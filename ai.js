@@ -385,10 +385,73 @@
     }
   }
 
+  // ---- 詰めピンチ用の厳密な強制勝ち証明(AND/OR探索) --------------------
+  // ヒューリスティックな評価に頼らず、実際の勝敗判定(engine.winner)だけを
+  // 根拠にする。solver 側の手番は「どれか1つで勝ちを証明できればよい」(OR)、
+  // 相手側の手番は「合法手すべてに対して勝ちを証明できなければならない」(AND)。
+  // maxDepth 手先までで証明できない場合は forced:false を返す
+  // (「強制勝ちではない」ではなく「この深さでは証明できなかった」という意味)。
+  function proveForcedWin(engine, solver, maxDepth, cache) {
+    cache = cache || new Map();
+    const stateKey = engine._stateKey() + "|" + maxDepth;
+    if (cache.has(stateKey)) return cache.get(stateKey);
+    if (engine.winner === solver) { const r = { forced: true, plies: 0 }; cache.set(stateKey, r); return r; }
+    const opponent = engine.winner ? null : (solver === "A" ? "B" : "A");
+    if (engine.winner === opponent || engine.isDraw) { const r = { forced: false, plies: null }; cache.set(stateKey, r); return r; }
+    if (maxDepth <= 0) { const r = { forced: false, plies: null }; cache.set(stateKey, r); return r; }
+    const current = engine.currentPlayer;
+    const actions = generateActions(engine, current);
+    if (!actions.length) { const r = { forced: false, plies: null }; cache.set(stateKey, r); return r; }
+    if (current === solver) {
+      let best = null;
+      for (const action of actions) {
+        const child = engine.clone();
+        applyAction(child, current, action);
+        const r = proveForcedWin(child, solver, maxDepth - 1, cache);
+        if (r.forced && (best === null || r.plies + 1 < best.plies)) {
+          best = { forced: true, plies: r.plies + 1, move: action };
+          if (best.plies <= 1) break;
+        }
+      }
+      const r = best || { forced: false, plies: null };
+      cache.set(stateKey, r);
+      return r;
+    }
+    let worst = 0;
+    for (const action of actions) {
+      const child = engine.clone();
+      applyAction(child, current, action);
+      const r = proveForcedWin(child, solver, maxDepth - 1, cache);
+      if (!r.forced) { const out = { forced: false, plies: null }; cache.set(stateKey, out); return out; }
+      if (r.plies > worst) worst = r.plies;
+    }
+    const r = { forced: true, plies: worst + 1 };
+    cache.set(stateKey, r);
+    return r;
+  }
+
+  // 詰めピンチのヒント用: 現在の局面で solver がすぐ指すべき最善手を1つ返す
+  // (maxDepth 以内に証明できる中で最短の勝ち筋)。証明できなければ null。
+  function solveTsumePinchHint(engine, solver, maxDepth) {
+    const cache = new Map();
+    const actions = generateActions(engine, solver);
+    let best = null;
+    for (const action of actions) {
+      const child = engine.clone();
+      applyAction(child, solver, action);
+      const r = proveForcedWin(child, solver, maxDepth - 1, cache);
+      if (r.forced && (best === null || r.plies + 1 < best.plies)) {
+        best = { move: action, plies: r.plies + 1 };
+      }
+    }
+    return best;
+  }
+
   const AI = {
     LEVELS, SPECIALIST_AI_NAME, SPECIALIST_AI_DESC,
     generateActions, applyAction, actionEquals,
     MinimaxAI, TemplateSpecialistAI, TranspositionTable, SearchTimeout,
+    proveForcedWin, solveTsumePinchHint,
   };
 
   if (typeof module !== "undefined" && module.exports) {

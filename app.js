@@ -129,6 +129,52 @@
 
   function clearNode(node) { while (node.firstChild) node.removeChild(node.firstChild); }
 
+  // 盤面(座標ラベル+マス目)一式を組み立てる。ゲーム画面・感想戦画面の両方から
+  // 使う共通部品にすることで、レイアウトのズレ(スマホで座標ラベルが盤に
+  // 隠れる不具合の原因だった)が二重管理にならないようにしている。
+  // .board-shell はCSS Grid で「ラベル用の段・列」と「盤面」を分けているため、
+  // 画面幅がどれだけ狭くても盤がラベルの上に重なることはない。
+  function buildBoardShell(size, opts) {
+    opts = opts || {};
+    const boardFrame = el("div", { class: "board-frame" });
+    const shell = el("div", { class: "board-shell" });
+    const railTop = el("div", { class: "rail-top" });
+    const railLeft = el("div", { class: "rail-left" });
+    for (let c = 0; c < size; c++) railTop.appendChild(el("span", { text: String.fromCharCode(65 + c) }));
+    for (let r = 0; r < size; r++) railLeft.appendChild(el("span", { text: String(r + 1) }));
+    const board = el("div", { class: "board" });
+    const grid = el("div", { class: "grid" });
+    grid.style.gridTemplateColumns = `repeat(${size},1fr)`;
+    grid.style.gridTemplateRows = `repeat(${size},1fr)`;
+    const cellNodes = [];
+    for (let r = 0; r < size; r++) {
+      cellNodes.push([]);
+      for (let c = 0; c < size; c++) {
+        const cell = el("div", { class: "cell" });
+        cell.dataset.r = r; cell.dataset.c = c;
+        if (opts.onCellClick) cell.addEventListener("click", () => opts.onCellClick(r, c));
+        grid.appendChild(cell);
+        cellNodes[r].push(cell);
+      }
+    }
+    const piecesLayer = el("div", { class: "layer pieces" });
+    board.appendChild(grid);
+    board.appendChild(piecesLayer);
+    let fxLayer = null;
+    if (opts.fx) {
+      fxLayer = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+      fxLayer.setAttribute("class", "fx-svg layer");
+      fxLayer.setAttribute("viewBox", "0 0 100 100");
+      fxLayer.setAttribute("preserveAspectRatio", "none");
+      board.appendChild(fxLayer);
+    }
+    shell.appendChild(railTop);
+    shell.appendChild(railLeft);
+    shell.appendChild(board);
+    boardFrame.appendChild(shell);
+    return { boardFrame, board, grid, cellNodes, piecesLayer, fxLayer };
+  }
+
   function confirmModal(message, okLabel, cancelLabel) {
     return new Promise((resolve) => {
       const veil = el("div", { class: "veil" });
@@ -190,6 +236,7 @@
     const renderers = {
       menu: renderMenu, game: renderGame, tutorial: renderTutorial, strategy: renderStrategy,
       report: renderReport, history: renderHistory, review: renderReview, online: renderOnline,
+      tsume: renderTsumeMenu,
     };
     (renderers[App.screen] || renderMenu)(root, payload);
     window.scrollTo({ top: 0, behavior: "instant" in window ? "instant" : "auto" });
@@ -475,6 +522,104 @@
     maybeTriggerAI();
   }
 
+  // ---- 詰めピンチ(強制勝ち問題) ------------------------------------
+  function rebuildEngineFromPuzzlePosition(position) {
+    const config = makeConfig({
+      rows: position.rows, cols: position.cols, moveRange: position.moveRange,
+      wallSandwich: position.wallSandwich, contactLimit: position.contactLimit,
+    });
+    const engine = new GameEngine(config);
+    engine.stock.A = position.stockA;
+    engine.stock.B = position.stockB;
+    // 駒を直接セットする(place_pieceの禁じ手チェックは、記録済みの実戦局面を
+    // そのまま再現するためのものなので通す必要がない)。
+    let nextId = 1;
+    for (const [player, r, c] of position.pieces) {
+      const id = nextId++;
+      engine.pieces.set(id, { id, player, position: [r, c] });
+      engine.board.set(r + "," + c, id);
+    }
+    engine._nextPieceId = nextId;
+    engine.currentPlayer = position.currentPlayer;
+    return engine;
+  }
+
+  function startTsumePuzzle(puzzle) {
+    const engine = rebuildEngineFromPuzzlePosition(puzzle.position);
+    App.match = {
+      mode: "tsume",
+      puzzle,
+      boardSize: puzzle.position.rows, moveRange: puzzle.position.moveRange,
+      contactLimit: puzzle.position.contactLimit,
+      stockA: puzzle.position.stockA, stockB: puzzle.position.stockB,
+      ruleTemplate: null,
+      engine,
+      humanPlayer: "B", // 詰めピンチは常に後手(プレイヤー2)側を解く
+      selected: null,
+      lastAction: null,
+      logMessages: [],
+      kifuRecords: [],
+      historyStack: [],
+      aiThinking: false,
+      aiVsAiPaused: false,
+      kifuSaved: false,
+      pieceNodes: new Map(),
+      startedAt: Date.now(),
+      tsumeMoveCount: 0,
+    };
+    App.screen = "game";
+    render();
+    maybeTriggerAI();
+  }
+
+  function requestTsumeHint() {
+    const m = App.match;
+    if (!m || m.mode !== "tsume" || m.engine.isOver()) return;
+    if (m.engine.currentPlayer !== m.humanPlayer) { toast("相手の手番です"); return; }
+    // 残り最大手数は「パー(par)」を上限にする(パーで詰む問題なので、
+    // 現在の局面がパー通りに進んでいれば必ずこの深さで見つかる)。
+    const maxDepth = Math.max(1, m.puzzle.plies);
+    const hint = AI.solveTsumePinchHint(m.engine, m.humanPlayer, maxDepth);
+    if (!hint) { toast("この手数内では正解手を見つけられませんでした(局面がずれている可能性があります)。"); return; }
+    const [kind, pidOrTo, to] = hint.move;
+    const target = kind === "place" ? pidOrTo : to;
+    const dom = App.gameDom;
+    if (dom) {
+      const cell = dom.cellNodes[target[0]][target[1]];
+      cell.classList.add("is-dest");
+      setTimeout(() => cell.classList.remove("is-dest"), 1600);
+    }
+    if (kind === "move") {
+      const from = m.engine.pieces.get(pidOrTo).position;
+      toast(`ヒント: ${posLabel(from)} → ${posLabel(to)}(あと${hint.plies}手で勝てます)`);
+    } else {
+      toast(`ヒント: ${posLabel(target)} に配置(あと${hint.plies}手で勝てます)`);
+    }
+  }
+
+  function renderTsumeMenu(root) {
+    const screen = el("div", { class: "screen" });
+    screen.appendChild(el("h1", { class: "card-title", text: "詰めピンチ", style: { fontSize: "24px" } }));
+    screen.appendChild(el("div", {
+      class: "field-hint", style: { textAlign: "center", maxWidth: "560px" },
+      text: "実戦の棋譜から「正しく指せば必ず勝てる」と証明できた局面を出題します。"
+        + "あなたは後手(プレイヤー2)を持ち、相手はレベル『最強』のAIです。"
+        + "必要な手数が多いレベルほど、正しい1手を選び続けるのが難しくなります。",
+    }));
+    const card = el("div", { class: "card", style: { width: "min(560px,100%)" } });
+    C.TSUME_PUZZLES.forEach((puzzle) => {
+      const row = el("div", { class: "history-row" });
+      row.appendChild(el("div", { class: "history-text" }, [
+        el("div", { class: "history-head", text: puzzle.title }),
+        el("div", { class: "history-sub", text: puzzle.hint }),
+      ]));
+      row.appendChild(el("button", { class: "btn btn-primary", text: "挑戦する", style: { width: "auto", fontSize: "14px", padding: "10px 18px" }, onclick: () => startTsumePuzzle(puzzle) }));
+      card.appendChild(row);
+    });
+    screen.appendChild(card);
+    root.appendChild(screen);
+  }
+
   function pushHistory(mover) {
     const m = App.match;
     m.historyStack.push({
@@ -488,14 +633,14 @@
 
   function playerDisplayName(player) {
     const m = App.match;
-    if (m.mode === "pvai") return player === m.humanPlayer ? "あなた" : "AI";
+    if (m.mode === "pvai" || m.mode === "tsume") return player === m.humanPlayer ? "あなた" : "AI";
     if (m.mode === "online") return player === "A" ? "先手" : "後手";
     if (m.mode === "ai_vs_ai") return player === "A" ? "先手AI" : "後手AI";
     return player === "A" ? "プレイヤー1" : "プレイヤー2";
   }
   function pieceLabelFor(player) {
     const m = App.match;
-    if (m.mode === "pvai") return player === m.humanPlayer ? "You" : "AI";
+    if (m.mode === "pvai" || m.mode === "tsume") return player === m.humanPlayer ? "You" : "AI";
     if (m.mode === "online") return player === "A" ? "1" : "2";
     if (m.mode === "ai_vs_ai") return player;
     return player === "A" ? "1" : "2";
@@ -503,6 +648,7 @@
   function modeLabelText() {
     const m = App.match;
     if (m.mode === "pvai") return `AI戦 - ${aiStrengthName(m.aiLevel, m.aiSpecialist)}`;
+    if (m.mode === "tsume") return `詰めピンチ - ${m.puzzle.title}(相手: ${AI.LEVELS[5].name})`;
     if (m.mode === "pvp") return "対人戦(同画面)";
     if (m.mode === "online") return "オンライン対戦(手番リンク)";
     if (m.mode === "ai_vs_ai") return `AI同士の対戦 - 先手:${aiStrengthName(m.aiLevel, m.aiSpecialist)} / 後手:${aiStrengthName(m.aiLevelB, m.aiSpecialistB)}`;
@@ -541,6 +687,7 @@
     const m = App.match;
     const result = AI.applyAction(m.engine, player, action);
     const extra = logAction(player, action, result, fromPos);
+    if (m.mode === "tsume" && player === m.humanPlayer) m.tsumeMoveCount++;
     if (m.mode === "online" && m.onlineActions) {
       m.onlineActions.push(action[0] === "place"
         ? { kind: "place", to: action[1] }
@@ -552,6 +699,7 @@
 
   function aiOptsFor(player) {
     const m = App.match;
+    if (m.mode === "tsume") return { level: 5, specialist: false }; // 詰めピンチの相手は必ずレベル『最強』
     if (m.mode === "pvai") return { level: m.aiLevel, specialist: m.aiSpecialist };
     return player === "A" ? { level: m.aiLevel, specialist: m.aiSpecialist } : { level: m.aiLevelB, specialist: m.aiSpecialistB };
   }
@@ -560,7 +708,7 @@
     const m = App.match;
     if (!m || m.engine.isOver()) return;
     const current = m.engine.currentPlayer;
-    if (m.mode === "pvai" && current === otherPlayer(m.humanPlayer)) {
+    if ((m.mode === "pvai" || m.mode === "tsume") && current === otherPlayer(m.humanPlayer)) {
       startAIMove(current);
     } else if (m.mode === "ai_vs_ai" && !m.aiVsAiPaused) {
       startAIMove(current);
@@ -597,6 +745,7 @@
 
   function recordIfFinished() {
     const m = App.match;
+    if (m.mode === "tsume") return; // 詰めピンチの挑戦は対戦履歴に残さない
     if ((m.engine.winner || m.engine.isDraw) && !m.kifuSaved) {
       m.kifuSaved = true;
       const record = buildMatchRecord(m);
@@ -644,9 +793,12 @@
     const stepBtn = el("button", { class: "btn btn-compact", text: "1手進める", onclick: onStepOnce });
     const pauseBtn = el("button", { class: "btn btn-compact", text: "一時停止", onclick: onTogglePause });
     const undoBtn = el("button", { class: "btn btn-compact", text: "待った(1手戻す)", onclick: onUndo });
-    const restartBtn = el("button", { class: "btn btn-compact", text: "新しく対戦", onclick: onRestart });
+    const restartBtn = el("button", { class: "btn btn-compact", text: m.mode === "tsume" ? "やり直す" : "新しく対戦", onclick: onRestart });
     if (m.mode === "ai_vs_ai") { topBar.appendChild(pauseBtn); topBar.appendChild(stepBtn); }
     else topBar.appendChild(undoBtn);
+    if (m.mode === "tsume") {
+      topBar.appendChild(el("button", { class: "btn btn-compact", text: "ヒント", onclick: requestTsumeHint }));
+    }
     topBar.appendChild(restartBtn);
     screen.appendChild(topBar);
 
@@ -663,37 +815,8 @@
     // ---- 盤面 ----
     const boardWrap = el("div", { class: "board-wrap" });
     const size = m.engine.config.rows;
-    const boardFrame = el("div", { class: "board-frame" });
-    const railTop = el("div", { class: "rail-top" });
-    const railLeft = el("div", { class: "rail-left" });
-    for (let c = 0; c < size; c++) railTop.appendChild(el("span", { text: String.fromCharCode(65 + c) }));
-    for (let r = 0; r < size; r++) railLeft.appendChild(el("span", { text: String(r + 1) }));
-    const board = el("div", { class: "board" });
-    const grid = el("div", { class: "grid" });
-    grid.style.gridTemplateColumns = `repeat(${size},1fr)`;
-    grid.style.gridTemplateRows = `repeat(${size},1fr)`;
-    const cellNodes = [];
-    for (let r = 0; r < size; r++) {
-      cellNodes.push([]);
-      for (let c = 0; c < size; c++) {
-        const cell = el("div", { class: "cell" });
-        cell.dataset.r = r; cell.dataset.c = c;
-        cell.addEventListener("click", () => onCellClick(r, c));
-        grid.appendChild(cell);
-        cellNodes[r].push(cell);
-      }
-    }
-    const piecesLayer = el("div", { class: "layer pieces" });
-    const fxLayer = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-    fxLayer.setAttribute("class", "fx-svg layer");
-    fxLayer.setAttribute("viewBox", "0 0 100 100");
-    fxLayer.setAttribute("preserveAspectRatio", "none");
-    board.appendChild(grid);
-    board.appendChild(piecesLayer);
-    board.appendChild(fxLayer);
-    boardFrame.appendChild(railTop);
-    boardFrame.appendChild(railLeft);
-    boardFrame.appendChild(board);
+    const { boardFrame, board, grid, cellNodes, piecesLayer, fxLayer } =
+      buildBoardShell(size, { onCellClick, fx: true });
     boardWrap.appendChild(boardFrame);
 
     const legend = el("div", { class: "legend-row" });
@@ -751,7 +874,7 @@
     if (!m || m.engine.isOver() || m.aiThinking) return;
     const engine = m.engine;
     const player = engine.currentPlayer;
-    if (m.mode === "pvai" && player === otherPlayer(m.humanPlayer)) return;
+    if ((m.mode === "pvai" || m.mode === "tsume") && player === otherPlayer(m.humanPlayer)) return;
     if (m.mode === "ai_vs_ai") return;
 
     const piece = engine.pieceAt([r, c]);
@@ -810,7 +933,7 @@
   function onUndo() {
     const m = App.match;
     if (m.aiThinking || !m.historyStack.length) return;
-    const popCount = (m.mode === "pvai" && m.historyStack.length >= 2) ? 2 : 1;
+    const popCount = ((m.mode === "pvai" || m.mode === "tsume") && m.historyStack.length >= 2) ? 2 : 1;
     let snap = null;
     for (let i = 0; i < popCount; i++) snap = m.historyStack.pop();
     m.engine = snap.engine;
@@ -827,6 +950,7 @@
     const m = App.match;
     // 「新しく対戦」は Python 版と同様、確認なしで即座に新しい対局へ切り替える。
     if (m.mode === "online") { App.match = null; App.screen = "online"; render(); return; }
+    if (m.mode === "tsume") { startTsumePuzzle(m.puzzle); return; }
     startNewMatch({
       mode: m.mode, boardSize: m.boardSize, moveRange: m.moveRange, contactLimit: m.contactLimit,
       aiLevel: m.aiLevel, aiLevelB: m.aiLevelB, aiSpecialist: m.aiSpecialist, aiSpecialistB: m.aiSpecialistB,
@@ -852,7 +976,7 @@
     const m = App.match;
     if (!m || m.engine.isOver() || m.aiThinking) return false;
     if (m.mode === "ai_vs_ai") return false;
-    if (m.mode === "pvai" && m.engine.currentPlayer === otherPlayer(m.humanPlayer)) return false;
+    if ((m.mode === "pvai" || m.mode === "tsume") && m.engine.currentPlayer === otherPlayer(m.humanPlayer)) return false;
     return true;
   }
 
@@ -1009,16 +1133,30 @@
       if (m.mode === "pvai") {
         if (engine.winner === m.humanPlayer) { cls = "success"; text = `${winnerName}の勝ちです。相手の駒を挟んで動けなくしました。`; }
         else { cls = "danger"; text = `${winnerName}の勝ちです。あなたの駒が挟まれて動けなくなりました。`; }
+      } else if (m.mode === "tsume") {
+        if (engine.winner === m.humanPlayer) {
+          cls = "success";
+          const par = m.puzzle.plies;
+          text = m.tsumeMoveCount <= par
+            ? `クリア!(${m.tsumeMoveCount}手、正解は${par}手 - 完璧です)`
+            : `クリアしました(${m.tsumeMoveCount}手、最短は${par}手でした)`;
+        } else {
+          cls = "danger"; text = "残念、詰めきれませんでした。もう一度挑戦してみましょう。";
+        }
       } else {
         cls = "neutral"; text = `${winnerName}の勝ちです。`;
       }
     } else {
-      cls = "warning"; text = "引き分けです(同一局面が繰り返されました)。";
+      cls = "warning";
+      text = m.mode === "tsume" ? "引き分けです。もう一度挑戦してみましょう。" : "引き分けです(同一局面が繰り返されました)。";
     }
     const banner = el("div", { class: `banner ${cls}` });
     banner.appendChild(el("span", { text }));
     const actions = el("div", { style: { display: "flex", gap: "8px" } });
-    if (m.finishedRecord) {
+    if (m.mode === "tsume") {
+      actions.appendChild(el("button", { class: "btn btn-compact", text: "もう一度挑戦", onclick: () => startTsumePuzzle(m.puzzle) }));
+      actions.appendChild(el("button", { class: "btn btn-compact", text: "問題一覧へ", onclick: () => goto("tsume") }));
+    } else if (m.finishedRecord) {
       actions.appendChild(el("button", { class: "btn btn-compact", text: "感想戦を見る", onclick: () => openReview(m.finishedRecord) }));
       actions.appendChild(el("button", { class: "btn btn-compact", text: "棋譜をダウンロード", onclick: () => downloadKifuCsv(m.finishedRecord) }));
     }
@@ -1260,6 +1398,7 @@
         },
         currentPlayer: engine.currentPlayer, winner: engine.winner, isDraw: engine.isDraw,
         desc, lastAction: lastAction || null,
+        engineClone: engine.clone(), // 「この局面から対局を再開する」機能のために保持しておく
       };
     }
     const frames = [snapshot("対局開始", null)];
@@ -1287,6 +1426,60 @@
     return frames;
   }
 
+  // 感想戦のある局面から、実際に対局を再開する(追加仕様3)。
+  function openResumeSetup(frame) {
+    const veil = el("div", { class: "veil" });
+    const engine0 = frame.engineClone;
+    const sideSelect = el("select", { class: "field-select" }, [
+      el("option", { value: "A", text: "先手(A)" }),
+      el("option", { value: "B", text: "後手(B)" }),
+    ]);
+    sideSelect.value = engine0.currentPlayer;
+    const levelSelect = el("select", { class: "field-select" });
+    for (let i = 1; i <= 7; i++) levelSelect.appendChild(el("option", { value: String(i), text: AI.LEVELS[i].name }));
+    levelSelect.value = "5";
+    const modal = el("div", { class: "modal" }, [
+      el("p", { text: "この局面から、実際に対局を再開します。どちらのプレイヤーを担当しますか?" }),
+      el("div", { class: "field-row" }, [el("div", { class: "field-label", text: "担当する側" }), sideSelect]),
+      el("div", { class: "field-row" }, [el("div", { class: "field-label", text: "相手AIの強さ" }), levelSelect]),
+      el("div", { class: "modal-actions" }, [
+        el("button", { class: "btn", text: "キャンセル", onclick: () => veil.remove() }),
+        el("button", { class: "btn btn-primary", text: "再開する", style: { width: "auto", fontSize: "14px", padding: "10px 16px" }, onclick: () => {
+          veil.remove();
+          resumeMatchFromEngine(engine0.clone(), sideSelect.value, parseInt(levelSelect.value, 10));
+        } }),
+      ]),
+    ]);
+    veil.appendChild(modal);
+    document.body.appendChild(veil);
+  }
+
+  function resumeMatchFromEngine(engine, humanPlayer, aiLevel) {
+    App.match = {
+      mode: "pvai",
+      boardSize: engine.config.rows, moveRange: engine.config.moveRange, contactLimit: engine.config.contactLimit,
+      aiLevel, aiLevelB: null, aiSpecialist: false, aiSpecialistB: false,
+      stockA: engine.stock.A, stockB: engine.stock.B,
+      ruleTemplate: null,
+      engine,
+      humanPlayer,
+      selected: null,
+      lastAction: null,
+      logMessages: [`(感想戦から再開: ここまでの手は対戦ログに含まれません)`],
+      kifuRecords: [],
+      historyStack: [],
+      aiThinking: false,
+      aiVsAiPaused: false,
+      kifuSaved: false,
+      pieceNodes: new Map(),
+      startedAt: Date.now(),
+      onlineActions: [],
+    };
+    App.screen = "game";
+    render();
+    maybeTriggerAI();
+  }
+
   function renderReview(root) {
     const record = App.reviewRecord;
     const screen = el("div", { class: "screen" });
@@ -1300,20 +1493,7 @@
 
     const boardWrap = el("div", { class: "board-wrap" });
     const size = record.rows;
-    const boardFrame = el("div", { class: "board-frame" });
-    const railTop = el("div", { class: "rail-top" });
-    const railLeft = el("div", { class: "rail-left" });
-    for (let c = 0; c < size; c++) railTop.appendChild(el("span", { text: String.fromCharCode(65 + c) }));
-    for (let r = 0; r < size; r++) railLeft.appendChild(el("span", { text: String(r + 1) }));
-    const board = el("div", { class: "board" });
-    const grid = el("div", { class: "grid" });
-    grid.style.gridTemplateColumns = `repeat(${size},1fr)`;
-    grid.style.gridTemplateRows = `repeat(${size},1fr)`;
-    const cellNodes = [];
-    for (let r = 0; r < size; r++) { cellNodes.push([]); for (let c = 0; c < size; c++) { const cell = el("div", { class: "cell" }); grid.appendChild(cell); cellNodes[r].push(cell); } }
-    const piecesLayer = el("div", { class: "layer pieces" });
-    board.appendChild(grid); board.appendChild(piecesLayer);
-    boardFrame.appendChild(railTop); boardFrame.appendChild(railLeft); boardFrame.appendChild(board);
+    const { boardFrame, cellNodes, piecesLayer } = buildBoardShell(size, {});
     boardWrap.appendChild(boardFrame);
     screen.appendChild(boardWrap);
 
@@ -1327,6 +1507,9 @@
     const last = el("button", { class: "btn btn-compact", text: "最後 >>|" });
     toolbar.appendChild(first); toolbar.appendChild(prev); toolbar.appendChild(step); toolbar.appendChild(next); toolbar.appendChild(last);
     screen.appendChild(toolbar);
+
+    const resumeBtn = el("button", { class: "btn btn-compact", text: "この局面から対局を再開する", onclick: () => openResumeSetup(frames[index]) });
+    screen.appendChild(resumeBtn);
 
     const list = el("ul", { class: "review-list" });
     list.appendChild(el("li", { text: "0: (対局開始)", onclick: () => { index = 0; renderFrame(); } }));
@@ -1364,6 +1547,7 @@
       step.textContent = `${index} / ${frames.length - 1} 手`;
       first.disabled = prev.disabled = index === 0;
       next.disabled = last.disabled = index === frames.length - 1;
+      resumeBtn.disabled = !!(frame.winner || frame.isDraw);
       Array.from(list.children).forEach((li, i) => li.classList.toggle("is-current", i === index));
     }
     first.addEventListener("click", () => { index = 0; renderFrame(); });

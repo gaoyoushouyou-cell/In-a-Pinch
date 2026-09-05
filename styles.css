@@ -234,15 +234,33 @@ select.field-select:disabled { opacity: .5; }
 .board-frame.is-shaking { animation: frame-shake .34s cubic-bezier(.36,.07,.19,.97); }
 @keyframes frame-shake { 10%,90%{transform:translate(-1px,1px)} 30%,70%{transform:translate(3px,-2px)} 50%{transform:translate(-3px,2px)} }
 
-.rail-top, .rail-left { position: absolute; display: flex; font-family: var(--f-mono); font-size: 10px; color: var(--text-muted); letter-spacing: .06em; pointer-events: none; user-select: none; }
-.rail-top { top: 5px; left: 18px; right: 18px; }
-.rail-left { flex-direction: column; top: 18px; bottom: 14px; left: 4px; width: 14px; }
-.rail-top span, .rail-left span { flex: 1; display: flex; align-items: center; justify-content: center; }
+/* 追加仕様: 座標ラベル(A-G/1-7)は盤面と重ならないよう、専用のグリッド段に
+   配置する(以前は絶対配置の固定px値で、狭い画面だと盤に隠れてしまっていた)。
+   グリッドの列・行として確保するので、どんな画面幅でも盤とラベルは物理的に
+   重なりようがない。 */
+.board-shell {
+  --rail-size: 20px;
+  display: grid;
+  grid-template-columns: var(--rail-size) 1fr;
+  grid-template-rows: var(--rail-size) 1fr;
+  column-gap: 4px;
+  row-gap: 4px;
+}
+@media (max-width: 480px) {
+  .board-shell { --rail-size: 16px; }
+}
+.rail-top, .rail-left { display: flex; font-family: var(--f-mono); font-size: 10px; color: var(--text-muted); letter-spacing: .06em; pointer-events: none; user-select: none; min-width: 0; min-height: 0; }
+.rail-top { grid-column: 2; grid-row: 1; align-items: center; }
+.rail-left { grid-column: 1; grid-row: 2; flex-direction: column; align-items: center; }
+.rail-top span, .rail-left span { flex: 1; display: flex; align-items: center; justify-content: center; overflow: hidden; }
 
 .board {
+  grid-column: 2;
+  grid-row: 2;
   position: relative;
   aspect-ratio: 1 / 1;
   width: 100%;
+  min-width: 0;
   border-radius: 4px;
   overflow: hidden;
   background: linear-gradient(155deg, var(--board-bg) 0%, var(--board-bg-alt) 100%);
