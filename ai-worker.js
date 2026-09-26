@@ -14,9 +14,8 @@ self.onmessage = function (e) {
   const { reqId, config, state, player, level, specialist, seed, timeBudget } = e.data;
   try {
     const engine = rebuildEngine(config, state);
-    const ai = specialist
-      ? new self.HasamiAI.TemplateSpecialistAI(player, seed, timeBudget)
-      : new self.HasamiAI.MinimaxAI(player, level, seed);
+    // 奥義・究極・神は学習型探索AI、初級〜最強は従来の MinimaxAI(ai.js の makeAI 参照)
+    const ai = self.HasamiAI.makeAI(player, level, specialist, seed, timeBudget);
     const t0 = Date.now();
     const action = ai.chooseAction(engine);
     const elapsed = Date.now() - t0;

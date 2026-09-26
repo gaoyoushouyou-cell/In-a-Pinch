@@ -97,9 +97,7 @@
       // メインスレッドで動くため長考中は画面が固まるが、動作はする。
       setTimeout(() => {
         try {
-          const ai = opts.specialist
-            ? new AI.TemplateSpecialistAI(player, payload.seed, payload.timeBudget)
-            : new AI.MinimaxAI(player, opts.level, payload.seed);
+          const ai = AI.makeAI(player, opts.level, opts.specialist, payload.seed, payload.timeBudget);
           const rebuilt = rebuildEngineFromState(payload.config, payload.state);
           const action = ai.chooseAction(rebuilt);
           if (pendingReqId === reqId && onWorkerResult) { const cb = onWorkerResult; onWorkerResult = null; cb({ ok: true, action, reqId }); }

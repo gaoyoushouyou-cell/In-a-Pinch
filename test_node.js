@@ -158,5 +158,77 @@ function check(name, cond, detail) {
   check("edge slide still respects contact limit", !m.includes("0,4") && m.includes("0,5") && m.includes("0,6"), m);
 })();
 
+// ---- 8. 学習型AI: 高速エンジン FastState が GameEngine と一致する ----
+(function () {
+  let s = 2026;
+  const rand = () => { s = (s * 1103515245 + 12345) & 0x7fffffff; return s / 0x7fffffff; };
+  const pick = (arr) => arr[Math.floor(rand() * arr.length)];
+  const actKey = (a) => (a[0] === "place" ? "p" + a[1].join(",") : "m" + a[1] + ":" + a[2].join(","));
+  let bad = 0, positions = 0;
+  for (let g = 0; g < 120 && !bad; g++) {
+    const cfg = H.makeConfig({
+      rows: pick([4, 5, 6, 7, 8]), cols: pick([4, 5, 6, 7, 8]), moveRange: pick([1, 2, 3]),
+      stockPerPlayer: pick([null, 3, 5, 8, 12]), wallSandwich: rand() < 0.8, contactLimit: pick([null, 3, 4, 5, 6]),
+    });
+    const e = new H.GameEngine(cfg);
+    const st = new AI.FastState(e);
+    for (let ply = 0; ply < 250 && !e.isOver(); ply++) {
+      positions++;
+      const ref = new Set(AI.generateActions(e, e.currentPlayer).map(actKey));
+      const codes = st.generate(st.side);
+      const got = codes.map((c) => actKey(st.toAction(c)));
+      if (got.length !== ref.size || !got.every((k) => ref.has(k)) || new Set(got).size !== got.length) {
+        bad++; console.log("   gen mismatch", g, ply); break;
+      }
+      if ((st.features() === null) !== (ref.size === 0)) { bad++; console.log("   features/loss", g, ply); break; }
+      const code = pick(codes);
+      AI.applyAction(e, e.currentPlayer, st.toAction(code));
+      st.make(code);
+      const loss = !st.hasAction(st.side);
+      let draw = false;
+      if (!loss) {
+        const k = st.key();
+        const c = (st.rep.get(k) || 0) + 1;
+        st.rep.set(k, c);
+        draw = c >= st.replimit;
+      }
+      if (loss !== (e.winner != null) || draw !== e.isDraw) { bad++; console.log("   result mismatch", g, ply); break; }
+      const so = (arr) => arr.slice().sort((a, b) => a - b).join(",");
+      if (so(st.obl[1]) !== so(e.obligated.A) || so(st.obl[2]) !== so(e.obligated.B)) {
+        bad++; console.log("   obligated mismatch", g, ply); break;
+      }
+      if (st._hashOfStateKey(e._stateKey()) !== st.key()) { bad++; console.log("   hash mismatch", g, ply); break; }
+    }
+  }
+  check(`FastState parity with GameEngine (${positions} positions)`, bad === 0);
+})();
+
+// ---- 9. 学習型AI: 合法手・持ち時間・生成窓口 ----
+(function () {
+  const cfg = H.makeConfig({ rows: 7, cols: 7, moveRange: 3, stockPerPlayer: 15, wallSandwich: true, contactLimit: 3 });
+  const e = new H.GameEngine(cfg);
+  const aiA = AI.makeAI("A", 7, true, 1, 500);
+  const aiB = AI.makeAI("B", 7, true, 2, 500);
+  let plies = 0, worst = 0, ok = true;
+  while (!e.isOver() && plies < 40) {
+    const cur = e.currentPlayer;
+    const ai = cur === "A" ? aiA : aiB;
+    const t0 = Date.now();
+    const action = ai.chooseAction(e.clone());
+    worst = Math.max(worst, Date.now() - t0);
+    const legal = AI.generateActions(e, cur);
+    if (!action || !legal.some((a) => AI.actionEquals(a, action))) { ok = false; break; }
+    AI.applyAction(e, cur, action);
+    plies++;
+  }
+  check(`learned AI (奥義) self-play: ${plies} plies all legal`, ok);
+  check(`learned AI move time within budget+margin (worst ${worst}ms)`, worst < 1200, worst);
+  check("makeAI: specialist -> LearnedSearchAI", AI.makeAI("A", 7, true, 1) instanceof AI.LearnedSearchAI);
+  check("makeAI: levels 6/7 -> LearnedSearchAI with original budgets",
+    [6, 7].every((l) => { const a = AI.makeAI("A", l, false, 1); return a instanceof AI.LearnedSearchAI && a.level.timeBudget === AI.LEVELS[l].timeBudget; }));
+  check("makeAI: levels 1-5 stay MinimaxAI",
+    [1, 2, 3, 4, 5].every((l) => { const a = AI.makeAI("A", l, false, 1); return a.constructor === AI.MinimaxAI; }));
+})();
+
 console.log(`\n==== ${pass} passed, ${fail} failed ====`);
 process.exit(fail ? 1 : 0);
