@@ -122,5 +122,41 @@ function check(name, cond, detail) {
   check("repetition triggers draw eventually", draw || e.isDraw);
 })();
 
+// ---- 7. 外周スライド: 最外周の駒は外周に沿う方向だけ移動範囲の上限なし ----
+(function () {
+  const keys = (moves) => moves.map((p) => p.join(",")).sort();
+  const put = (e, id, player, pos) => {
+    e.pieces.set(id, { id, player, position: pos });
+    e.board.set(pos.join(","), id);
+    e._nextPieceId = Math.max(e._nextPieceId, id + 1);
+  };
+  const cfg = (moveRange, contactLimit) => H.makeConfig({ rows: 7, cols: 7, moveRange, stockPerPlayer: 10, wallSandwich: true, contactLimit });
+
+  let e = new H.GameEngine(cfg(1, null));
+  put(e, 1, "A", [0, 1]);
+  check("top-row piece slides to both ends, inward only 1 step",
+    JSON.stringify(keys(e.legalMoves(1))) === JSON.stringify(["0,0", "0,2", "0,3", "0,4", "0,5", "0,6", "1,1"]), keys(e.legalMoves(1)));
+
+  e = new H.GameEngine(cfg(1, null));
+  put(e, 1, "A", [3, 6]);
+  put(e, 2, "B", [5, 6]);
+  let m = keys(e.legalMoves(1));
+  check("slide stops before a blocking piece", m.includes("4,6") && !m.includes("5,6") && !m.includes("6,6"), m);
+  check("slide reaches the corner but does not turn", m.includes("0,6") && !m.includes("0,5"), m);
+  check("inward move keeps moveRange", m.includes("3,5") && !m.includes("3,4"), m);
+
+  e = new H.GameEngine(cfg(2, null));
+  put(e, 1, "A", [1, 3]);
+  check("second-row piece keeps moveRange",
+    JSON.stringify(keys(e.legalMoves(1))) === JSON.stringify(["0,3", "1,1", "1,2", "1,4", "1,5", "2,3", "3,3"]), keys(e.legalMoves(1)));
+
+  e = new H.GameEngine(cfg(1, 2));
+  put(e, 1, "A", [0, 0]);
+  put(e, 2, "A", [1, 4]);
+  put(e, 3, "A", [2, 4]);
+  m = keys(e.legalMoves(1));
+  check("edge slide still respects contact limit", !m.includes("0,4") && m.includes("0,5") && m.includes("0,6"), m);
+})();
+
 console.log(`\n==== ${pass} passed, ${fail} failed ====`);
 process.exit(fail ? 1 : 0);

@@ -169,11 +169,21 @@
       return this._finishTurn({ newlySandwiched: [], selfSandwiched: false, winner: null, draw: false });
     }
 
+    // pos から (dr, dc) 方向へ動けるマス数の上限。最外周の行・列にいる駒が
+    // 外周に沿って(その行・列の中で)動く場合は moveRange の上限がなく、盤の端まで進める。
+    _maxSteps(pos, dr, dc) {
+      const [r, c] = pos;
+      if (dr === 0 && (r === 0 || r === this.config.rows - 1)) return this.config.cols;
+      if (dc === 0 && (c === 0 || c === this.config.cols - 1)) return this.config.rows;
+      return this.config.moveRange;
+    }
+
     legalMoves(pieceId) {
       const piece = this.pieces.get(pieceId);
       const result = [];
       for (const [dr, dc] of DIRECTIONS) {
-        for (let step = 1; step <= this.config.moveRange; step++) {
+        const maxSteps = this._maxSteps(piece.position, dr, dc);
+        for (let step = 1; step <= maxSteps; step++) {
           const pos = [piece.position[0] + dr * step, piece.position[1] + dc * step];
           if (!this.inBounds(pos)) break;
           if (this.board.has(posKey(pos))) break;
