@@ -912,7 +912,17 @@
       };
       this.weights = LEARNED_FEATURES.map((f) => weights[f] || 0);
       this.rng = new RNG(seed == null ? Date.now() & 0xffffffff : seed);
-      this.contempt = opts.contempt == null ? 30 : opts.contempt;
+      // 千日手を避ける設計(Python 版と同じ既定値): 引き分けを自分にとってロジット1の損と数え、
+      // すでに1度現れた局面へ戻る手を読みの中で引き分け扱いにする。長引いたら徐々に許容する
+      this.contempt = opts.contempt == null ? 100 : opts.contempt;
+      // 千日手対策: 読みの中で何回目の出現から引き分けとみなすか(null ならルールどおり)。
+      // 2 にすると、すでに1度現れた局面へ戻る手をその時点で引き分けと評価して避ける
+      this.repDrawAt = opts.repDrawAt === undefined ? 2 : opts.repDrawAt;
+      this._repAt = 3;
+      // 千日手を避け続けると終わらなくなりうるので、[開始, 終了] 手を超えて長引いたら
+      // contempt を 0 まで徐々に下げ、最後は引き分けを受け入れる
+      this.contemptTaper = opts.contemptTaper === undefined ? [120, 240] : opts.contemptTaper;
+      this._contemptNow = this.contempt;
       this.lmr = opts.lmr !== false;
       this.nodeLimit = null;
       this.tt = new Map();
@@ -930,6 +940,14 @@
       this._deadline = budget == null ? null : Date.now() + budget;
       const st = this._st = new FastState(engine);
       this._me = st.side;
+      this._repAt = this.repDrawAt == null ? st.replimit : Math.min(st.replimit, this.repDrawAt);
+      this._contemptNow = this.contempt;
+      if (this.contemptTaper) {
+        const [t0, t1] = this.contemptTaper;
+        let plies = 0; // これまでの手数(各手のあとに1回ずつ局面が記録される)
+        for (const c of engine._stateHistory.values()) plies += c;
+        if (plies > t0) this._contemptNow = this.contempt * Math.max(0, (t1 - plies) / (t1 - t0));
+      }
       const N = st.g.N;
       this.nodesVisited = 0;
       if (this.tt.size > this.level.ttSize) this.tt.clear();
@@ -992,13 +1010,13 @@
     }
 
     _drawValue(side) {
-      return side === this._me ? -this.contempt : this.contempt;
+      return side === this._me ? -this._contemptNow : this._contemptNow;
     }
 
     _evaluate(st, ply, cnt) {
       const x = st.features();
       if (x === null) return ply - WIN_SCORE;
-      if (cnt >= st.replimit) return this._drawValue(st.side);
+      if (cnt >= this._repAt) return this._drawValue(st.side);
       const w = this.weights;
       let v = 0;
       for (let i = 0; i < w.length; i++) v += w[i] * x[i];
@@ -1018,7 +1036,7 @@
       const side = st.side;
       const acts = st.generate(side);
       if (!acts.length) return ply - WIN_SCORE;
-      if (cnt >= st.replimit) return this._drawValue(side);
+      if (cnt >= this._repAt) return this._drawValue(side);
 
       let ttMove = -1;
       const ent = this.tt.get(key);

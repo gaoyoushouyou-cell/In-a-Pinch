@@ -230,5 +230,26 @@ function check(name, cond, detail) {
     [1, 2, 3, 4, 5].every((l) => { const a = AI.makeAI("A", l, false, 1); return a.constructor === AI.MinimaxAI; }));
 })();
 
+// ---- 10. 学習型AI: 千日手の入口(一度現れた局面へ戻る手)を避ける ----
+(function () {
+  // 左右対称の局面で (3,2) と (3,4) は同じ評価。(3,2) へ動いた後の局面だけを
+  // 「すでに1度出現した」ことにしておくと、学習型AIは (3,2) へは戻らないはず。
+  let ok = true;
+  for (let seed = 1; seed <= 6 && ok; seed++) {
+    const e = new H.GameEngine(H.makeConfig({ rows: 7, cols: 7, moveRange: 1, stockPerPlayer: 0, wallSandwich: true, contactLimit: null }));
+    e.pieces.set(1, { id: 1, player: "A", position: [3, 3] }); e.board.set("3,3", 1);
+    e.pieces.set(2, { id: 2, player: "B", position: [6, 3] }); e.board.set("6,3", 2);
+    e._nextPieceId = 3;
+    const seen = e.clone();
+    seen.movePiece("A", 1, [3, 2]);
+    e._stateHistory.set(seen._stateKey(), 1);
+    const ai = AI.makeAI("A", 7, false, seed);
+    ai.level = Object.assign({}, ai.level, { timeBudget: 300 });
+    const a = ai.chooseAction(e);
+    if (a && a[0] === "move" && a[2][0] === 3 && a[2][1] === 2) ok = false;
+  }
+  check("learned AI avoids stepping back into an already-seen position", ok);
+})();
+
 console.log(`\n==== ${pass} passed, ${fail} failed ====`);
 process.exit(fail ? 1 : 0);
