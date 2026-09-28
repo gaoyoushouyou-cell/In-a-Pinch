@@ -1572,6 +1572,7 @@
     setTimeout(() => URL.revokeObjectURL(url), 2000);
   }
   function downloadKifuCsv(record) {
+    if (IS_LINE_BROWSER) { offerLineHandoff([record]); return; }
     const csv = "﻿" + matchRecordToCsv(record);
     downloadBlob(new Blob([csv], { type: "text/csv;charset=utf-8" }), kifuCsvFileName(record));
   }
@@ -1579,6 +1580,7 @@
   // ブロックしがちなので、1件ずつではなく1ファイルに固める(1件だけならCSVそのまま)。
   function downloadKifuCsvBundle(records) {
     if (!records.length) return;
+    if (IS_LINE_BROWSER) { offerLineHandoff(records); return; }
     if (records.length === 1) { downloadKifuCsv(records[0]); return; }
     const enc = new TextEncoder();
     const files = records.map((rec) => ({ name: kifuCsvFileName(rec), data: enc.encode("﻿" + matchRecordToCsv(rec)) }));
@@ -1586,6 +1588,115 @@
     const p2 = (n) => String(n).padStart(2, "0");
     const stamp = `${d.getFullYear()}${p2(d.getMonth() + 1)}${p2(d.getDate())}_${p2(d.getHours())}${p2(d.getMinutes())}${p2(d.getSeconds())}`;
     downloadBlob(buildZip(files, d), `kifu_${records.length}games_${stamp}.zip`);
+  }
+
+  // ============================================================ LINE内ブラウザ対策
+  // LINEのアプリ内ブラウザはファイルのダウンロードに対応していない。しかも対戦履歴は
+  // そのアプリ内ブラウザ側のlocalStorageにあるため、単に外部ブラウザで開き直しても
+  // 記録は見えない。そこで選んだ記録を圧縮してURLの#kifu=に載せ、LINEの
+  // ?openExternalBrowser=1(外部ブラウザで開かせる公式パラメータ)で開き直して、
+  // 開いた先の履歴に取り込んでから保存してもらう。
+  const IS_LINE_BROWSER = / Line\//i.test(navigator.userAgent);
+  const KIFU_HASH_PREFIX = "#kifu=";
+  const KIFU_TRANSFER_MAX_CHARS = 60000; // URLが長すぎて外部ブラウザに渡らないのを避ける目安
+
+  function bytesToBase64Url(bytes) {
+    let bin = "";
+    for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+    return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  }
+  function base64UrlToBytes(text) {
+    let b64 = text.replace(/-/g, "+").replace(/_/g, "/");
+    while (b64.length % 4) b64 += "=";
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return bytes;
+  }
+  async function pipeBytes(bytes, stream) {
+    return new Uint8Array(await new Response(new Blob([bytes]).stream().pipeThrough(stream)).arrayBuffer());
+  }
+  // 先頭1文字で形式を表す: "z" = deflate圧縮済み, "j" = 生のJSON(圧縮APIが無い環境用)
+  async function encodeKifuTransfer(records) {
+    const bytes = new TextEncoder().encode(JSON.stringify(records));
+    if (window.CompressionStream) {
+      try { return "z" + bytesToBase64Url(await pipeBytes(bytes, new CompressionStream("deflate-raw"))); } catch (e) { /* 生JSONで送る */ }
+    }
+    return "j" + bytesToBase64Url(bytes);
+  }
+  async function decodeKifuTransfer(code) {
+    let bytes = base64UrlToBytes(code.slice(1));
+    if (code[0] === "z") bytes = await pipeBytes(bytes, new DecompressionStream("deflate-raw"));
+    const records = JSON.parse(new TextDecoder().decode(bytes));
+    if (!Array.isArray(records)) throw new Error("bad payload");
+    return records.filter((r) => r && typeof r.id === "string" && Array.isArray(r.moves));
+  }
+
+  async function copyText(text) {
+    try { await navigator.clipboard.writeText(text); return true; } catch (e) { /* 下の旧方式へ */ }
+    const ta = el("textarea", { style: { position: "fixed", top: "0", left: "0", opacity: "0" } });
+    ta.value = text;
+    document.body.appendChild(ta);
+    ta.select();
+    let ok = false;
+    try { ok = document.execCommand("copy"); } catch (e) { ok = false; }
+    ta.remove();
+    return ok;
+  }
+
+  function offerLineHandoff(records) {
+    const veil = el("div", { class: "veil" });
+    const close = () => veil.remove();
+    const openBtn = el("button", {
+      class: "btn btn-compact", text: "ブラウザで開いて保存",
+      style: { borderColor: "var(--accent)", color: "var(--accent)", fontWeight: "700" },
+    });
+    const copyBtn = el("button", { class: "btn btn-compact", text: "CSVをコピー" });
+    openBtn.addEventListener("click", async () => {
+      openBtn.disabled = true;
+      let code;
+      try { code = await encodeKifuTransfer(records); } catch (e) { code = null; }
+      if (!code || code.length > KIFU_TRANSFER_MAX_CHARS) {
+        openBtn.disabled = false;
+        toast(code ? "一度に送るには多すぎます。選ぶ件数を減らしてください。" : "記録の変換に失敗しました。");
+        return;
+      }
+      close();
+      location.href = location.origin + location.pathname + "?openExternalBrowser=1" + KIFU_HASH_PREFIX + code;
+    });
+    copyBtn.addEventListener("click", async () => {
+      const ok = await copyText(records.map(matchRecordToCsv).join("\n\n"));
+      toast(ok ? `${records.length}件分のCSVをコピーしました` : "コピーできませんでした");
+      if (ok) close();
+    });
+    veil.appendChild(el("div", { class: "modal" }, [
+      el("p", { text: "LINEのアプリ内ブラウザでは、ファイルを保存できません。" }),
+      el("p", { style: { color: "var(--text-secondary)", fontSize: "12.5px" }, text: `「ブラウザで開いて保存」を押すと、Safari・Chromeなどで開き直します。選んだ${records.length}件の対局記録も一緒に引き継がれるので、開いた先でダウンロードしてください。うまく切り替わらない場合は「CSVをコピー」でメモ帳などに貼り付けられます。` }),
+      el("div", { class: "modal-actions", style: { flexWrap: "wrap" } }, [
+        el("button", { class: "btn btn-compact", text: "キャンセル", onclick: close }),
+        copyBtn,
+        openBtn,
+      ]),
+    ]));
+    document.body.appendChild(veil);
+  }
+
+  // #kifu=... 付きで開かれたら、記録をこの端末の履歴に取り込んで対戦履歴画面を開く。
+  async function importKifuFromHash() {
+    const code = location.hash.slice(KIFU_HASH_PREFIX.length);
+    history.replaceState(null, "", location.pathname); // 再読み込みで二重に取り込まないよう消す
+    let incoming;
+    try { incoming = await decodeKifuTransfer(code); } catch (e) {
+      toast("引き継いだ対局記録を読み取れませんでした");
+      return null;
+    }
+    const list = loadHistory();
+    const known = new Set(list.map((r) => r.id));
+    incoming.forEach((r) => { if (!known.has(r.id)) { list.push(r); known.add(r.id); } });
+    // idは「作成時刻(ms)_乱数」なので、その時刻順に並べ直して履歴の時系列を保つ
+    list.sort((a, b) => (parseInt(a.id, 10) || 0) - (parseInt(b.id, 10) || 0));
+    saveHistoryList(list);
+    return incoming.map((r) => r.id);
   }
 
   // 無圧縮(STORE)ZIPの最小実装。外部ライブラリを使わずに済ませるため、
@@ -1803,10 +1914,21 @@
   }
 
   // ============================================================ 対戦履歴
-  function renderHistory(root) {
+  // payload.preselect: 最初から選択しておく記録のid(LINEから引き継いだ記録など)
+  function renderHistory(root, payload) {
+    const preselect = (payload && payload.preselect) || [];
     const screen = el("div", { class: "screen" });
     screen.appendChild(el("h1", { class: "card-title", text: "対戦履歴", style: { fontSize: "24px" } }));
     screen.appendChild(el("div", { class: "field-hint", text: "この端末のブラウザに保存されている対戦記録です(他の端末とは共有されません)。" }));
+    if (preselect.length) {
+      screen.appendChild(el("div", { class: "banner success" }, [
+        el("span", { text: `LINEから${preselect.length}件の対局記録を引き継ぎました。選択済みなので「まとめてダウンロード」で保存できます。` }),
+      ]));
+    } else if (IS_LINE_BROWSER) {
+      screen.appendChild(el("div", { class: "banner neutral" }, [
+        el("span", { text: "LINEで開いています。ダウンロードするときは、記録を引き継いでSafari・Chromeなどのブラウザで開き直します。" }),
+      ]));
+    }
     const card = el("div", { class: "card", style: { width: "min(640px,100%)" } });
     const list = el("ul", { class: "history-list" });
     const records = loadHistory().slice().reverse();
@@ -1814,7 +1936,7 @@
       card.appendChild(el("div", { class: "history-empty", text: "まだ対戦記録がありません。対戦を1局終えると、ここに表示されます。" }));
     } else {
       // まとめてダウンロード用の選択状態(画面を開き直すとリセット)
-      const selected = new Set();
+      const selected = new Set(records.filter((r) => preselect.includes(r.id)).map((r) => r.id));
       const checkboxes = [];
       const countText = el("span", { class: "history-bulk-count" });
       const downloadBtn = el("button", {
@@ -2218,8 +2340,14 @@
 
   // ============================================================ 起動
   // #online=<コード> を含むリンクから開かれた場合は、そのままオンライン対局へ。
-  App.screen = /^#online=/.test(location.hash) ? "online" : "menu";
-  render();
+  // #kifu=<コード> はLINE内ブラウザから引き継いだ対局記録(offerLineHandoff参照)。
+  if (location.hash.startsWith(KIFU_HASH_PREFIX)) {
+    App.screen = "history";
+    importKifuFromHash().then((ids) => { render(ids && ids.length ? { preselect: ids } : undefined); });
+  } else {
+    App.screen = /^#online=/.test(location.hash) ? "online" : "menu";
+    render();
+  }
   window.addEventListener("hashchange", () => {
     if (/^#online=/.test(location.hash) && App.screen !== "game") { App.screen = "online"; render(); }
   });
