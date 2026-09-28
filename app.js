@@ -33,9 +33,9 @@
   function initWorker() {
     if (!Worker_) { workerOk = false; return; }
     try {
-      worker = new Worker_("ai-worker.js");
+      worker = new Worker_("ai-worker.js?v=3");
       worker.onmessage = (e) => {
-        if (e.data.reqId !== pendingReqId) return; // 破棄済み(リスタート等)の応答
+        if (e.data.reqId !== pendingReqId || e.data.progress != null) return; // 破棄済み(リスタート等)の応答
         if (onWorkerResult) onWorkerResult(e.data);
       };
       worker.onerror = () => { workerOk = false; };
@@ -104,6 +104,33 @@
         } catch (err) {
           if (pendingReqId === reqId && onWorkerResult) { const cb = onWorkerResult; onWorkerResult = null; cb({ ok: false, error: String(err), reqId }); }
         }
+      }, 20);
+    }
+  }
+
+  // 詰めピンチの受け(op:"defend")・ヒント(op:"hint")を Worker で計算する
+  function requestTsume(op, engine, solver, quietLeft, maxPlies, callback) {
+    const reqId = reqSeq++;
+    pendingReqId = reqId;
+    onWorkerResult = (data) => {
+      onWorkerResult = null;
+      callback(data.ok ? data.result : null, data);
+    };
+    const payload = { kind: "tsume", op, reqId, config: engine.config, state: engineSnapshot(engine), solver, quietLeft, maxPlies };
+    if (worker && workerOk) {
+      worker.postMessage(payload);
+    } else {
+      setTimeout(() => {
+        let data;
+        try {
+          const rebuilt = rebuildEngineFromState(payload.config, payload.state);
+          const T = window.HasamiTsume;
+          const result = op === "hint" ? T.hintFor(rebuilt, solver, quietLeft, maxPlies) : T.defendFor(rebuilt, solver, quietLeft, maxPlies);
+          data = { ok: true, result, reqId };
+        } catch (err) {
+          data = { ok: false, error: String(err), reqId };
+        }
+        if (pendingReqId === reqId && onWorkerResult) { const cb = onWorkerResult; onWorkerResult = null; cb(data); }
       }, 20);
     }
   }
@@ -208,7 +235,8 @@
   };
 
   function goto(screen, payload) {
-    if (App.match && App.screen === "game" && screen !== "game") {
+    if (App.match && App.match.mode === "tsume") stopTsumeReplay(App.match);
+    if (App.match && App.screen === "game" && screen !== "game" && App.match.mode !== "tsume") {
       // 対局中にメニュー等へ抜けようとした場合は確認する
       const engine = App.match.engine;
       if (engine && !engine.isOver() && !App.match.aiThinking) {
@@ -520,30 +548,45 @@
     maybeTriggerAI();
   }
 
-  // ---- 詰めピンチ(強制勝ち問題) ------------------------------------
-  function rebuildEngineFromPuzzlePosition(position) {
-    const config = makeConfig({
-      rows: position.rows, cols: position.cols, moveRange: position.moveRange,
-      wallSandwich: position.wallSandwich, contactLimit: position.contactLimit,
-    });
-    const engine = new GameEngine(config);
-    engine.stock.A = position.stockA;
-    engine.stock.B = position.stockB;
-    // 駒を直接セットする(place_pieceの禁じ手チェックは、記録済みの実戦局面を
-    // そのまま再現するためのものなので通す必要がない)。
-    let nextId = 1;
-    for (const [player, r, c] of position.pieces) {
-      const id = nextId++;
-      engine.pieces.set(id, { id, player, position: [r, c] });
-      engine.board.set(r + "," + c, id);
-    }
-    engine._nextPieceId = nextId;
-    engine.currentPlayer = position.currentPlayer;
-    return engine;
+  // ---- 詰めピンチ ---------------------------------------------------
+  // 問題は tsume-data.js(tsume_lab.js が実戦の棋譜と AI 自己対戦から発掘し、
+  // tsume.js のソルバーで手数・唯一解を証明したもの)。受け方の AI は同じソルバーで
+  // 「最も長く粘る受け」を返し、あなたの手で詰みが消えたら逃れの手を指して失敗を知らせる。
+  const T = window.HasamiTsume;
+  const TD = window.HasamiTsumeData;
+  const LS_TSUME = "hasami:tsume:v2";
+  const LS_TSUME_MINE = "hasami:tsume:mine:v1";
+  const TSUME_SLACK = 2; // 最短より2手長い詰みまではクリアと認める(星は2つ)
+
+  function loadTsumeProgress() { try { return JSON.parse(localStorage.getItem(LS_TSUME) || "{}"); } catch (e) { return {}; } }
+  function saveTsumeProgress(p) { try { localStorage.setItem(LS_TSUME, JSON.stringify(p)); } catch (e) { /* 保存できなくても遊べる */ } }
+  function loadMyPuzzles() { try { return JSON.parse(localStorage.getItem(LS_TSUME_MINE) || "[]"); } catch (e) { return []; } }
+  function saveMyPuzzles(list) { try { localStorage.setItem(LS_TSUME_MINE, JSON.stringify(list.slice(-20))); } catch (e) { /* 同上 */ } }
+
+  function markTsume(puzzle, patch) {
+    const prog = loadTsumeProgress();
+    const cur = prog[puzzle.id] || {};
+    if (patch.stars) cur.stars = Math.max(cur.stars || 0, patch.stars);
+    if (patch.viewed) cur.viewed = true;
+    prog[puzzle.id] = cur;
+    saveTsumeProgress(prog);
   }
 
+  function tsumeKindText(puzzle) { return puzzle.quiet ? `詰めろ・${puzzle.par}手` : `${puzzle.par}手詰め`; }
+  function tsumeTitle(puzzle) { return (puzzle.no ? `No.${puzzle.no} ` : "新作 ") + tsumeKindText(puzzle); }
+  function tsumeRuleText(p) {
+    return `${p.rows}×${p.cols}・移動${p.moveRange}・接触${p.contactLimit == null ? "なし" : p.contactLimit}`;
+  }
+  function tsumeSourceText(puzzle) {
+    const s = puzzle.source || {};
+    if (s.kind === "kifu") return `実戦 ${s.file.replace(/^kifu_|\.csv$/g, "")} ${s.ply + 1}手目の局面`;
+    if (s.kind === "self") return "AI自己対戦から作問";
+    return "自動生成";
+  }
+  function starText(n) { return "★".repeat(n || 0) + "☆".repeat(3 - (n || 0)); }
+
   function startTsumePuzzle(puzzle) {
-    const engine = rebuildEngineFromPuzzlePosition(puzzle.position);
+    const engine = T.engineFromPosition(puzzle.position);
     App.match = {
       mode: "tsume",
       puzzle,
@@ -552,7 +595,7 @@
       stockA: puzzle.position.stockA, stockB: puzzle.position.stockB,
       ruleTemplate: null,
       engine,
-      humanPlayer: "B", // 詰めピンチは常に後手(プレイヤー2)側を解く
+      humanPlayer: puzzle.position.currentPlayer, // 出題局面の手番側を持つ(先手の問題も後手の問題もある)
       selected: null,
       lastAction: null,
       logMessages: [],
@@ -563,59 +606,324 @@
       kifuSaved: false,
       pieceNodes: new Map(),
       startedAt: Date.now(),
-      tsumeMoveCount: 0,
+      tsumeHintUsed: false,
+      tsumeUndoUsed: false,
+      tsumeFailed: null,   // 失敗の説明文(詰みを逃した)
+      tsumeReplay: null,   // 解答の再生中 { step, timer, done }
+      tsumeHint: null,     // { engine, stage(1=駒 / 2=行き先), move, plies }
+      tsumeStars: 0,
     };
     App.screen = "game";
     render();
-    maybeTriggerAI();
+  }
+
+  // 何手進んだか・あなたが挟まない手を何回使ったか(待ったに追従するよう棋譜から数える)
+  function tsumeCounts(m) {
+    const mine = m.kifuRecords.filter((r) => r.mover === m.humanPlayer);
+    return { plies: m.kifuRecords.length, quietUsed: mine.filter((r) => !r.sandwiched.length).length };
+  }
+  function tsumeQuietLeft(m) { return Math.max(0, (m.puzzle.quiet || 0) - tsumeCounts(m).quietUsed); }
+  function tsumeBudget(m) { return m.puzzle.par + TSUME_SLACK - tsumeCounts(m).plies; }
+
+  // あなたの手番で指せる手。挟む手だけに絞る(詰めろ問題で挟まない手が残っていれば null = 制限なし)
+  function tsumeAllowedMoves(m) {
+    if (tsumeQuietLeft(m) > 0) return null;
+    return T.checkMovesOf(m.engine, m.humanPlayer);
+  }
+
+  function startTsumeDefense() {
+    const m = App.match;
+    const defender = otherPlayer(m.humanPlayer);
+    m.aiThinking = true;
+    m.busyText = "相手が受けを考えています";
+    m.selected = null;
+    updateGameUI();
+    const targetEngine = m.engine;
+    requestTsume("defend", m.engine, m.humanPlayer, tsumeQuietLeft(m), tsumeBudget(m), (res) => {
+      if (App.match !== m || m.engine !== targetEngine) return; // やり直し・解答再生で破棄された
+      m.aiThinking = false;
+      m.busyText = null;
+      if (!res) { updateGameUI(); toast("受けの計算に失敗しました。「やり直す」を押してください。"); return; }
+      pushHistory(defender);
+      const fromPos = res.move[0] === "move" ? m.engine.pieces.get(res.move[1]).position.slice() : null;
+      applyLocalAction(defender, res.move, fromPos);
+      m.lastAction = res.move[0] === "move" ? { from: fromPos, to: res.move[2] } : { from: null, to: res.move[1] };
+      if (!res.proven && !m.engine.isOver()) {
+        m.tsumeFailed = tsumeBudget(m) <= 1
+          ? `手数切れです。最短${m.puzzle.par}手の問題なので、${m.puzzle.par + TSUME_SLACK}手以内に詰ませましょう。`
+          : `詰みを逃しました。相手は ${res.label.replace("-", "→")} と受けて逃れました。`;
+      }
+      afterPlayerAction();
+    });
   }
 
   function requestTsumeHint() {
     const m = App.match;
-    if (!m || m.mode !== "tsume" || m.engine.isOver()) return;
-    if (m.engine.currentPlayer !== m.humanPlayer) { toast("相手の手番です"); return; }
-    // 残り最大手数は「パー(par)」を上限にする(パーで詰む問題なので、
-    // 現在の局面がパー通りに進んでいれば必ずこの深さで見つかる)。
-    const maxDepth = Math.max(1, m.puzzle.plies);
-    const hint = AI.solveTsumePinchHint(m.engine, m.humanPlayer, maxDepth);
-    if (!hint) { toast("この手数内では正解手を見つけられませんでした(局面がずれている可能性があります)。"); return; }
-    const [kind, pidOrTo, to] = hint.move;
-    const target = kind === "place" ? pidOrTo : to;
-    const dom = App.gameDom;
-    if (dom) {
-      const cell = dom.cellNodes[target[0]][target[1]];
-      cell.classList.add("is-dest");
-      setTimeout(() => cell.classList.remove("is-dest"), 1600);
+    if (!m || m.mode !== "tsume" || m.engine.isOver() || m.tsumeFailed || m.tsumeReplay || m.aiThinking) return;
+    if (m.engine.currentPlayer !== m.humanPlayer) return;
+    if (activeTsumeHint(m)) {
+      m.tsumeHint.stage = 2;
+      updateGameUI();
+      return;
     }
-    if (kind === "move") {
-      const from = m.engine.pieces.get(pidOrTo).position;
-      toast(`ヒント: ${posLabel(from)} → ${posLabel(to)}(あと${hint.plies}手で勝てます)`);
-    } else {
-      toast(`ヒント: ${posLabel(target)} に配置(あと${hint.plies}手で勝てます)`);
-    }
+    m.aiThinking = true;
+    m.busyText = "ヒントを探しています";
+    updateGameUI();
+    const targetEngine = m.engine;
+    requestTsume("hint", m.engine, m.humanPlayer, tsumeQuietLeft(m), tsumeBudget(m), (res) => {
+      if (App.match !== m || m.engine !== targetEngine) return;
+      m.aiThinking = false;
+      m.busyText = null;
+      if (!res) {
+        updateGameUI();
+        toast("この局面からは手数内の詰みが見つかりません。「待った」で戻ってみましょう。");
+        return;
+      }
+      m.tsumeHintUsed = true;
+      m.tsumeHint = { engine: m.engine, at: m.kifuRecords.length, stage: 1, move: res.move, plies: res.plies };
+      updateGameUI();
+    });
   }
+
+  // ヒントは出した局面でだけ有効(エンジンは指すたびに書き換わるので手数も合わせて見る)
+  function activeTsumeHint(m) {
+    const h = m.tsumeHint;
+    return h && h.engine === m.engine && h.at === m.kifuRecords.length ? h : null;
+  }
+
+  function tsumeHintText(m) {
+    const h = activeTsumeHint(m);
+    if (!h) return "";
+    if (h.move[0] === "place") {
+      return h.stage === 1 ? "ヒント1: 駒を配置する手です(もう一度押すと場所)"
+        : `ヒント2: ${posLabel(h.move[1])} に配置(あと${h.plies}手で詰み)`;
+    }
+    const from = m.engine.pieces.get(h.move[1]).position;
+    return h.stage === 1 ? `ヒント1: ${posLabel(from)} の駒を動かします(もう一度押すと行き先)`
+      : `ヒント2: ${posLabel(from)} → ${posLabel(h.move[2])}(あと${h.plies}手で詰み)`;
+  }
+
+  // 解答(主手順)を最初から自動で並べる
+  function startTsumeReplay() {
+    const m = App.match;
+    if (!m || m.mode !== "tsume") return;
+    stopTsumeReplay(m);
+    pendingReqId = null; // 計算中の受け・ヒントの結果は捨てる
+    m.aiThinking = false;
+    m.busyText = null;
+    m.engine = T.engineFromPosition(m.puzzle.position);
+    m.logMessages = [];
+    m.kifuRecords = [];
+    m.historyStack = [];
+    m.selected = null;
+    m.lastAction = null;
+    m.tsumeFailed = null;
+    m.tsumeHint = null;
+    m.tsumeReplay = { step: 0, timer: null, done: false };
+    markTsume(m.puzzle, { viewed: true });
+    updateGameUI();
+    scheduleTsumeReplayStep(m);
+  }
+
+  function scheduleTsumeReplayStep(m) {
+    const rp = m.tsumeReplay;
+    rp.timer = setTimeout(() => {
+      if (App.match !== m || m.tsumeReplay !== rp) return;
+      const action = T.actionFromLabel(m.engine, m.puzzle.line[rp.step]);
+      const mover = m.engine.currentPlayer;
+      const fromPos = action[0] === "move" ? m.engine.pieces.get(action[1]).position.slice() : null;
+      applyLocalAction(mover, action, fromPos);
+      m.lastAction = action[0] === "move" ? { from: fromPos, to: action[2] } : { from: null, to: action[1] };
+      rp.step++;
+      if (rp.step >= m.puzzle.line.length) { rp.done = true; rp.timer = null; } else scheduleTsumeReplayStep(m);
+      updateGameUI();
+    }, rp.step === 0 ? 600 : 1100);
+  }
+
+  function stopTsumeReplay(m) {
+    if (m && m.tsumeReplay && m.tsumeReplay.timer) { clearTimeout(m.tsumeReplay.timer); m.tsumeReplay.timer = null; }
+  }
+
+  function tsumeListFor(puzzle) {
+    if (!puzzle.no) return loadMyPuzzles();
+    return TD.PUZZLES;
+  }
+  // 今の問題の次にある、まだ星3つでない問題(なければ単に次の問題)
+  function nextTsumePuzzle(puzzle) {
+    const list = tsumeListFor(puzzle);
+    const i = list.findIndex((p) => p.id === puzzle.id);
+    const prog = loadTsumeProgress();
+    for (let k = 1; k <= list.length; k++) {
+      const p = list[(i + k) % list.length];
+      if ((prog[p.id] || {}).stars !== 3) return p;
+    }
+    return list[(i + 1) % list.length];
+  }
+
+  // 対局画面の上に出す、問題のルールと進み具合
+  function updateTsumePanel() {
+    const m = App.match, dom = App.gameDom;
+    if (!dom.tsumePanel) return;
+    const pz = m.puzzle;
+    const c = tsumeCounts(m);
+    clearNode(dom.tsumePanel);
+    const rule = pz.quiet
+      ? `${tsumeKindText(pz)}:毎手、相手の駒を挟む(挟まない手は あと${tsumeQuietLeft(m)}回まで)`
+      : `${tsumeKindText(pz)}:毎手、相手の駒を挟んで、義務の駒を動けなくしよう`;
+    dom.tsumePanel.appendChild(el("div", { class: "tsume-rule", text: rule }));
+    const finished = m.engine.isOver() || m.tsumeFailed || (m.tsumeReplay && m.tsumeReplay.done);
+    const meta = [`${tsumeRuleText(pz.position)}`, `${c.plies}手指した / 最短${pz.par}手`, tsumeSourceText(pz)];
+    if (finished && pz.tags && pz.tags.length) meta.push("テーマ: " + pz.tags.join("・"));
+    dom.tsumePanel.appendChild(el("div", { class: "tsume-meta", text: meta.join(" · ") }));
+    const hint = tsumeHintText(m);
+    if (hint) dom.tsumePanel.appendChild(el("div", { class: "tsume-hint", text: hint }));
+  }
+
+  // ---- 詰めピンチの問題一覧 ----
+  const TSUME_GEN_BOARDS = [
+    { key: "t7", label: "7×7 標準", config: { rows: 7, cols: 7, moveRange: 3, contactLimit: 3, wallSandwich: true }, stock: 15 },
+    { key: "s5", label: "5×5", config: { rows: 5, cols: 5, moveRange: 3, contactLimit: 3, wallSandwich: true }, stock: 8 },
+    { key: "r1", label: "7×7・移動1", config: { rows: 7, cols: 7, moveRange: 1, contactLimit: 4, wallSandwich: true }, stock: 13 },
+    { key: "b9", label: "9×9", config: { rows: 9, cols: 9, moveRange: 3, contactLimit: 3, wallSandwich: true }, stock: 21 },
+  ];
+  const TSUME_GEN_LENGTHS = [
+    { key: "3", label: "3手", minPar: 3, maxPar: 3, quiet: 0 },
+    { key: "5", label: "5手", minPar: 5, maxPar: 5, quiet: 0 },
+    { key: "7", label: "7手", minPar: 7, maxPar: 7, quiet: 0 },
+    { key: "9", label: "9手以上", minPar: 9, maxPar: 15, quiet: 0 },
+    { key: "q", label: "詰めろ", minPar: 3, maxPar: 7, quiet: 1 },
+  ];
+  let tsumeGenWorker = null;
 
   function renderTsumeMenu(root) {
     const screen = el("div", { class: "screen" });
     screen.appendChild(el("h1", { class: "card-title", text: "詰めピンチ", style: { fontSize: "24px" } }));
     screen.appendChild(el("div", {
-      class: "field-hint", style: { textAlign: "center", maxWidth: "560px" },
-      text: "実戦の棋譜から「正しく指せば必ず勝てる」と証明できた局面を出題します。"
-        + "あなたは後手(プレイヤー2)を持ち、相手はレベル『最強』のAIです。"
-        + "必要な手数が多いレベルほど、正しい1手を選び続けるのが難しくなります。",
+      class: "field-hint", style: { textAlign: "center", maxWidth: "580px" },
+      text: "「正しく指せば必ず勝てる」と証明済みの局面から、相手を詰ませる問題集です。"
+        + "詰将棋の王手と同じく、あなたは毎手かならず相手の駒を挟みます(=移動義務を負わせる)。"
+        + "相手が義務のある駒をどれも動かせなくなれば詰み。相手は最も長く粘る受けを返してきます。",
     }));
-    const card = el("div", { class: "card", style: { width: "min(560px,100%)" } });
-    C.TSUME_PUZZLES.forEach((puzzle) => {
-      const row = el("div", { class: "history-row" });
-      row.appendChild(el("div", { class: "history-text" }, [
-        el("div", { class: "history-head", text: puzzle.title }),
-        el("div", { class: "history-sub", text: puzzle.hint }),
-      ]));
-      row.appendChild(el("button", { class: "btn btn-primary", text: "挑戦する", style: { width: "auto", fontSize: "14px", padding: "10px 18px" }, onclick: () => startTsumePuzzle(puzzle) }));
-      card.appendChild(row);
+
+    const prog = loadTsumeProgress();
+    const all = TD.PUZZLES;
+    const cleared = all.filter((p) => (prog[p.id] || {}).stars).length;
+    const perfect = all.filter((p) => (prog[p.id] || {}).stars === 3).length;
+    screen.appendChild(el("div", { class: "tsume-progress", text: `クリア ${cleared} / ${all.length} 問 ・ ★3つ ${perfect} 問` }));
+
+    const tabs = TD.CATEGORIES.map((c) => ({ key: c.key, label: c.title })).concat([{ key: "gen", label: "新作を作る" }]);
+    if (!App.tsumeTab) {
+      const firstOpen = TD.CATEGORIES.find((c) => all.some((p) => p.category === c.key && !(prog[p.id] || {}).stars));
+      App.tsumeTab = firstOpen ? firstOpen.key : TD.CATEGORIES[0].key;
+    }
+    const tabRow = el("div", { class: "tsume-tabs", role: "tablist" });
+    tabs.forEach((t) => {
+      const count = t.key === "gen" ? null : all.filter((p) => p.category === t.key);
+      const done = count ? count.filter((p) => (prog[p.id] || {}).stars).length : 0;
+      tabRow.appendChild(el("button", {
+        class: "tsume-tab", role: "tab", "aria-selected": String(App.tsumeTab === t.key),
+        onclick: () => { App.tsumeTab = t.key; render(); },
+      }, [el("span", { text: t.label }), count ? el("span", { class: "tsume-tab-count", text: `${done}/${count.length}` }) : null]));
     });
+    screen.appendChild(tabRow);
+
+    const card = el("div", { class: "card", style: { width: "min(580px,100%)" } });
+    if (App.tsumeTab === "gen") {
+      renderTsumeGenerator(card);
+    } else {
+      const cat = TD.CATEGORIES.find((c) => c.key === App.tsumeTab);
+      card.appendChild(el("div", { class: "tsume-cat-head", text: `${cat.title}(${cat.sub})` }));
+      all.filter((p) => p.category === App.tsumeTab).forEach((p) => card.appendChild(tsumeRow(p, prog)));
+    }
     screen.appendChild(card);
     root.appendChild(screen);
+  }
+
+  function tsumeRow(p, prog) {
+    const st = prog[p.id] || {};
+    const row = el("div", { class: "history-row" });
+    const subParts = [tsumeRuleText(p.position), tsumeSourceText(p)];
+    // テーマはネタバレになるので、クリアするか解答を見るまで伏せる
+    if ((st.stars || st.viewed) && p.tags && p.tags.length) subParts.push("テーマ: " + p.tags.join("・"));
+    row.appendChild(el("div", { class: "history-text" }, [
+      el("div", { class: "history-head" }, [
+        el("span", { text: tsumeTitle(p) }),
+        el("span", { class: `tsume-stars${st.stars ? " is-on" : ""}`, text: starText(st.stars) }),
+        st.viewed && !st.stars ? el("span", { class: "tsume-viewed", text: "解答を見た" }) : null,
+      ]),
+      el("div", { class: "history-sub", text: subParts.join(" · ") }),
+    ]));
+    row.appendChild(el("button", {
+      class: st.stars ? "btn btn-compact" : "btn btn-primary", text: st.stars ? "再挑戦" : "挑戦する",
+      style: { width: "auto", fontSize: "14px", padding: "10px 18px" }, onclick: () => startTsumePuzzle(p),
+    }));
+    return row;
+  }
+
+  function renderTsumeGenerator(card) {
+    card.appendChild(el("div", { class: "tsume-cat-head", text: "新作を作る(その場で自動作問)" }));
+    card.appendChild(el("div", {
+      class: "field-hint",
+      text: "学習型AI同士の速い対局を裏で指し進め、条件に合う詰み局面が現れたら、"
+        + "唯一解を確かめて不要な駒を取り除き、1問に仕上げます。数秒〜1分ほどかかります。",
+    }));
+    if (!App.tsumeGen) App.tsumeGen = { board: "t7", length: "5" };
+    const g = App.tsumeGen;
+    const segOf = (items, key) => {
+      const wrap = el("div", { class: "seg", role: "radiogroup" });
+      items.forEach((it) => wrap.appendChild(el("button", {
+        role: "radio", "aria-checked": String(g[key] === it.key), text: it.label,
+        onclick: () => { g[key] = it.key; render(); },
+      })));
+      return wrap;
+    };
+    card.appendChild(el("div", { class: "field-row" }, [el("span", { class: "field-label", text: "盤" }), segOf(TSUME_GEN_BOARDS, "board")]));
+    card.appendChild(el("div", { class: "field-row" }, [el("span", { class: "field-label", text: "手数" }), segOf(TSUME_GEN_LENGTHS, "length")]));
+    const status = el("div", { class: "field-hint tsume-gen-status" });
+    const btn = el("button", { class: "btn btn-primary", text: "作問する", style: { width: "auto" } });
+    btn.addEventListener("click", () => generateTsume(status, btn));
+    card.appendChild(el("div", { class: "tsume-gen-actions" }, [btn, status]));
+
+    const mine = loadMyPuzzles();
+    if (mine.length) {
+      card.appendChild(el("div", { class: "tsume-cat-head", text: "作った問題(新しい順・最大20問)", style: { marginTop: "18px" } }));
+      const prog = loadTsumeProgress();
+      mine.slice().reverse().forEach((p) => card.appendChild(tsumeRow(p, prog)));
+    }
+  }
+
+  function generateTsume(status, btn) {
+    if (!Worker_) { toast("この環境では自動作問を使えません(Web Workerが必要です)"); return; }
+    if (tsumeGenWorker) { tsumeGenWorker.terminate(); tsumeGenWorker = null; }
+    const board = TSUME_GEN_BOARDS.find((b) => b.key === App.tsumeGen.board);
+    const len = TSUME_GEN_LENGTHS.find((l) => l.key === App.tsumeGen.length);
+    let w;
+    try { w = new Worker_("ai-worker.js?v=3"); } catch (e) { toast("自動作問を開始できませんでした(ローカルサーバー経由で開いてください)"); return; }
+    tsumeGenWorker = w;
+    btn.disabled = true;
+    status.textContent = "作問中…(AI同士の対局から詰み局面を探しています)";
+    const done = () => { w.terminate(); if (tsumeGenWorker === w) tsumeGenWorker = null; btn.disabled = false; };
+    w.onmessage = (e) => {
+      if (e.data.progress != null) { status.textContent = `作問中…(${e.data.progress}局目を調べ終えました)`; return; }
+      done();
+      if (!e.data.ok || !e.data.result) {
+        status.textContent = "時間内に条件に合う問題が見つかりませんでした。もう一度お試しください。";
+        return;
+      }
+      const pz = Object.assign(e.data.result, { id: `my-${Date.now()}`, category: "gen" });
+      const list = loadMyPuzzles();
+      list.push(pz);
+      saveMyPuzzles(list);
+      if (App.screen === "tsume") startTsumePuzzle(pz);
+    };
+    w.onerror = () => { done(); status.textContent = "自動作問に失敗しました(ローカルサーバー経由で開くと動きます)"; };
+    w.postMessage({
+      kind: "tsume", op: "generate", reqId: 1,
+      opts: {
+        config: board.config, stock: board.stock, minPar: len.minPar, maxPar: len.maxPar, quiet: len.quiet,
+        seed: Math.floor(Math.random() * 0xffffffff), timeLimit: 60000, nodeLimit: 60000,
+      },
+    });
   }
 
   function pushHistory(mover) {
@@ -646,7 +954,7 @@
   function modeLabelText() {
     const m = App.match;
     if (m.mode === "pvai") return `AI戦 - ${aiStrengthName(m.aiLevel, m.aiSpecialist)}`;
-    if (m.mode === "tsume") return `詰めピンチ - ${m.puzzle.title}(相手: ${AI.LEVELS[5].name})`;
+    if (m.mode === "tsume") return `詰めピンチ ${tsumeTitle(m.puzzle)}`;
     if (m.mode === "pvp") return "対人戦(同画面)";
     if (m.mode === "online") return "オンライン対戦(手番リンク)";
     if (m.mode === "ai_vs_ai") return `AI同士の対戦 - 先手:${aiStrengthName(m.aiLevel, m.aiSpecialist)} / 後手:${aiStrengthName(m.aiLevelB, m.aiSpecialistB)}`;
@@ -675,7 +983,7 @@
     if (result.draw) msg += "(千日手成立)";
     m.logMessages.push(msg);
     m.kifuRecords.push({
-      turn: m.kifuRecords.length + 1, player: name, action: kifuAction,
+      turn: m.kifuRecords.length + 1, player: name, mover: player, action: kifuAction,
       from: kifuFrom, to: kifuTo, sandwiched: sandwichedLabels, selfSandwiched: result.selfSandwiched,
     });
     return { sandwichedLabels };
@@ -685,7 +993,6 @@
     const m = App.match;
     const result = AI.applyAction(m.engine, player, action);
     const extra = logAction(player, action, result, fromPos);
-    if (m.mode === "tsume" && player === m.humanPlayer) m.tsumeMoveCount++;
     if (m.mode === "online" && m.onlineActions) {
       m.onlineActions.push(action[0] === "place"
         ? { kind: "place", to: action[1] }
@@ -697,7 +1004,6 @@
 
   function aiOptsFor(player) {
     const m = App.match;
-    if (m.mode === "tsume") return { level: 5, specialist: false }; // 詰めピンチの相手は必ずレベル『最強』
     if (m.mode === "pvai") return { level: m.aiLevel, specialist: m.aiSpecialist };
     return player === "A" ? { level: m.aiLevel, specialist: m.aiSpecialist } : { level: m.aiLevelB, specialist: m.aiSpecialistB };
   }
@@ -706,7 +1012,11 @@
     const m = App.match;
     if (!m || m.engine.isOver()) return;
     const current = m.engine.currentPlayer;
-    if ((m.mode === "pvai" || m.mode === "tsume") && current === otherPlayer(m.humanPlayer)) {
+    if (m.mode === "tsume") {
+      if (current !== m.humanPlayer && !m.tsumeFailed && !m.tsumeReplay) startTsumeDefense();
+      return;
+    }
+    if (m.mode === "pvai" && current === otherPlayer(m.humanPlayer)) {
       startAIMove(current);
     } else if (m.mode === "ai_vs_ai" && !m.aiVsAiPaused) {
       startAIMove(current);
@@ -743,7 +1053,14 @@
 
   function recordIfFinished() {
     const m = App.match;
-    if (m.mode === "tsume") return; // 詰めピンチの挑戦は対戦履歴に残さない
+    if (m.mode === "tsume") { // 詰めピンチの挑戦は対戦履歴ではなく問題ごとの星として残す
+      if (m.engine.winner === m.humanPlayer && !m.tsumeReplay && !m.tsumeStars) {
+        const c = tsumeCounts(m);
+        m.tsumeStars = c.plies <= m.puzzle.par && !m.tsumeHintUsed && !m.tsumeUndoUsed ? 3 : 2;
+        markTsume(m.puzzle, { stars: m.tsumeStars });
+      }
+      return;
+    }
     if ((m.engine.winner || m.engine.isDraw) && !m.kifuSaved) {
       m.kifuSaved = true;
       const record = buildMatchRecord(m);
@@ -784,7 +1101,9 @@
     const screen = el("div", { class: "screen" });
 
     const topBar = el("div", { class: "top-bar" });
-    topBar.appendChild(el("button", { class: "btn btn-compact", text: "← メニューに戻る", onclick: () => goto("menu") }));
+    topBar.appendChild(m.mode === "tsume"
+      ? el("button", { class: "btn btn-compact", text: "← 問題一覧", onclick: () => goto("tsume") })
+      : el("button", { class: "btn btn-compact", text: "← メニューに戻る", onclick: () => goto("menu") }));
     const modeText = el("span", { class: "mode-text" });
     topBar.appendChild(modeText);
     topBar.appendChild(el("div", { class: "grow" }));
@@ -794,14 +1113,19 @@
     const restartBtn = el("button", { class: "btn btn-compact", text: m.mode === "tsume" ? "やり直す" : "新しく対戦", onclick: onRestart });
     if (m.mode === "ai_vs_ai") { topBar.appendChild(pauseBtn); topBar.appendChild(stepBtn); }
     else topBar.appendChild(undoBtn);
+    let hintBtn = null;
     if (m.mode === "tsume") {
-      topBar.appendChild(el("button", { class: "btn btn-compact", text: "ヒント", onclick: requestTsumeHint }));
+      hintBtn = el("button", { class: "btn btn-compact", text: "ヒント", onclick: requestTsumeHint });
+      topBar.appendChild(hintBtn);
+      topBar.appendChild(el("button", { class: "btn btn-compact", text: "解答を見る", onclick: startTsumeReplay }));
     }
     topBar.appendChild(restartBtn);
     screen.appendChild(topBar);
 
     const bannerHost = el("div", { class: "banner-host", style: { width: "min(560px,100%)" } });
     screen.appendChild(bannerHost);
+    const tsumePanel = m.mode === "tsume" ? el("div", { class: "tsume-panel" }) : null;
+    if (tsumePanel) screen.appendChild(tsumePanel);
 
     const turnRow = el("div", { class: "turn-row" });
     const turnText = el("div", { class: "turn-text" });
@@ -860,11 +1184,24 @@
 
     // ---- 保存しておいて updateGameUI から参照する ----
     App.gameDom = {
-      modeText, turnText, obligationText, bannerHost, undoBtn, restartBtn, stepBtn, pauseBtn,
+      modeText, turnText, obligationText, bannerHost, undoBtn, restartBtn, stepBtn, pauseBtn, hintBtn, tsumePanel,
       board, grid, cellNodes, piecesLayer, fxLayer, size, sideA, sideB, logList,
     };
     m.pieceNodes = new Map();
     updateGameUI();
+  }
+
+  // 人間が今選べる駒・行き先・配置先(詰めピンチでは「挟む手」だけに絞る)
+  function humanMoveRules(m) {
+    const engine = m.engine, player = engine.currentPlayer;
+    const allowed = m.mode === "tsume" ? tsumeAllowedMoves(m) : null;
+    const obl = new Set(engine.obligated[player]);
+    return {
+      allowed,
+      canSelect: (piece) => piece.player === player && (allowed ? allowed.has(piece.id) : (!obl.size || obl.has(piece.id))),
+      dests: (piece) => (allowed ? (allowed.get(piece.id) || []) : engine.legalMoves(piece.id)),
+      placements: () => (allowed || obl.size ? [] : engine.legalPlacements(player)),
+    };
   }
 
   function onCellClick(r, c) {
@@ -873,10 +1210,17 @@
     const engine = m.engine;
     const player = engine.currentPlayer;
     if ((m.mode === "pvai" || m.mode === "tsume") && player === otherPlayer(m.humanPlayer)) return;
+    if (m.mode === "tsume" && (m.tsumeFailed || m.tsumeReplay)) return;
     if (m.mode === "ai_vs_ai") return;
 
     const piece = engine.pieceAt([r, c]);
-    const obligatedPositions = new Set(engine.obligated[player].map((pid) => H.posKey(engine.pieces.get(pid).position)));
+    const rules = humanMoveRules(m);
+    const trySelect = () => {
+      if (rules.canSelect(piece)) { m.selected = [r, c]; updateGameUI(); return; }
+      if (rules.allowed && (!engine.obligated[player].length || engine.obligated[player].includes(piece.id))) {
+        toast("この駒では相手を挟めません(詰めピンチでは毎手、相手の駒を挟みます)");
+      }
+    };
 
     if (m.selected) {
       const [sr, sc] = m.selected;
@@ -886,44 +1230,30 @@
         return;
       }
       const selPiece = engine.pieceAt(m.selected);
-      if (selPiece) {
-        const legal = engine.legalMoves(selPiece.id);
-        if (legal.some((p) => p[0] === r && p[1] === c)) {
-          pushHistory(player);
-          const action = ["move", selPiece.id, [r, c]];
-          applyLocalAction(player, action, [sr, sc]);
-          m.lastAction = { from: [sr, sc], to: [r, c] };
-          m.selected = null;
-          afterPlayerAction();
-          return;
-        }
+      if (selPiece && rules.dests(selPiece).some((p) => p[0] === r && p[1] === c)) {
+        pushHistory(player);
+        const action = ["move", selPiece.id, [r, c]];
+        applyLocalAction(player, action, [sr, sc]);
+        m.lastAction = { from: [sr, sc], to: [r, c] };
+        m.selected = null;
+        afterPlayerAction();
+        return;
       }
-      if (piece && piece.player === player) {
-        if (!engine.obligated[player].length || obligatedPositions.has(H.posKey([r, c]))) {
-          m.selected = [r, c];
-          updateGameUI();
-        }
-      }
+      if (piece && piece.player === player) trySelect();
       return;
     }
 
-    if (piece && piece.player === player) {
-      if (!engine.obligated[player].length || obligatedPositions.has(H.posKey([r, c]))) {
-        m.selected = [r, c];
-        updateGameUI();
-      }
-      return;
-    }
+    if (piece && piece.player === player) { trySelect(); return; }
 
     if (!piece) {
-      if (engine.obligated[player].length) return;
-      const legal = engine.legalPlacements(player);
-      if (legal.some((p) => p[0] === r && p[1] === c)) {
+      if (rules.placements().some((p) => p[0] === r && p[1] === c)) {
         pushHistory(player);
         const action = ["place", [r, c]];
         applyLocalAction(player, action, null);
         m.lastAction = { from: null, to: [r, c] };
         afterPlayerAction();
+      } else if (rules.allowed && !engine.obligated[player].length) {
+        toast("詰めピンチでは配置できません(配置では相手を挟めないため)");
       }
     }
   }
@@ -931,9 +1261,18 @@
   function onUndo() {
     const m = App.match;
     if (m.aiThinking || !m.historyStack.length) return;
-    const popCount = ((m.mode === "pvai" || m.mode === "tsume") && m.historyStack.length >= 2) ? 2 : 1;
+    if (m.mode === "tsume" && m.tsumeReplay) return;
     let snap = null;
-    for (let i = 0; i < popCount; i++) snap = m.historyStack.pop();
+    if (m.mode === "tsume") {
+      // あなたの手番まで戻す(失敗した手・詰ませた手の直前に戻れる)
+      do { snap = m.historyStack.pop(); } while (m.historyStack.length && snap.engine.currentPlayer !== m.humanPlayer);
+      m.tsumeUndoUsed = true;
+      m.tsumeFailed = null;
+      m.tsumeHint = null;
+    } else {
+      const popCount = (m.mode === "pvai" && m.historyStack.length >= 2) ? 2 : 1;
+      for (let i = 0; i < popCount; i++) snap = m.historyStack.pop();
+    }
     m.engine = snap.engine;
     m.logMessages.length = snap.logLen;
     m.kifuRecords.length = snap.kifuLen;
@@ -975,6 +1314,7 @@
     if (!m || m.engine.isOver() || m.aiThinking) return false;
     if (m.mode === "ai_vs_ai") return false;
     if ((m.mode === "pvai" || m.mode === "tsume") && m.engine.currentPlayer === otherPlayer(m.humanPlayer)) return false;
+    if (m.mode === "tsume" && (m.tsumeFailed || m.tsumeReplay)) return false;
     return true;
   }
 
@@ -986,7 +1326,12 @@
 
     dom.modeText.textContent = modeLabelText() + (m.ruleTemplate ? " / 特化テンプレート" : "") + ` / 接触制限 ${engine.config.contactLimit}`;
     dom.restartBtn.disabled = false;
-    dom.undoBtn.disabled = m.aiThinking || !m.historyStack.length;
+    dom.undoBtn.disabled = m.aiThinking || !m.historyStack.length || !!m.tsumeReplay;
+    if (dom.hintBtn) {
+      dom.hintBtn.disabled = m.aiThinking || engine.isOver() || !!m.tsumeFailed || !!m.tsumeReplay;
+      const h = activeTsumeHint(m);
+      dom.hintBtn.textContent = h && h.stage === 1 ? "ヒント2" : "ヒント";
+    }
     if (m.mode === "ai_vs_ai") {
       dom.pauseBtn.textContent = m.aiVsAiPaused ? "再開" : "一時停止";
       dom.stepBtn.disabled = !(m.aiVsAiPaused && !engine.isOver());
@@ -996,16 +1341,21 @@
     drawStatus();
     drawLog();
     drawBanner();
+    if (m.mode === "tsume") updateTsumePanel();
 
     if (thinkTimer) { clearInterval(thinkTimer); thinkTimer = null; }
     if (m.aiThinking) {
       let dots = 0;
       const tick = () => {
-        dom.turnText.textContent = `AIが考えています${".".repeat((dots % 3) + 1)}`;
+        dom.turnText.textContent = `${m.busyText || "AIが考えています"}${".".repeat((dots % 3) + 1)}`;
         dots++;
       };
       tick();
       thinkTimer = setInterval(tick, 400);
+    } else if (m.mode === "tsume" && m.tsumeReplay && !engine.isOver()) {
+      dom.turnText.textContent = `解答を再生しています(${m.tsumeReplay.step} / ${m.puzzle.line.length}手)`;
+    } else if (m.mode === "tsume" && m.tsumeFailed) {
+      dom.turnText.textContent = "";
     } else if (!engine.isOver()) {
       dom.turnText.textContent = `${playerDisplayName(engine.currentPlayer)}の番です`;
     } else {
@@ -1015,7 +1365,10 @@
     const oblTexts = [];
     for (const p of ["A", "B"]) {
       if (engine.obligated[p].length) {
-        const labels = engine.obligated[p].map((pid) => posLabel(engine.pieces.get(pid).position)).join(", ");
+        // 同じ駒が2方向から挟まれると義務が重なる(2回動かすまで消えない)ので「×2」と表示する
+        const counts = new Map();
+        for (const pid of engine.obligated[p]) counts.set(pid, (counts.get(pid) || 0) + 1);
+        const labels = Array.from(counts, ([pid, n]) => posLabel(engine.pieces.get(pid).position) + (n > 1 ? `×${n}` : "")).join(", ");
         oblTexts.push(`${playerDisplayName(p)}: ${labels}`);
       }
     }
@@ -1033,22 +1386,24 @@
     const ownSelectable = new Set();
     const placementSet = new Set();
     if (humanTurn) {
-      const obligatedPositions = new Set(engine.obligated[player].map((pid) => H.posKey(engine.pieces.get(pid).position)));
+      const rules = humanMoveRules(m);
       if (m.selected) {
         const selPiece = engine.pieceAt(m.selected);
-        if (selPiece) engine.legalMoves(selPiece.id).forEach((p) => destSet.add(H.posKey(p)));
+        if (selPiece) rules.dests(selPiece).forEach((p) => destSet.add(H.posKey(p)));
       }
-      for (let r = 0; r < size; r++) {
-        for (let c = 0; c < size; c++) {
-          const p = engine.pieceAt([r, c]);
-          if (p && p.player === player) {
-            if (!engine.obligated[player].length || obligatedPositions.has(H.posKey([r, c]))) ownSelectable.add(H.posKey([r, c]));
-          }
-        }
+      for (const p of engine.pieces.values()) {
+        if (rules.canSelect(p)) ownSelectable.add(H.posKey(p.position));
       }
-      if (!m.selected && !engine.obligated[player].length) engine.legalPlacements(player).forEach((p) => placementSet.add(H.posKey(p)));
+      if (!m.selected) rules.placements().forEach((p) => placementSet.add(H.posKey(p)));
     }
     const clickable = new Set([...destSet, ...ownSelectable, ...placementSet]);
+    // 詰めピンチのヒント: 1段目は動かす駒(配置なら何も光らせない)、2段目で行き先も光らせる
+    const hintSet = new Set();
+    const hint = m.mode === "tsume" ? activeTsumeHint(m) : null;
+    if (hint) {
+      if (hint.move[0] === "move") hintSet.add(H.posKey(engine.pieces.get(hint.move[1]).position));
+      if (hint.stage === 2) hintSet.add(H.posKey(hint.move[0] === "move" ? hint.move[2] : hint.move[1]));
+    }
 
     for (let r = 0; r < size; r++) {
       for (let c = 0; c < size; c++) {
@@ -1057,6 +1412,7 @@
         cell.classList.toggle("is-hot", clickable.has(key));
         cell.classList.toggle("is-dest", destSet.has(key) && !engine.pieceAt([r, c]));
         cell.classList.toggle("is-bad", false);
+        cell.classList.toggle("is-hint", hintSet.has(key));
       }
     }
 
@@ -1124,6 +1480,7 @@
     const m = App.match, dom = App.gameDom;
     const engine = m.engine;
     clearNode(dom.bannerHost);
+    if (m.mode === "tsume") { drawTsumeBanner(); return; }
     if (!engine.winner && !engine.isDraw) return;
     let cls = "neutral", text = "";
     if (engine.winner) {
@@ -1131,34 +1488,57 @@
       if (m.mode === "pvai") {
         if (engine.winner === m.humanPlayer) { cls = "success"; text = `${winnerName}の勝ちです。相手の駒を挟んで動けなくしました。`; }
         else { cls = "danger"; text = `${winnerName}の勝ちです。あなたの駒が挟まれて動けなくなりました。`; }
-      } else if (m.mode === "tsume") {
-        if (engine.winner === m.humanPlayer) {
-          cls = "success";
-          const par = m.puzzle.plies;
-          text = m.tsumeMoveCount <= par
-            ? `クリア!(${m.tsumeMoveCount}手、正解は${par}手 - 完璧です)`
-            : `クリアしました(${m.tsumeMoveCount}手、最短は${par}手でした)`;
-        } else {
-          cls = "danger"; text = "残念、詰めきれませんでした。もう一度挑戦してみましょう。";
-        }
       } else {
         cls = "neutral"; text = `${winnerName}の勝ちです。`;
       }
     } else {
       cls = "warning";
-      text = m.mode === "tsume" ? "引き分けです。もう一度挑戦してみましょう。" : "引き分けです(同一局面が繰り返されました)。";
+      text = "引き分けです(同一局面が繰り返されました)。";
     }
     const banner = el("div", { class: `banner ${cls}` });
     banner.appendChild(el("span", { text }));
     const actions = el("div", { style: { display: "flex", gap: "8px" } });
-    if (m.mode === "tsume") {
-      actions.appendChild(el("button", { class: "btn btn-compact", text: "もう一度挑戦", onclick: () => startTsumePuzzle(m.puzzle) }));
-      actions.appendChild(el("button", { class: "btn btn-compact", text: "問題一覧へ", onclick: () => goto("tsume") }));
-    } else if (m.finishedRecord) {
+    if (m.finishedRecord) {
       actions.appendChild(el("button", { class: "btn btn-compact", text: "感想戦を見る", onclick: () => openReview(m.finishedRecord) }));
       actions.appendChild(el("button", { class: "btn btn-compact", text: "棋譜をダウンロード", onclick: () => downloadKifuCsv(m.finishedRecord) }));
     }
     banner.appendChild(actions);
+    dom.bannerHost.appendChild(banner);
+  }
+
+  function drawTsumeBanner() {
+    const m = App.match, dom = App.gameDom;
+    const engine = m.engine;
+    const pz = m.puzzle;
+    let cls = null, text = "";
+    const buttons = [];
+    const btn = (label, fn) => buttons.push(el("button", { class: "btn btn-compact", text: label, onclick: fn }));
+    const next = () => startTsumePuzzle(nextTsumePuzzle(pz));
+    if (m.tsumeReplay) {
+      if (!m.tsumeReplay.done) return;
+      cls = "neutral";
+      text = `解答: ${pz.line.map((lb, i) => `${i + 1}.${lb.replace("-", "→")}`).join(" ")}`;
+      btn("もう一度挑戦", () => startTsumePuzzle(pz));
+      btn("次の問題へ", next);
+    } else if (engine.winner === m.humanPlayer) {
+      const plies = tsumeCounts(m).plies;
+      cls = "success";
+      const how = plies <= pz.par ? "最短手順" : `最短は${pz.par}手`;
+      const note = m.tsumeStars === 3 ? "" : (m.tsumeHintUsed || m.tsumeUndoUsed ? " ※ヒント・待ったを使うと★2つまで" : "");
+      text = `詰み! ${starText(m.tsumeStars)} ${plies}手(${how})${note}`;
+      btn("次の問題へ", next);
+      btn("解答を見る", startTsumeReplay);
+    } else if (m.tsumeFailed || engine.winner || engine.isDraw) {
+      cls = "danger";
+      text = m.tsumeFailed
+        || (engine.winner ? "挟み返されて、あなたの義務の駒が動けなくなりました。" : "同じ局面に戻ってしまいました(千日手)。");
+      btn("待った(1手戻す)", onUndo);
+      btn("解答を見る", startTsumeReplay);
+    }
+    if (!cls) return;
+    const banner = el("div", { class: `banner ${cls}` });
+    banner.appendChild(el("span", { text }));
+    banner.appendChild(el("div", { style: { display: "flex", gap: "8px", flexWrap: "wrap" } }, buttons));
     dom.bannerHost.appendChild(banner);
   }
 
@@ -1182,15 +1562,97 @@
     if (/[",\n]/.test(v)) return '"' + v.replace(/"/g, '""') + '"';
     return v;
   }
-  function downloadKifuCsv(record) {
-    const csv = "﻿" + matchRecordToCsv(record);
-    const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+  function kifuCsvFileName(record) { return `kifu_${record.id}.csv`; }
+  function downloadBlob(blob, fileName) {
     const url = URL.createObjectURL(blob);
-    const a = el("a", { href: url, download: `kifu_${record.id}.csv` });
+    const a = el("a", { href: url, download: fileName });
     document.body.appendChild(a);
     a.click();
     a.remove();
     setTimeout(() => URL.revokeObjectURL(url), 2000);
+  }
+  function downloadKifuCsv(record) {
+    const csv = "﻿" + matchRecordToCsv(record);
+    downloadBlob(new Blob([csv], { type: "text/csv;charset=utf-8" }), kifuCsvFileName(record));
+  }
+  // 複数の棋譜CSVを1つのZIPにまとめてダウンロードする。ブラウザは連続ダウンロードを
+  // ブロックしがちなので、1件ずつではなく1ファイルに固める(1件だけならCSVそのまま)。
+  function downloadKifuCsvBundle(records) {
+    if (!records.length) return;
+    if (records.length === 1) { downloadKifuCsv(records[0]); return; }
+    const enc = new TextEncoder();
+    const files = records.map((rec) => ({ name: kifuCsvFileName(rec), data: enc.encode("﻿" + matchRecordToCsv(rec)) }));
+    const d = new Date();
+    const p2 = (n) => String(n).padStart(2, "0");
+    const stamp = `${d.getFullYear()}${p2(d.getMonth() + 1)}${p2(d.getDate())}_${p2(d.getHours())}${p2(d.getMinutes())}${p2(d.getSeconds())}`;
+    downloadBlob(buildZip(files, d), `kifu_${records.length}games_${stamp}.zip`);
+  }
+
+  // 無圧縮(STORE)ZIPの最小実装。外部ライブラリを使わずに済ませるため、
+  // ローカルファイルヘッダ+中央ディレクトリ+終端レコードだけを自前で組み立てる。
+  let crcTable = null;
+  function crc32(bytes) {
+    if (!crcTable) {
+      crcTable = new Uint32Array(256);
+      for (let n = 0; n < 256; n++) {
+        let c = n;
+        for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1;
+        crcTable[n] = c >>> 0;
+      }
+    }
+    let crc = 0xFFFFFFFF;
+    for (let i = 0; i < bytes.length; i++) crc = crcTable[(crc ^ bytes[i]) & 0xFF] ^ (crc >>> 8);
+    return (crc ^ 0xFFFFFFFF) >>> 0;
+  }
+  function buildZip(files, date) {
+    const enc = new TextEncoder();
+    const dosTime = (date.getHours() << 11) | (date.getMinutes() << 5) | (date.getSeconds() >> 1);
+    const dosDate = ((date.getFullYear() - 1980) << 9) | ((date.getMonth() + 1) << 5) | date.getDate();
+    const parts = [];
+    const central = [];
+    let offset = 0;
+    files.forEach((f) => {
+      const name = enc.encode(f.name);
+      const crc = crc32(f.data);
+      const size = f.data.length;
+      const local = new DataView(new ArrayBuffer(30));
+      local.setUint32(0, 0x04034b50, true);
+      local.setUint16(4, 20, true);        // 展開に必要なバージョン
+      local.setUint16(6, 0x0800, true);    // ファイル名はUTF-8
+      local.setUint16(8, 0, true);         // 無圧縮
+      local.setUint16(10, dosTime, true);
+      local.setUint16(12, dosDate, true);
+      local.setUint32(14, crc, true);
+      local.setUint32(18, size, true);
+      local.setUint32(22, size, true);
+      local.setUint16(26, name.length, true);
+      local.setUint16(28, 0, true);
+      parts.push(local.buffer, name, f.data);
+
+      const cd = new DataView(new ArrayBuffer(46));
+      cd.setUint32(0, 0x02014b50, true);
+      cd.setUint16(4, 20, true);
+      cd.setUint16(6, 20, true);
+      cd.setUint16(8, 0x0800, true);
+      cd.setUint16(10, 0, true);
+      cd.setUint16(12, dosTime, true);
+      cd.setUint16(14, dosDate, true);
+      cd.setUint32(16, crc, true);
+      cd.setUint32(20, size, true);
+      cd.setUint32(24, size, true);
+      cd.setUint16(28, name.length, true);
+      cd.setUint32(42, offset, true);      // 30〜41(拡張/コメント長・属性等)は0のまま
+      central.push(cd.buffer, name);
+      offset += 30 + name.length + size;
+    });
+    const cdSize = central.reduce((s, b) => s + b.byteLength, 0);
+    const end = new DataView(new ArrayBuffer(22));
+    end.setUint32(0, 0x06054b50, true);
+    end.setUint16(8, files.length, true);
+    end.setUint16(10, files.length, true);
+    end.setUint32(12, cdSize, true);
+    end.setUint32(16, offset, true);
+    return new Blob(parts.concat(central, [end.buffer]), { type: "application/zip" });
   }
 
   // ============================================================ チュートリアル
@@ -1351,12 +1813,49 @@
     if (!records.length) {
       card.appendChild(el("div", { class: "history-empty", text: "まだ対戦記録がありません。対戦を1局終えると、ここに表示されます。" }));
     } else {
+      // まとめてダウンロード用の選択状態(画面を開き直すとリセット)
+      const selected = new Set();
+      const checkboxes = [];
+      const countText = el("span", { class: "history-bulk-count" });
+      const downloadBtn = el("button", {
+        class: "btn btn-compact", onclick: () => downloadKifuCsvBundle(records.filter((r) => selected.has(r.id))),
+      });
+      function refreshBulk() {
+        checkboxes.forEach(([cb, rec]) => { cb.checked = selected.has(rec.id); });
+        countText.textContent = `${selected.size} / ${records.length}件を選択`;
+        downloadBtn.disabled = selected.size === 0;
+        downloadBtn.textContent = selected.size >= 2 ? `まとめてダウンロード(ZIP・${selected.size}件)` : "まとめてダウンロード";
+      }
+      function selectRecords(recs) {
+        selected.clear();
+        recs.forEach((r) => selected.add(r.id));
+        refreshBulk();
+      }
+      const bulk = el("div", { class: "history-bulk" });
+      const pickers = el("div", { class: "history-bulk-pickers" });
+      pickers.appendChild(el("button", { class: "btn btn-compact", text: "すべて", onclick: () => selectRecords(records) }));
+      [10, 30].filter((n) => records.length > n).forEach((n) => {
+        pickers.appendChild(el("button", { class: "btn btn-compact", text: `最新${n}件`, onclick: () => selectRecords(records.slice(0, n)) }));
+      });
+      pickers.appendChild(el("button", { class: "btn btn-compact", text: "解除", onclick: () => selectRecords([]) }));
+      bulk.appendChild(pickers);
+      bulk.appendChild(el("div", { class: "history-bulk-action" }, [countText, downloadBtn]));
+      card.appendChild(bulk);
+
       records.forEach((rec) => {
         const row = el("li", { class: "history-row" });
         const cl = rec.contactLimit != null ? `接触${rec.contactLimit}` : "接触制限なし";
-        row.appendChild(el("div", { class: "history-text" }, [
-          el("div", { class: "history-head", text: `${rec.modeLabel} - ${rec.resultText}` }),
-          el("div", { class: "history-sub", text: `${rec.timestamp}  ${rec.rows}x${rec.cols} / ${cl}` }),
+        const cb = el("input", {
+          type: "checkbox", class: "history-check", "aria-label": `${rec.timestamp} の対局を選択`,
+          onchange: () => { if (cb.checked) selected.add(rec.id); else selected.delete(rec.id); refreshBulk(); },
+        });
+        checkboxes.push([cb, rec]);
+        row.appendChild(el("label", { class: "history-pick" }, [
+          cb,
+          el("div", { class: "history-text" }, [
+            el("div", { class: "history-head", text: `${rec.modeLabel} - ${rec.resultText}` }),
+            el("div", { class: "history-sub", text: `${rec.timestamp}  ${rec.rows}x${rec.cols} / ${cl}` }),
+          ]),
         ]));
         const actions = el("div", { class: "history-actions" });
         actions.appendChild(el("button", { class: "btn btn-compact", text: "感想戦", onclick: () => openReview(rec) }));
@@ -1365,6 +1864,7 @@
         list.appendChild(row);
       });
       card.appendChild(list);
+      refreshBulk();
     }
     screen.appendChild(card);
     root.appendChild(screen);

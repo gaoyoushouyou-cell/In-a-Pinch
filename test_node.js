@@ -251,5 +251,170 @@ function check(name, cond, detail) {
   check("learned AI avoids stepping back into an already-seen position", ok);
 })();
 
+// ---- 11. 詰めピンチ: ソルバーを GameEngine だけで書いた素朴な参照実装と突き合わせる ----
+// tsume.js は FastState(指す→戻す)と置換表で速く読むが、ここでは clone() と
+// engine.winner だけを使う独立した実装で同じ「最短手数」になることを確かめる。
+const T = require("./tsume.js");
+const TD = require("./tsume-data.js");
+
+function refDistance(engine, solver, maxPlies, quiet) {
+  // 返り値: 最短手数(maxPlies 以内に詰まなければ null)。path は同一局面への戻り検出用
+  function or(e, d, q, path) {
+    const key = e._stateKey();
+    if (path.has(key)) return false;
+    path.add(key);
+    let ok = false;
+    for (const a of AI.generateActions(e, e.currentPlayer)) {
+      const c = e.clone();
+      const res = AI.applyAction(c, e.currentPlayer, a);
+      const cap = res.newlySandwiched.length > 0;
+      if (!cap && q === 0) continue;
+      if (c.winner === solver) { ok = true; break; }
+      if (c.isOver() || d < 3) continue;
+      if (and(c, d - 1, cap ? q : q - 1, path)) { ok = true; break; }
+    }
+    path.delete(key);
+    return ok;
+  }
+  function and(e, d, q, path) {
+    const key = e._stateKey();
+    if (path.has(key)) return false;
+    path.add(key);
+    let ok = true;
+    for (const a of AI.generateActions(e, e.currentPlayer)) {
+      const c = e.clone();
+      AI.applyAction(c, e.currentPlayer, a);
+      if (c.isOver() || !or(c, d - 1, q, path)) { ok = false; break; }
+    }
+    path.delete(key);
+    return ok;
+  }
+  for (let d = 1; d <= maxPlies; d += 2) if (or(engine, d, quiet, new Set())) return d;
+  return null;
+}
+
+(function () {
+  // 学習型AIの速い自己対戦から局面を集め、1〜5手の範囲で参照実装と一致するか
+  const rng = T.mulberry32(20260927);
+  let compared = 0, mates = 0, mismatch = null;
+  for (let g = 0; g < 6 && !mismatch; g++) {
+    const e = new H.GameEngine(H.makeConfig({ rows: 5, cols: 5, moveRange: 3, contactLimit: 3, wallSandwich: true, stockPerPlayer: 8 }));
+    const ais = { A: new AI.LearnedSearchAI("A", "t", 15, AI.LEARNED_WEIGHTS_GENERIC, g * 2 + 1),
+      B: new AI.LearnedSearchAI("B", "t", 15, AI.LEARNED_WEIGHTS_GENERIC, g * 2 + 2) };
+    for (let ply = 0; ply < 70 && !e.isOver() && !mismatch; ply++) {
+      const p = e.currentPlayer;
+      const acts = AI.generateActions(e, p);
+      AI.applyAction(e, p, ply < 3 || rng() < 0.15 ? acts[Math.floor(rng() * acts.length)] : ais[p].chooseAction(e));
+      if (e.isOver() || ply < 8) continue;
+      for (const quiet of [0, 1]) {
+        const maxPlies = quiet ? 3 : 5;
+        const fast = new T.TsumeSolver(e, e.currentPlayer, { quiet }).distance(maxPlies);
+        const fresh = e.clone();
+        fresh._stateHistory = new Map(); // 実戦の千日手カウントは両実装とも見ない
+        const ref = refDistance(fresh, e.currentPlayer, maxPlies, quiet);
+        compared++;
+        if (fast != null) mates++;
+        if (fast !== ref) mismatch = { ply, quiet, fast, ref, pos: T.positionFromEngine(e) };
+      }
+    }
+  }
+  check(`tsume solver matches the clone-based reference (${compared} cases, ${mates} mates)`, !mismatch && mates > 0,
+    JSON.stringify(mismatch));
+})();
+
+// ---- 12. 詰めピンチ: 問題データの品質(全問を独立に再検証) ----
+(function () {
+  const bad = [];
+  const keys = new Set();
+  for (const pz of TD.PUZZLES) {
+    const why = [];
+    const e = T.engineFromPosition(pz.position);
+    const solver = pz.position.currentPlayer;
+    if (e.isOver()) why.push("already over");
+    if (!T.isNatural(e)) why.push("unnatural");
+    const key = T.canonicalKey(pz.position);
+    if (keys.has(key)) why.push("duplicate");
+    keys.add(key);
+    // 最短手数と唯一解
+    const info = T.analyze(e, solver, pz.par, { quiet: pz.quiet });
+    if (!info || info.par !== pz.par) why.push(`par ${info && info.par} != ${pz.par}`);
+    else if (pz.par >= 3 && !info.unique) why.push("not unique");
+    if (pz.quiet && T.analyze(e, solver, pz.par, { quiet: 0 })) why.push("solvable without quiet move");
+    if (!pz.quiet && info && info.rootChecks < 2) why.push("only one check at root");
+    // 主手順を素のエンジンで並べ直す: 攻めは挟む手(静かな手は quiet 回まで)、最後は攻め方の勝ち
+    const r = e.clone();
+    let quietUsed = 0;
+    if (pz.line.length !== pz.par) why.push("line length");
+    for (const label of pz.line) {
+      const mover = r.currentPlayer;
+      const action = T.actionFromLabel(r, label);
+      if (!action) { why.push(`bad label ${label}`); break; }
+      let res;
+      try { res = AI.applyAction(r, mover, action); } catch (err) { why.push(`illegal ${label}`); break; }
+      if (mover === solver && !res.newlySandwiched.length) quietUsed++;
+    }
+    if (quietUsed > pz.quiet) why.push("too many quiet moves");
+    if (r.winner !== solver) why.push("line does not mate");
+    if (why.length) bad.push(`${pz.id}: ${why.join(", ")}`);
+  }
+  check(`all ${TD.PUZZLES.length} puzzles re-verified (par, uniqueness, legal mating line)`, bad.length === 0, bad.join(" / "));
+  const cats = new Set(TD.CATEGORIES.map((c) => c.key));
+  check("every puzzle belongs to a known category", TD.PUZZLES.every((p) => cats.has(p.category)));
+})();
+
+// ---- 13. 詰めピンチ: 対局画面と同じ手順(ヒント→最長抵抗の受け)で必ず詰み、悪手には逃れを返す ----
+(function () {
+  let ok = true, detail = "";
+  for (const pz of TD.PUZZLES.filter((p, i) => i % 5 === 0)) {
+    const e = T.engineFromPosition(pz.position);
+    const solver = pz.position.currentPlayer;
+    let plies = 0, quietLeft = pz.quiet;
+    while (!e.isOver() && plies < pz.par + 2) {
+      if (e.currentPlayer === solver) {
+        const h = T.hintFor(e, solver, quietLeft, pz.par - plies);
+        if (!h) { ok = false; detail = `${pz.id}: no hint at ply ${plies}`; break; }
+        if (h.quiet) quietLeft--;
+        AI.applyAction(e, solver, h.move);
+      } else {
+        const d = T.defendFor(e, solver, quietLeft, pz.par - plies);
+        if (!d || !d.proven) { ok = false; detail = `${pz.id}: defender escaped at ply ${plies}`; break; }
+        AI.applyAction(e, e.currentPlayer, d.move);
+      }
+      plies++;
+    }
+    if (ok && (e.winner !== solver || plies !== pz.par)) { ok = false; detail = `${pz.id}: mated in ${plies}, par ${pz.par}`; }
+    if (!ok) break;
+  }
+  check("hint + longest-resistance defence mates exactly in par", ok, detail);
+
+  // 3手以上の問題で、初手に「詰まない挟む手」を指すと受け方は逃れの手を返す
+  let tested = 0, escaped = 0;
+  for (const pz of TD.PUZZLES.filter((p) => p.par >= 3 && !p.quiet)) {
+    const e = T.engineFromPosition(pz.position);
+    const solver = pz.position.currentPlayer;
+    const s = new T.TsumeSolver(e, solver, {});
+    const wrong = s.rankChecks(pz.par + 2).find((x) => x.plies == null); // 最短+2手まではクリア扱いなので、それでも詰まない手
+    if (!wrong) continue;
+    AI.applyAction(e, solver, s.toAction(wrong.code));
+    if (e.isOver()) continue;
+    tested++;
+    const d = T.defendFor(e, solver, 0, pz.par + 2 - 1);
+    if (d && !d.proven) escaped++;
+  }
+  check(`wrong first move lets the defender escape (${escaped}/${tested})`, tested > 0 && escaped === tested);
+})();
+
+// ---- 14. 詰めピンチ: 局面データは移動義務まで往復で保たれる ----
+(function () {
+  const e = new H.GameEngine(H.makeConfig({ rows: 7, cols: 7, moveRange: 3, wallSandwich: true, contactLimit: 3 }));
+  e.pieces.set(4, { id: 4, player: "B", position: [3, 0] }); e.board.set("3,0", 4);
+  e.pieces.set(9, { id: 9, player: "A", position: [3, 2] }); e.board.set("3,2", 9);
+  e._nextPieceId = 10;
+  e.movePiece("A", 9, [3, 1]); // 壁挟み → B の駒に移動義務
+  const back = T.engineFromPosition(T.positionFromEngine(e));
+  check("position round-trip keeps obligations", back.obligated.B.length === 1
+    && back.pieces.get(back.obligated.B[0]).position.join() === "3,0" && back.currentPlayer === "B");
+})();
+
 console.log(`\n==== ${pass} passed, ${fail} failed ====`);
 process.exit(fail ? 1 : 0);

@@ -5,12 +5,15 @@
  * メインスレッドで実行すると画面が固まってしまう。そこでこの Worker の中で
  * 探索を行い、結果だけを postMessage で画面側に返す。
  *
+ * 詰めピンチ(kind: "tsume")の受け・ヒント・新作の自動生成もここで行う。
+ *
  * postMessage は構造化複製(structured clone)アルゴリズムを使うため、
  * Map や配列はそのまま送受信できる(JSON化は不要)。
  */
-importScripts("engine.js", "ai.js");
+importScripts("engine.js?v=3", "ai.js?v=3", "tsume.js?v=1");
 
 self.onmessage = function (e) {
+  if (e.data.kind === "tsume") { handleTsume(e.data); return; }
   const { reqId, config, state, player, level, specialist, seed, timeBudget } = e.data;
   try {
     const engine = rebuildEngine(config, state);
@@ -24,6 +27,27 @@ self.onmessage = function (e) {
     postMessage({ reqId, ok: false, error: String((err && err.message) || err) });
   }
 };
+
+function handleTsume(d) {
+  const T = self.HasamiTsume;
+  try {
+    let result;
+    if (d.op === "generate") {
+      result = T.generatePuzzle(Object.assign({}, d.opts, {
+        deadline: Date.now() + d.opts.timeLimit,
+        onProgress: (games) => postMessage({ reqId: d.reqId, progress: games }),
+      }));
+    } else {
+      const engine = rebuildEngine(d.config, d.state);
+      result = d.op === "hint"
+        ? T.hintFor(engine, d.solver, d.quietLeft, d.maxPlies)
+        : T.defendFor(engine, d.solver, d.quietLeft, d.maxPlies);
+    }
+    postMessage({ reqId: d.reqId, ok: true, result });
+  } catch (err) {
+    postMessage({ reqId: d.reqId, ok: false, error: String((err && err.message) || err) });
+  }
+}
 
 function rebuildEngine(config, state) {
   const engine = Object.create(self.Hasami.GameEngine.prototype);
