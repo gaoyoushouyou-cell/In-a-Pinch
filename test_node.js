@@ -532,5 +532,93 @@ function refDistance(engine, solver, maxPlies, quiet) {
     AI.MOVE_JUDGE_LEVELS.map((l) => `${l.min}${l.label}${l.mark}`).join() === "0.3大悪手??,0.15悪手?,0.08疑問手?!");
 })();
 
+// ---- 17. チュートリアル: 全レッスンの模範手順で課題を達成でき、✕のマスは本当に置けない ----
+// (Python版 test_engine 9k と同じ確認。画面と同じ tutorial.js の判定を使う)
+(function () {
+  const C = require("./content.js");
+  const TU = require("./tutorial.js");
+  const lessons = C.TUTORIAL_LESSONS;
+  check("tutorial: 12 lessons, last one is the finale", lessons.length === 12 && lessons[11].finale && !lessons[11].board);
+  lessons.forEach((L, li) => {
+    if (!L.board) return;
+    const name = `tutorial ${li + 1}「${L.title}」`;
+    check(`${name}: board rows match size`, L.board.rows.length === L.board.size && L.board.rows.every((r) => r.length === L.board.size));
+    const e = TU.buildEngine(L.board);
+    let ok = true, why = "";
+    L.steps.forEach((step, si) => {
+      if (!ok) return;
+      if (step.pre) { const a = TU.resolveAction(e, "B", step.pre); TU.playAs(e, "B", a); }
+      const sol = step.solution;
+      if (step.goal === "select") {
+        const p = e.pieceAt(H.posFromLabel(sol[1]));
+        if (!p || p.player !== "A" || !e.legalMoves(p.id).length) { ok = false; why = `step${si + 1} select`; }
+        return;
+      }
+      if (step.goal === "tryBad") {
+        const legal = new Set(e.legalPlacements("A").map(H.posKey));
+        for (const lb of step.marks) {
+          const pos = H.posFromLabel(lb);
+          if (legal.has(H.posKey(pos)) || e.pieceAt(pos) || !TU.placementBlockReason(e, "A", pos)) { ok = false; why = `mark ${lb} is placeable`; }
+        }
+        return;
+      }
+      if (step.goal === "escape") {
+        // 連鎖するマス(C2)へ入ると義務が続き、模範手(C4)なら義務が消える
+        const trap = e.clone();
+        const pid = trap.obligated.A[0];
+        const res = TU.playAs(trap, "A", { kind: "move", pieceId: pid, from: null, to: [1, 2] });
+        if (TU.judgeStep(step, trap, { kind: "move", to: [1, 2] }, res) !== "chain") { ok = false; why = "escape trap is not a chain"; }
+      }
+      const act = TU.resolveAction(e, "A", sol);
+      const legal = act.kind === "place"
+        ? e.legalPlacements("A").some((p) => p[0] === act.to[0] && p[1] === act.to[1])
+        : act.pieceId != null && e.obligated.A.every((id) => id === act.pieceId) && e.legalMoves(act.pieceId).some((p) => p[0] === act.to[0] && p[1] === act.to[1]);
+      if (!legal) { ok = false; why = `step${si + 1} solution illegal ${sol}`; return; }
+      // 1手で届かない「reach」は、前のステップの模範手から続けて届く
+      const res = TU.playAs(e, "A", act);
+      const v = TU.judgeStep(step, e, act, res);
+      if (v !== "success") { ok = false; why = `step${si + 1} verdict ${v}`; return; }
+      if (step.reply && !e.isOver()) {
+        const r = TU.resolveAction(e, "B", step.reply);
+        const legalR = r.kind === "place" ? r.to != null
+          : r.pieceId != null && e.legalMoves(r.pieceId).some((p) => p[0] === r.to[0] && p[1] === r.to[1]);
+        if (!legalR) { ok = false; why = `step${si + 1} reply illegal`; return; }
+        TU.playAs(e, "B", r);
+      } else {
+        TU.passBack(e);
+      }
+      if (e.winner === "B") { ok = false; why = `step${si + 1} you lost`; }
+    });
+    check(`${name}: model solution clears every step`, ok, why);
+  });
+
+  // 「win」のレッスンは模範手以外では勝てない(簡単すぎ・別解なしを確認)
+  lessons.forEach((L, li) => {
+    const step = L.steps[0];
+    if (step.goal !== "win") return;
+    const e = TU.buildEngine(L.board);
+    const wins = AI.generateActions(e, "A").filter((a) => {
+      const c = e.clone(); AI.applyAction(c, "A", a); return c.winner === "A";
+    });
+    check(`tutorial ${li + 1}: exactly one winning move`, wins.length === 1, wins.length);
+  });
+
+  // 指せない理由の文言
+  const e = TU.buildEngine(lessons[7].board);
+  check("tutorial reason: self-sandwich placement", /C3とE3の間/.test(TU.placementBlockReason(e, "A", H.posFromLabel("D3"))));
+  check("tutorial reason: placing to sandwich", /D5をC5と挟む/.test(TU.placementBlockReason(e, "A", H.posFromLabel("E5"))));
+  const e2 = TU.buildEngine(lessons[10].board);
+  check("tutorial reason: contact limit", /4個になり、接触制限\(3個まで\)/.test(TU.placementBlockReason(e2, "A", H.posFromLabel("E4"))));
+  const e3 = TU.buildEngine(lessons[2].board);
+  const mover = e3.pieceAt(H.posFromLabel("D4"));
+  check("tutorial reason: diagonal / blocked / too far", /斜め/.test(TU.moveBlockReason(e3, mover, [2, 2]))
+    && /途中のD6/.test(TU.moveBlockReason(e3, mover, [6, 3])) && /移動範囲の2マス/.test(TU.moveBlockReason(e3, mover, [3, 6])));
+  const e4 = TU.buildEngine(lessons[8].board);
+  e4.stock.A = 3;
+  check("tutorial reason: placing next to an edge piece sandwiches it with the wall",
+    /相手のC1を盤の端と挟む/.test(TU.placementBlockReason(e4, "A", H.posFromLabel("C2")) || ""));
+  check("tutorial reason: no stock", /持ち駒が残っていない/.test(TU.placementBlockReason(TU.buildEngine(lessons[8].board), "A", [3, 3])));
+})();
+
 console.log(`\n==== ${pass} passed, ${fail} failed ====`);
 process.exit(fail ? 1 : 0);

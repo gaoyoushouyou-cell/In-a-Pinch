@@ -2354,118 +2354,460 @@
   }
 
   // ============================================================ チュートリアル
+  // 実際の盤を使ったレッスン形式。局面・課題・相手の手は content.js の TUTORIAL_LESSONS、
+  // 達成判定や「指せない理由」の文言は tutorial.js(Python 版と同じ判定)。
+  const TU = window.HasamiTutorial;
+  const LS_TUTORIAL = "hasami:tutorial:v1";
+  function loadTutorialProgress() {
+    try { const p = JSON.parse(localStorage.getItem(LS_TUTORIAL) || "{}"); return { done: Array.isArray(p.done) ? p.done : [], last: p.last | 0 }; } catch (e) { return { done: [], last: 0 }; }
+  }
+  function saveTutorialProgress(p) { try { localStorage.setItem(LS_TUTORIAL, JSON.stringify(p)); } catch (e) { /* 保存できなくても使える */ } }
+
   function renderTutorial(root) {
-    let page = 0;
+    const lessons = C.TUTORIAL_LESSONS;
+    const progress = loadTutorialProgress();
+    const S = { token: 0, lesson: 0, step: 0, engine: null, start: null, status: "play", selected: null, last: null, lines: [], tried: new Set(), hint: null, pieceNodes: new Map(), dom: null, feedback: { cls: null, lines: [] }, startLast: null, startLines: [] };
+
     const screen = el("div", { class: "screen" });
     screen.appendChild(el("h1", { class: "card-title", text: "チュートリアル", style: { fontSize: "24px" } }));
-    const doc = el("div", { class: "doc" });
-    const title = el("h2", {});
-    const diagram = el("div", { class: "tutorial-diagram" });
-    const body = el("div", {});
-    doc.appendChild(title); doc.appendChild(diagram); doc.appendChild(body);
-    screen.appendChild(doc);
+    const chips = el("div", { class: "tut-chips", role: "tablist", "aria-label": "レッスン一覧" });
+    screen.appendChild(chips);
+
+    const layout = el("div", { class: "tut-layout" });
+    const lessonDoc = el("div", { class: "doc tut-lesson" });
+    const taskBox = el("div", { class: "tut-task" });
+    const boardArea = el("div", { class: "tut-board" });
+    const feedbackBox = el("div", { class: "tut-feedback-area" });
+    layout.appendChild(lessonDoc); layout.appendChild(taskBox); layout.appendChild(boardArea); layout.appendChild(feedbackBox);
+    screen.appendChild(layout);
+
     const nav = el("div", { class: "tutorial-nav" });
-    const prevBtn = el("button", { class: "btn", text: "← 前へ" });
+    const prevBtn = el("button", { class: "btn", text: "← 前のレッスン", onclick: () => openLesson(S.lesson - 1) });
     const indicator = el("span", { class: "tutorial-page-indicator" });
-    const nextBtn = el("button", { class: "btn", text: "次へ →" });
+    const nextBtn = el("button", { class: "btn", text: "次のレッスン →", onclick: () => openLesson(S.lesson + 1) });
     nav.appendChild(prevBtn); nav.appendChild(indicator); nav.appendChild(nextBtn);
     screen.appendChild(nav);
     root.appendChild(screen);
 
-    function renderPage() {
-      const p = C.TUTORIAL_PAGES[page];
-      title.textContent = p.title;
-      clearNode(body);
-      p.body.forEach((line) => body.appendChild(el("p", { text: line || " " })));
-      clearNode(diagram);
-      if (p.grid) diagram.appendChild(renderMiniGrid(p.grid));
-      else if (p.flow) diagram.appendChild(renderFlowDiagram(p.flow));
-      indicator.textContent = `${page + 1} / ${C.TUTORIAL_PAGES.length}`;
-      prevBtn.disabled = page === 0;
-      nextBtn.disabled = page === C.TUTORIAL_PAGES.length - 1;
-    }
-    prevBtn.addEventListener("click", () => { if (page > 0) { page--; renderPage(); } });
-    nextBtn.addEventListener("click", () => { if (page < C.TUTORIAL_PAGES.length - 1) { page++; renderPage(); } });
-    renderPage();
-  }
+    // 前回の続きから(全部終えていれば最初から)
+    const firstOpen = lessons.findIndex((_, i) => !progress.done.includes(i));
+    openLesson(firstOpen < 0 ? 0 : Math.min(progress.last, firstOpen));
 
-  function renderMiniGrid(spec) {
-    const cells = spec.cells;
-    const rows = cells.length, cols = cells[0].length;
-    const cellPx = 46;
-    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-    svg.setAttribute("width", cols * cellPx);
-    svg.setAttribute("height", rows * cellPx);
-    svg.setAttribute("viewBox", `0 0 ${cols * cellPx} ${rows * cellPx}`);
-    for (let r = 0; r < rows; r++) {
-      for (let c = 0; c < cols; c++) {
-        const val = cells[r][c];
-        const x0 = c * cellPx, y0 = r * cellPx;
-        if (val === "W") {
-          svg.appendChild(svgRect(x0 + 1, y0 + 1, cellPx - 2, cellPx - 2, "var(--surface-raised)", "var(--border-bright)"));
-          svg.appendChild(svgText(x0 + cellPx / 2, y0 + cellPx / 2, "壁", "var(--text-muted)", 12));
-          continue;
-        }
-        const bg = (r + c) % 2 === 0 ? "var(--board-bg)" : "var(--board-bg-alt)";
-        svg.appendChild(svgRect(x0 + 1, y0 + 1, cellPx - 2, cellPx - 2, bg, "var(--board-line)"));
-        if (val === "H" || val === "A") {
-          const player = val === "H" ? "A" : "B";
-          const colors = C.PLAYER_COLORS[player];
-          const pad = 6;
-          svg.appendChild(svgCircle(x0 + cellPx / 2, y0 + cellPx / 2, cellPx / 2 - pad, colors.fill));
-          svg.appendChild(svgText(x0 + cellPx / 2, y0 + cellPx / 2, val, colors.on, 15, true));
-        } else if (val === "X") {
-          const m = 12;
-          svg.appendChild(svgLine(x0 + m, y0 + m, x0 + cellPx - m, y0 + cellPx - m, "var(--danger)"));
-          svg.appendChild(svgLine(x0 + m, y0 + cellPx - m, x0 + cellPx - m, y0 + m, "var(--danger)"));
-        }
-        const hl = spec.highlights && spec.highlights[r + "," + c];
-        if (hl) {
-          const rect = svgRect(x0 + 2, y0 + 2, cellPx - 4, cellPx - 4, "none", hl === "danger" ? "var(--danger)" : "var(--accent)");
-          rect.setAttribute("stroke-width", "2.5");
-          svg.appendChild(rect);
-        }
+    function lessonObj() { return lessons[S.lesson]; }
+    function stepObj() { return lessonObj().steps[S.step]; }
+    function later(ms, fn) { const t = S.token; setTimeout(() => { if (t === S.token && App.screen === "tutorial") fn(); }, ms); }
+
+    function openLesson(i) {
+      if (i < 0 || i >= lessons.length) return;
+      S.token++;
+      S.lesson = i;
+      progress.last = i;
+      saveTutorialProgress(progress);
+      const L = lessons[i];
+      S.engine = L.board ? TU.buildEngine(L.board) : null;
+      S.pieceNodes = new Map();
+      S.last = null;
+      S.lines = [];
+      buildLessonDom(L);
+      startStep(0);
+      if (L.finale) markLessonDone();
+      window.scrollTo({ top: 0, behavior: "instant" in window ? "instant" : "auto" });
+    }
+
+    function buildLessonDom(L) {
+      clearNode(chips);
+      lessons.forEach((les, i) => {
+        const cls = "tut-chip" + (i === S.lesson ? " is-current" : "") + (progress.done.includes(i) ? " is-done" : "");
+        chips.appendChild(el("button", {
+          class: cls, role: "tab", "aria-selected": String(i === S.lesson), title: les.title,
+          text: progress.done.includes(i) ? `✓${i + 1}` : String(i + 1), onclick: () => openLesson(i),
+        }));
+      });
+      clearNode(lessonDoc);
+      lessonDoc.appendChild(el("div", { class: "tut-kicker", text: `レッスン ${S.lesson + 1} / ${lessons.length}` }));
+      lessonDoc.appendChild(el("h2", { text: L.title }));
+      L.body.forEach((line) => lessonDoc.appendChild(el("p", { text: line })));
+
+      clearNode(boardArea);
+      layout.classList.toggle("no-board", !L.board);
+      if (L.board) {
+        const shell = buildBoardShell(L.board.size, { onCellClick: onTutorialCell, fx: true });
+        boardArea.appendChild(shell.boardFrame);
+        const status = el("div", { class: "tut-status" });
+        boardArea.appendChild(status);
+        S.dom = Object.assign({ status, size: L.board.size }, shell);
+      } else {
+        S.dom = null;
+      }
+      indicator.textContent = `${S.lesson + 1} / ${lessons.length}`;
+      prevBtn.disabled = S.lesson === 0;
+      nextBtn.disabled = S.lesson === lessons.length - 1;
+    }
+
+    function startStep(k) {
+      S.step = k;
+      S.selected = null;
+      S.tried = new Set();
+      S.hint = null;
+      const step = stepObj();
+      if (step.pre) {
+        S.status = "busy";
+        setFeedback("info", "相手が指します…");
+        drawAll();
+        later(650, () => {
+          const act = TU.resolveAction(S.engine, "B", step.pre);
+          const result = TU.playAs(S.engine, "B", act);
+          S.last = { from: act.from || null, to: act.to };
+          S.lines = TU.sandwichLines(S.engine, act, result);
+          S.start = S.engine.clone();
+          S.startLast = S.last;
+          S.startLines = S.lines;
+          S.status = "play";
+          setFeedback("warn", step.preText);
+          drawAll();
+        });
+        return;
+      }
+      S.start = S.engine ? S.engine.clone() : null;
+      S.startLast = S.last;
+      S.startLines = S.lines;
+      S.status = step.goal === "read" ? "done" : "play";
+      setFeedback(null, "");
+      drawAll();
+    }
+
+    function resetStep() {
+      S.token++;
+      S.engine = S.start.clone();
+      S.selected = null;
+      S.tried = new Set();
+      S.hint = null;
+      S.last = S.startLast;
+      S.lines = S.startLines;
+      S.status = "play";
+      const step = stepObj();
+      setFeedback(step.pre ? "warn" : null, step.pre ? step.preText : "");
+      drawAll();
+    }
+
+    function markLessonDone() {
+      if (!progress.done.includes(S.lesson)) {
+        progress.done.push(S.lesson);
+        saveTutorialProgress(progress);
+        const chip = chips.children[S.lesson];
+        if (chip) { chip.classList.add("is-done"); chip.textContent = `✓${S.lesson + 1}`; }
       }
     }
-    return svg;
-  }
-  function svgRect(x, y, w, h, fill, stroke) {
-    const r = document.createElementNS("http://www.w3.org/2000/svg", "rect");
-    r.setAttribute("x", x); r.setAttribute("y", y); r.setAttribute("width", w); r.setAttribute("height", h);
-    r.setAttribute("fill", fill); if (stroke) r.setAttribute("stroke", stroke);
-    return r;
-  }
-  function svgCircle(cx, cy, rad, fill) {
-    const c = document.createElementNS("http://www.w3.org/2000/svg", "circle");
-    c.setAttribute("cx", cx); c.setAttribute("cy", cy); c.setAttribute("r", rad); c.setAttribute("fill", fill);
-    return c;
-  }
-  function svgText(x, y, text, fill, size, bold) {
-    const t = document.createElementNS("http://www.w3.org/2000/svg", "text");
-    t.setAttribute("x", x); t.setAttribute("y", y + size * 0.35); t.setAttribute("text-anchor", "middle");
-    t.setAttribute("fill", fill); t.setAttribute("font-size", size);
-    if (bold) t.setAttribute("font-weight", "700");
-    t.textContent = text;
-    return t;
-  }
-  function svgLine(x1, y1, x2, y2, stroke) {
-    const l = document.createElementNS("http://www.w3.org/2000/svg", "line");
-    l.setAttribute("x1", x1); l.setAttribute("y1", y1); l.setAttribute("x2", x2); l.setAttribute("y2", y2);
-    l.setAttribute("stroke", stroke); l.setAttribute("stroke-width", "3"); l.setAttribute("stroke-linecap", "round");
-    return l;
-  }
-  function renderFlowDiagram(steps) {
-    const wrap = el("div", { style: { display: "flex", flexWrap: "wrap", gap: "10px", justifyContent: "center", alignItems: "center" } });
-    steps.forEach((step, i) => {
-      wrap.appendChild(el("div", {
-        style: {
-          background: "var(--surface-alt)", border: "1px solid var(--border)", borderRadius: "6px",
-          padding: "10px 12px", fontSize: "12px", color: "var(--text-primary)", width: "130px", textAlign: "center", whiteSpace: "pre-line",
-        }, text: step,
-      }));
-      if (i < steps.length - 1) wrap.appendChild(el("span", { style: { color: "var(--text-muted)" }, text: "→" }));
-    });
-    return wrap;
+
+    function completeStep(...lines) {
+      S.status = "done";
+      S.hint = null;
+      const step = stepObj();
+      const lastStep = S.step === lessonObj().steps.length - 1;
+      if (lastStep && !step.reply) markLessonDone();
+      setFeedback("success", ...lines);
+      drawAll();
+      if (step.reply && !S.engine.isOver()) {
+        S.status = "busy";
+        drawAll();
+        later(1600, () => {
+          const act = TU.resolveAction(S.engine, "B", step.reply);
+          const result = TU.playAs(S.engine, "B", act);
+          S.last = { from: act.from || null, to: act.to };
+          S.lines = TU.sandwichLines(S.engine, act, result);
+          S.status = "done";
+          if (lastStep) markLessonDone();
+          setFeedback("success", ...lines, step.replyText);
+          drawAll();
+        });
+      }
+    }
+
+    // ---- 盤のクリック ----
+    function onTutorialCell(r, c) {
+      if (!S.engine || S.status === "busy" || S.status === "fail" || S.engine.isOver()) return;
+      const engine = S.engine;
+      const step = stepObj();
+      const pos = [r, c];
+      const piece = engine.pieceAt(pos);
+      const label = posLabel(pos);
+
+      if (step.goal === "tryBad" && S.status === "play") {
+        if (step.marks.includes(label)) {
+          S.tried.add(label);
+          const reason = TU.placementBlockReason(engine, "A", pos) || "";
+          const need = step.need || step.marks.length;
+          if (S.tried.size >= need) completeStep(`【${label}】${reason}`, step.success);
+          else { setFeedback("warn", `【${label}】${reason}`, `あと${need - S.tried.size}つ、✕のマスを試してみましょう。`); drawAll(); }
+        } else {
+          setFeedback("info", "まずは✕の付いたマスをタップしてみましょう。");
+        }
+        return;
+      }
+
+      if (S.selected) {
+        const selPiece = engine.pieceAt(S.selected);
+        if (r === S.selected[0] && c === S.selected[1]) {
+          if (!(engine.obligated.A.length === 1 && engine.obligated.A[0] === selPiece.id)) S.selected = null;
+          drawAll();
+          return;
+        }
+        if (!piece && engine.legalMoves(selPiece.id).some((p) => p[0] === r && p[1] === c)) {
+          doAction({ kind: "move", from: S.selected, to: pos, pieceId: selPiece.id });
+          return;
+        }
+        if (piece && piece.player === "A") { trySelect(piece); return; }
+        if (piece) { setFeedback("info", "それは相手の駒です。動かせるのは水色の自分の駒だけです。"); return; }
+        const why = TU.moveBlockReason(engine, selPiece, pos) || "選んだ駒はそこへは動けません。";
+        const extra = engine.stock.A > 0 && !engine.obligated.A.length
+          ? "駒を置きたいときは、選んだ駒をもう一度タップして選択をやめてから空きマスをタップします。" : "金色の点のマスを選んでください。";
+        setFeedback("warn", why, extra);
+        return;
+      }
+
+      if (piece) {
+        if (piece.player === "A") trySelect(piece);
+        else setFeedback("info", "それは相手の駒です。動かせるのは水色の自分の駒だけです。");
+        return;
+      }
+      if (engine.legalPlacements("A").some((p) => p[0] === r && p[1] === c)) {
+        doAction({ kind: "place", to: pos });
+        return;
+      }
+      setFeedback("warn", TU.placementBlockReason(engine, "A", pos) || "そこには置けません。");
+    }
+
+    function trySelect(piece) {
+      const engine = S.engine;
+      const obl = engine.obligated.A;
+      if (obl.length && !obl.includes(piece.id)) {
+        const where = Array.from(new Set(obl)).map((pid) => posLabel(engine.pieces.get(pid).position)).join("・");
+        setFeedback("warn", `今は移動義務のある駒(赤い輪の${where})しか動かせません。`);
+        return;
+      }
+      if (!engine.legalMoves(piece.id).length) {
+        setFeedback("warn", "この駒は今、動ける場所がありません。");
+        return;
+      }
+      S.selected = piece.position.slice();
+      if (S.status === "play" && stepObj().goal === "select") { completeStep(stepObj().success); return; }
+      drawAll();
+    }
+
+    function doAction(act) {
+      const engine = S.engine;
+      const result = TU.playAs(engine, "A", act);
+      S.last = { from: act.from || null, to: act.to };
+      S.lines = TU.sandwichLines(engine, act, result);
+      S.selected = null;
+      S.hint = null;
+      const desc = TU.describeResult(engine, act, result);
+      const step = stepObj();
+      const verdict = S.status === "play" ? TU.judgeStep(step, engine, act, result) : "continue";
+      const replyComing = verdict === "success" && step.reply && !engine.isOver();
+      if (!replyComing) TU.passBack(engine);
+
+      if (verdict === "success") {
+        completeStep(step.success);
+      } else if (verdict === "fail") {
+        S.status = "fail";
+        setFeedback("danger", desc, step.fail || step.hint);
+      } else if (engine.winner === "B") {
+        S.status = "fail";
+        setFeedback("danger", desc, "義務のある駒がどこにも動けなくなりました。本当の対戦なら負けです。「やり直す」で戻りましょう。");
+      } else if (verdict === "chain") {
+        setFeedback("warn", step.chain || desc);
+      } else if (S.status === "play" && step.goal === "reach") {
+        setFeedback("info", desc, `まだ${step.target}に着いていません。続けて動かしましょう。`);
+      } else if (S.status === "play" && step.goal === "escape" && engine.obligated.A.length) {
+        setFeedback("warn", desc, "まだ移動義務が残っています。");
+      } else {
+        setFeedback(desc ? "info" : null, desc);
+      }
+      drawAll();
+    }
+
+    function showHint() {
+      const step = stepObj();
+      const sol = step.solution || [];
+      const cells = new Set();
+      const engine = S.engine;
+      if (sol[0] === "move") {
+        const from = posFromLabel(sol[1]);
+        const p = engine && engine.pieceAt(from);
+        if (p && p.player === "A") { cells.add(H.posKey(from)); cells.add(H.posKey(posFromLabel(sol[2]))); }
+      } else if (sol[0] === "place" && sol[1] !== "auto") cells.add(H.posKey(posFromLabel(sol[1])));
+      else if (sol[0] === "select") cells.add(H.posKey(posFromLabel(sol[1])));
+      else if (sol[0] === "tap") sol.slice(1).forEach((lb) => cells.add(H.posKey(posFromLabel(lb))));
+      S.hint = cells;
+      setFeedback("info", "ヒント: " + step.hint);
+      drawAll();
+    }
+
+    // ---- 表示 ----
+    function setFeedback(cls, ...lines) {
+      S.feedback = { cls, lines: lines.filter((t) => t) };
+      drawFeedback();
+    }
+
+    function drawAll() {
+      drawTask();
+      drawTutorialBoard();
+      drawFeedback();
+    }
+
+    function drawTask() {
+      clearNode(taskBox);
+      const L = lessonObj();
+      const step = stepObj();
+      if (L.finale) {
+        taskBox.appendChild(el("div", { class: "tut-task-head" }, [el("span", { text: "次にすること" })]));
+        const row = el("div", { class: "tut-actions" });
+        row.appendChild(el("button", {
+          class: "btn btn-primary", text: "AI(初級)と練習対局する",
+          onclick: () => startNewMatch({
+            mode: "pvai", boardSize: 7, moveRange: 1, contactLimit: C.DEFAULT_CONTACT_LIMIT,
+            aiLevel: 2, aiLevelB: null, aiSpecialist: false, aiSpecialistB: false,
+            stockA: defaultStockForSize(7), stockB: defaultStockForSize(7), ruleTemplate: null,
+            side: "A", timeControl: null, evalDisplay: false,
+          }),
+        }));
+        row.appendChild(el("button", { class: "btn", text: "戦略コラムを読む", onclick: () => goto("strategy") }));
+        row.appendChild(el("button", { class: "btn", text: "メニューで設定を選ぶ", onclick: () => goto("menu") }));
+        taskBox.appendChild(row);
+        taskBox.appendChild(el("p", { class: "tut-note", text: "練習対局は 7×7・移動範囲1・接触制限4 の標準的な設定で、あなたが先手です。" }));
+        return;
+      }
+      const total = L.steps.length;
+      taskBox.appendChild(el("div", { class: "tut-task-head" }, [
+        el("span", { text: "やってみよう" }),
+        total > 1 ? el("span", { class: "tut-step-count", text: `ステップ ${S.step + 1} / ${total}` }) : null,
+      ]));
+      taskBox.appendChild(el("p", { class: "tut-task-text", text: step.task }));
+      const row = el("div", { class: "tut-actions" });
+      const hintBtn = el("button", { class: "btn btn-compact", text: "ヒント", onclick: showHint });
+      hintBtn.disabled = S.status !== "play";
+      row.appendChild(hintBtn);
+      row.appendChild(el("button", { class: "btn btn-compact", text: "やり直す", onclick: resetStep }));
+      taskBox.appendChild(row);
+    }
+
+    function drawFeedback() {
+      clearNode(feedbackBox);
+      const L = lessonObj();
+      if (S.feedback.lines.length) {
+        const box = el("div", { class: `tut-feedback ${S.feedback.cls || "info"}`, role: "status" });
+        S.feedback.lines.forEach((t) => box.appendChild(el("p", { text: t })));
+        feedbackBox.appendChild(box);
+      }
+      const row = el("div", { class: "tut-actions" });
+      if (S.status === "fail") {
+        row.appendChild(el("button", { class: "btn btn-primary", text: "やり直す", onclick: resetStep }));
+      } else if (S.status === "done" && !L.finale) {
+        const lastStep = S.step === L.steps.length - 1;
+        if (!lastStep) row.appendChild(el("button", { class: "btn btn-primary", text: "次のステップへ →", onclick: () => startStep(S.step + 1) }));
+        else if (S.lesson < lessons.length - 1) row.appendChild(el("button", { class: "btn btn-primary", text: "次のレッスンへ →", onclick: () => openLesson(S.lesson + 1) }));
+      }
+      if (row.children.length) feedbackBox.appendChild(row);
+      nextBtn.classList.toggle("btn-nav", progress.done.includes(S.lesson));
+    }
+
+    function drawTutorialBoard() {
+      const dom = S.dom;
+      if (!dom) return;
+      const engine = S.engine;
+      const step = stepObj();
+      const size = dom.size;
+      const canAct = (S.status === "play" || S.status === "done") && !engine.isOver() && engine.currentPlayer === "A";
+
+      const destSet = new Set(), hot = new Set(), marks = new Set(), glow = new Set(S.hint || []);
+      if (step.target) glow.add(H.posKey(posFromLabel(step.target)));
+      if (step.goal === "tryBad" && S.status === "play") step.marks.forEach((lb) => marks.add(H.posKey(posFromLabel(lb))));
+      if (canAct) {
+        const obl = engine.obligated.A;
+        for (const p of engine.pieces.values()) {
+          if (p.player === "A" && (!obl.length || obl.includes(p.id))) hot.add(H.posKey(p.position));
+        }
+        if (S.selected) {
+          const sp = engine.pieceAt(S.selected);
+          if (sp) engine.legalMoves(sp.id).forEach((p) => { destSet.add(H.posKey(p)); hot.add(H.posKey(p)); });
+        } else if (step.goal !== "tryBad" || S.status !== "play") {
+          engine.legalPlacements("A").forEach((p) => hot.add(H.posKey(p)));
+        }
+        marks.forEach((k) => hot.add(k));
+      }
+      for (let r = 0; r < size; r++) {
+        for (let c = 0; c < size; c++) {
+          const key = r + "," + c;
+          const cell = dom.cellNodes[r][c];
+          cell.classList.toggle("is-hot", hot.has(key));
+          cell.classList.toggle("is-dest", destSet.has(key));
+          cell.classList.toggle("is-hint", glow.has(key));
+          cell.classList.toggle("is-mark", marks.has(key) && !S.tried.has(posLabel([r, c])));
+          cell.classList.toggle("is-mark-done", marks.has(key) && S.tried.has(posLabel([r, c])));
+        }
+      }
+
+      const seen = new Set();
+      for (const piece of engine.pieces.values()) {
+        seen.add(piece.id);
+        let node = S.pieceNodes.get(piece.id);
+        const isNew = !node;
+        if (isNew) {
+          node = el("div", { class: `piece p-${piece.player}` }, [el("div", { class: "disc" }, [el("span", { class: "label", text: piece.player === "A" ? "You" : "相手" })])]);
+          dom.piecesLayer.appendChild(node);
+          S.pieceNodes.set(piece.id, node);
+        }
+        node.style.width = (100 / size) + "%";
+        node.style.height = (100 / size) + "%";
+        node.style.transform = `translate(${piece.position[1] * 100}%, ${piece.position[0] * 100}%)`;
+        node.classList.toggle("is-obligated", engine.obligated[piece.player].includes(piece.id));
+        node.classList.toggle("is-selected", !!(S.selected && S.selected[0] === piece.position[0] && S.selected[1] === piece.position[1]));
+        node.classList.toggle("is-last", !!(S.last && S.last.to[0] === piece.position[0] && S.last.to[1] === piece.position[1]));
+        if (isNew && S.last && S.last.to[0] === piece.position[0] && S.last.to[1] === piece.position[1]) {
+          node.classList.add("just-dropped");
+          setTimeout(() => node.classList.remove("just-dropped"), 550);
+        }
+      }
+      for (const [id, node] of Array.from(S.pieceNodes)) {
+        if (!seen.has(id)) { node.remove(); S.pieceNodes.delete(id); }
+      }
+
+      // 挟んだ線(両端の駒・壁を結ぶ)
+      const fx = dom.fxLayer;
+      while (fx.firstChild) fx.removeChild(fx.firstChild);
+      const unit = 100 / size;
+      S.lines.forEach(([p1, p2]) => {
+        const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+        line.setAttribute("x1", (p1[1] + 0.5) * unit); line.setAttribute("y1", (p1[0] + 0.5) * unit);
+        line.setAttribute("x2", (p2[1] + 0.5) * unit); line.setAttribute("y2", (p2[0] + 0.5) * unit);
+        line.setAttribute("class", "tut-flank");
+        fx.appendChild(line);
+      });
+
+      // 手番・持ち駒・義務
+      clearNode(dom.status);
+      let turn;
+      if (engine.winner === "A") turn = "あなたの勝ち!";
+      else if (engine.winner === "B") turn = "あなたの負け";
+      else if (S.status === "busy") turn = "相手の番です…";
+      else turn = "あなたの番です";
+      dom.status.appendChild(el("span", { class: "tut-turn", text: turn }));
+      dom.status.appendChild(el("span", {}, [
+        el("span", { class: "legend-dot", style: { background: C.PLAYER_COLORS.A.legend } }),
+        document.createTextNode(`あなたの持ち駒 ${engine.stock.A}`),
+      ]));
+      dom.status.appendChild(el("span", {}, [
+        el("span", { class: "legend-dot", style: { background: C.PLAYER_COLORS.B.legend } }),
+        document.createTextNode(`相手の持ち駒 ${engine.stock.B}`),
+      ]));
+      const obl = [];
+      for (const p of ["A", "B"]) {
+        const labels = Array.from(new Set(engine.obligated[p])).map((pid) => posLabel(engine.pieces.get(pid).position));
+        if (labels.length) obl.push(`${p === "A" ? "あなた" : "相手"}の${labels.join("・")}`);
+      }
+      if (obl.length) dom.status.appendChild(el("span", { class: "tut-obl", text: "移動義務: " + obl.join(" / ") }));
+    }
   }
 
   // ============================================================ 戦略コラム

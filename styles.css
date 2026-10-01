@@ -416,7 +416,65 @@ select.field-select:disabled { opacity: .5; }
 
 .tutorial-nav { display: flex; align-items: center; justify-content: center; gap: 14px; }
 .tutorial-page-indicator { font-family: var(--f-mono); color: var(--text-muted); font-size: 12px; }
-.tutorial-diagram { display: flex; justify-content: center; margin: 4px 0 14px; }
+
+/* 操作できるチュートリアル: スマホは「説明→課題→盤→結果」の縦並び、広い画面は説明の右に盤 */
+.tut-chips { display: flex; flex-wrap: wrap; justify-content: center; gap: 6px; width: min(980px, 100%); }
+.tut-chip {
+  min-width: 34px; height: 30px; padding: 0 8px; border-radius: 15px; cursor: pointer;
+  border: 1px solid rgba(201,162,39,.3); background: rgba(255,255,255,.02); color: var(--text-muted);
+  font-family: var(--f-mono); font-size: 12px;
+}
+.tut-chip:hover { border-color: var(--accent); color: var(--warning); }
+.tut-chip.is-done { color: var(--success); border-color: rgba(143,217,212,.4); }
+.tut-chip.is-current { background: var(--accent); border-color: var(--accent); color: var(--bg-deep); font-weight: 700; }
+.tut-layout {
+  display: grid; gap: 14px; width: min(980px, 100%);
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-areas: "lesson" "task" "board" "feedback";
+}
+.tut-lesson { grid-area: lesson; width: 100%; }
+.tut-task { grid-area: task; }
+.tut-board { grid-area: board; display: flex; flex-direction: column; align-items: center; gap: 10px; }
+.tut-feedback-area { grid-area: feedback; display: flex; flex-direction: column; gap: 10px; min-height: 48px; }
+@media (min-width: 900px) {
+  .tut-layout {
+    grid-template-columns: minmax(0, 1fr) 440px;
+    grid-template-rows: auto auto 1fr;
+    grid-template-areas: "lesson board" "task board" "feedback board";
+    align-items: start;
+  }
+  .tut-board { position: sticky; top: 12px; }
+  .tut-layout.no-board { grid-template-columns: minmax(0, 1fr); grid-template-areas: "lesson" "task" "feedback"; width: min(680px, 100%); }
+}
+.tut-board .board-frame { width: min(440px, 100%); }
+.tut-kicker { font-family: var(--f-mono); font-size: 11px; letter-spacing: .2em; color: var(--text-muted); margin-bottom: 4px; }
+.tut-task {
+  background: var(--surface-alt); border: 1px solid rgba(201,162,39,.3); border-left: 3px solid var(--accent);
+  border-radius: 6px; padding: 12px 14px;
+}
+.tut-task-head { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; font-family: var(--f-disp); color: var(--accent); font-size: 15px; letter-spacing: .1em; margin-bottom: 6px; }
+.tut-step-count { font-family: var(--f-mono); font-size: 11px; color: var(--text-muted); letter-spacing: .1em; }
+.tut-task-text { margin: 0 0 10px; font-size: 14px; line-height: 1.8; color: var(--text-primary); }
+.tut-note { margin: 10px 0 0; font-size: 12px; color: var(--text-muted); line-height: 1.6; }
+.tut-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.tut-actions .btn-primary { width: auto; flex: 1 1 auto; padding: 11px 18px; font-size: 16px; letter-spacing: .12em; text-indent: 0; }
+.tut-feedback { border-radius: 8px; padding: 10px 14px; font-size: 13.5px; line-height: 1.75; }
+.tut-feedback p { margin: 0; }
+.tut-feedback p + p { margin-top: 6px; }
+.tut-feedback.info { background: var(--surface-alt); color: var(--text-primary); border: 1px solid rgba(201,162,39,.2); }
+.tut-feedback.success { background: var(--success-bg); color: var(--success); font-weight: 700; }
+.tut-feedback.success p + p { font-weight: 400; color: var(--text-primary); }
+.tut-feedback.warn { background: var(--warning-bg); color: var(--warning); }
+.tut-feedback.danger { background: var(--danger-bg); color: var(--danger); }
+.tut-status { display: flex; flex-wrap: wrap; justify-content: center; align-items: center; gap: 6px 14px; font-size: 12px; color: var(--text-secondary); width: min(440px, 100%); }
+.tut-turn { font-family: var(--f-disp); font-size: 15px; color: var(--accent); }
+.tut-obl { color: var(--danger); flex-basis: 100%; text-align: center; }
+.cell.is-mark::after, .cell.is-mark-done::after {
+  content: "✕"; position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+  color: var(--board-bad); font-size: clamp(16px, 5vw, 30px); font-weight: 700; opacity: .75;
+}
+.cell.is-mark-done::after { opacity: .3; }
+.tut-flank { stroke: var(--danger); stroke-width: 1.4; stroke-linecap: round; stroke-dasharray: 2.5 1.8; opacity: .85; }
 
 .strategy-item { border-bottom: 1px solid rgba(201,162,39,.12); padding: 14px 0; }
 .strategy-item:first-child { padding-top: 0; }
