@@ -368,7 +368,7 @@
     const renderers = {
       menu: renderMenu, game: renderGame, tutorial: renderTutorial, strategy: renderStrategy,
       report: renderReport, history: renderHistory, review: renderReview, online: renderOnline,
-      tsume: renderTsumeMenu,
+      tsume: renderTsumeMenu, rating: renderRating,
     };
     (renderers[App.screen] || renderMenu)(root, payload);
     window.scrollTo({ top: 0, behavior: "instant" in window ? "instant" : "auto" });
@@ -455,6 +455,16 @@
     const levelSelect = buildLevelSelect();
     levelRow.appendChild(el("div", { class: "field-control" }, [levelSelect]));
     card.appendChild(levelRow);
+    // AI戦のときだけ: いまのレートと、近い強さのAI
+    const ratingHint = el("div", { class: "field-hint rating-hint" });
+    const myRating = currentRating();
+    if (myRating != null) {
+      const near = RT.nearestLevel(myRating);
+      ratingHint.textContent = `あなたのレート ${myRating}(近い強さのAI: ${ratingLevelName(near[0])})。形勢表示なし・待ったなしのAI戦でレートが動きます。`;
+    } else {
+      ratingHint.textContent = "AI戦(形勢表示なし・待ったなし)を指すと、結果と指し手の質からレートが付きます。";
+    }
+    card.appendChild(ratingHint);
 
     const levelRowB = el("div", { class: "field-row", style: { display: "none" } });
     levelRowB.appendChild(el("div", { class: "field-label", text: "後手AIの強さ" }));
@@ -686,6 +696,7 @@
       const mode = currentMode();
       sideRow.style.display = mode === "pvai" ? "" : "none";
       onTimeChange();
+      ratingHint.style.display = mode === "pvai" ? "" : "none";
       if (mode === "pvai") {
         levelLabel.textContent = "AIの強さ";
         levelRow.style.display = "";
@@ -1259,7 +1270,10 @@
   }
   function modeLabelText() {
     const m = App.match;
-    if (m.mode === "pvai") return `AI戦 - ${aiStrengthName(m.aiLevel, m.aiSpecialist)}(あなたは${m.humanPlayer === "A" ? "先手" : "後手"})`;
+    if (m.mode === "pvai") {
+      const resumed = m.resumedFrom ? `・感想戦の${m.resumedFrom.ply}手目から再開` : "";
+      return `AI戦 - ${aiStrengthName(m.aiLevel, m.aiSpecialist)}(あなたは${m.humanPlayer === "A" ? "先手" : "後手"}${resumed})`;
+    }
     if (m.mode === "tsume") return `詰めピンチ ${tsumeTitle(m.puzzle)}`;
     if (m.mode === "pvp") return m.timeControl ? `対人戦(同画面) - ${timeControlLabel(m.timeControl)}` : "対人戦(同画面)";
     if (m.mode === "online") return "オンライン対戦(手番リンク)";
@@ -1549,6 +1563,7 @@
       list.push(record);
       saveHistoryList(list);
       m.finishedRecord = record;
+      if (record.ratingPending) processPendingRatings(); // 裏で指し手を解析してレートを更新する
     }
   }
 
@@ -1561,6 +1576,7 @@
   }
 
   function buildMatchRecord(m) {
+    const ratingInfo = ratingInfoFor(m);
     return {
       id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
       timestamp: new Date().toLocaleString("ja-JP"),
@@ -1573,6 +1589,10 @@
       playerALabel: playerDisplayName("A"), playerBLabel: playerDisplayName("B"),
       resultText: resultText(),
       evalDisplay: !!m.evalDisplay, // 形勢表示ありの対局(レートなどの集計で区別する)
+      resumedFrom: m.resumedFrom || null, // 感想戦の途中から再開した対局(元の記録の id と再開した手数)
+      undoUsed: !!m.undoUsed,
+      ratingInfo: ratingInfo, // AI戦のレート計算に使う情報(対象外ならその理由)
+      ratingPending: !!(ratingInfo && ratingInfo.eligible), // レート計算待ち(processPendingRatings が片づける)
       moves: m.kifuRecords.map((r) => Object.assign({}, r)),
     };
   }
@@ -1809,6 +1829,7 @@
       const target = undoTargetIndex(m);
       if (target == null) return;
       while (m.historyStack.length > target) snap = m.historyStack.pop();
+      m.undoUsed = true; // 待ったを使った対局はレートの対象外
     }
     m.engine = snap.engine;
     m.logMessages.length = snap.logLen;
@@ -2088,6 +2109,13 @@
     }
     banner.appendChild(actions);
     dom.bannerHost.appendChild(banner);
+    const note = ratingNoteFor(m.finishedRecord);
+    if (note) {
+      dom.bannerHost.appendChild(el("div", { class: `rating-note ${note.cls}` }, [
+        el("span", { text: note.text }),
+        el("button", { class: "btn btn-compact", text: "レートの推移", onclick: () => goto("rating") }),
+      ]));
+    }
   }
 
   function drawTsumeBanner() {
@@ -2279,7 +2307,8 @@
     }
     const list = loadHistory();
     const known = new Set(list.map((r) => r.id));
-    incoming.forEach((r) => { if (!known.has(r.id)) { list.push(r); known.add(r.id); } });
+    // レートは対局した端末で計算するので、引き継いだ記録ではもう計算しない
+    incoming.forEach((r) => { if (!known.has(r.id)) { list.push(Object.assign(r, { ratingPending: false })); known.add(r.id); } });
     // idは「作成時刻(ms)_乱数」なので、その時刻順に並べ直して履歴の時系列を保つ
     list.sort((a, b) => (parseInt(a.id, 10) || 0) - (parseInt(b.id, 10) || 0));
     saveHistoryList(list);
@@ -2842,6 +2871,326 @@
     root.appendChild(screen);
   }
 
+  // ============================================================ レート(AI戦の結果と指し手の質)
+  // 計算式とAIレベルのレートは rating.js(HasamiRating)。ここは記録・解析・画面の部分
+  const RT = window.HasamiRating;
+  const LS_RATING = "hasami:rating:v1";
+  const RATING_LEVELS = RT.LEVELS;
+
+  function loadRatingStore() {
+    try {
+      const s = JSON.parse(localStorage.getItem(LS_RATING) || "null");
+      if (s && Array.isArray(s.games)) return s;
+    } catch (e) { /* 壊れていたら作り直す */ }
+    return { v: 1, games: [] };
+  }
+  function saveRatingStore(s) {
+    try { localStorage.setItem(LS_RATING, JSON.stringify(s)); } catch (e) { /* 保存できなくても対局はできる */ }
+  }
+  function currentRating(store) {
+    const g = (store || loadRatingStore()).games;
+    return g.length ? g[g.length - 1].after : null;
+  }
+  function ratingLevelKey(level, specialist) { return specialist ? "S" : String(level); }
+  function ratingLevelName(key) { return key === "S" ? AI.SPECIALIST_AI_NAME : AI.LEVELS[key].name; }
+
+  // AI戦の記録に付ける、レートの対象かどうかと計算に要る情報。対象外ならその理由
+  function ratingInfoFor(m) {
+    if (m.mode !== "pvai") return null;
+    const human = m.humanPlayer;
+    const result = m.engine.winner ? (m.engine.winner === human ? "win" : "loss") : "draw";
+    let reason = null;
+    if (m.resumedFrom) reason = "感想戦の途中から再開した対局";
+    else if (m.evalDisplay) reason = "形勢表示ありの対局";
+    else if (m.undoUsed) reason = "待ったを使った対局";
+    return { side: human, level: ratingLevelKey(m.aiLevel, m.aiSpecialist), result, eligible: !reason, reason };
+  }
+
+  // 解析し終えた対局から、レートの1件ぶんを作る(判定できる手が少なすぎれば null)
+  function buildRatingEntry(record, frames, results, store) {
+    const info = record.ratingInfo;
+    const losses = [];
+    const counts = { 大悪手: 0, 悪手: 0, 疑問手: 0 };
+    for (let i = 1; i < frames.length; i++) {
+      if (frames[i - 1].currentPlayer !== info.side) continue;
+      const j = judgeAt(record, frames, results, i);
+      if (!j || j.forced) continue;
+      losses.push(j.loss);
+      if (j.label) counts[j.label]++;
+    }
+    if (losses.length < RT.MIN_MOVES) return null;
+    const avgLoss = losses.reduce((s, v) => s + v, 0) / losses.length;
+    return Object.assign({
+      id: record.id, at: parseInt(record.id, 10) || Date.now(), timestamp: record.timestamp,
+      level: info.level, levelName: ratingLevelName(info.level), side: info.side, result: info.result,
+      moves: losses.length, avgLoss, counts,
+    }, RT.rate(store.games, info.level, info.result, avgLoss));
+  }
+
+  // ---- 対局の解析(裏方の Worker。形勢表示・感想戦の Worker とは別) ----
+  // 対局のAIが考えている間は止めて待つ(AIの読みの邪魔をしない)
+  let bgWorker = null, bgWorkerOk = true;
+  const bgPending = new Map();
+  function bgAnalyze(engine, template) {
+    return new Promise((resolve) => {
+      if (!bgWorker && bgWorkerOk && Worker_) {
+        try {
+          bgWorker = new Worker_("ai-worker.js?v=6");
+          bgWorker.onmessage = (e) => {
+            const cb = bgPending.get(e.data.reqId);
+            if (cb) { bgPending.delete(e.data.reqId); cb(e.data.ok ? e.data.result : null); }
+          };
+          bgWorker.onerror = () => { bgWorkerOk = false; bgWorker = null; bgPending.forEach((cb) => cb(null)); bgPending.clear(); };
+        } catch (e) { bgWorkerOk = false; }
+      }
+      if (bgWorker && bgWorkerOk) {
+        const reqId = reqSeq++;
+        bgPending.set(reqId, resolve);
+        bgWorker.postMessage({ kind: "analyze", reqId, config: engine.config, state: engineSnapshot(engine), template, timeBudget: AI.EVAL_TIME_BUDGET });
+      } else {
+        setTimeout(() => { try { resolve(AI.analyzePosition(engine, template, 250)); } catch (e) { resolve(null); } }, 30);
+      }
+    });
+  }
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  async function analyzeRecordInBackground(record, onProgress) {
+    const frames = rebuildFramesFromRecord(record);
+    const results = (cachedAnalysis(record, frames.length) || new Array(frames.length).fill(null)).slice();
+    const template = recordUsesTemplate(record);
+    for (let i = 0; i < frames.length; i++) {
+      if (results[i]) continue;
+      while (App.match && App.match.aiThinking) await sleep(500);
+      results[i] = (await bgAnalyze(frames[i].engineClone, template))
+        || { winA: 0.5, mate: null, matePlies: null, depth: 0, final: false, best: null, nActs: 0 };
+      if (onProgress) onProgress(results.filter(Boolean).length, results.length);
+    }
+    saveRecordAnalysis(record, results);
+    return { frames, results };
+  }
+
+  // ---- レート計算待ちの対局を、古い順に1局ずつ片づける(ページを閉じても次に開いたとき続きから) ----
+  const ratingBusy = { running: false, current: null };
+  function setRecordRatingState(id, patch) {
+    const list = loadHistory();
+    const i = list.findIndex((r) => r.id === id);
+    if (i >= 0) { Object.assign(list[i], patch); saveHistoryList(list); }
+  }
+  async function processPendingRatings() {
+    if (ratingBusy.running) return;
+    ratingBusy.running = true;
+    try {
+      for (;;) {
+        const record = loadHistory().find((r) => r.ratingPending);
+        if (!record) break;
+        ratingBusy.current = { id: record.id, done: 0, total: 0 };
+        const { frames, results } = await analyzeRecordInBackground(record, (done, total) => {
+          ratingBusy.current = { id: record.id, done, total };
+          onRatingProgress(record.id);
+        });
+        const store = loadRatingStore();
+        if (!store.games.some((g) => g.id === record.id)) {
+          const entry = buildRatingEntry(record, frames, results, store);
+          if (entry) { store.games.push(entry); saveRatingStore(store); }
+          setRecordRatingState(record.id, { ratingPending: false, ratingExcluded: entry ? null : "判定できる手が少なすぎる対局" });
+        } else {
+          setRecordRatingState(record.id, { ratingPending: false });
+        }
+        ratingBusy.current = null;
+        onRatingProgress(record.id);
+      }
+    } finally {
+      ratingBusy.running = false;
+      ratingBusy.current = null;
+    }
+  }
+  // 対局画面の結果表示・レート画面を、計算の進み具合に合わせて描き直す
+  function onRatingProgress(id) {
+    const m = App.match;
+    if (App.screen === "game" && m && m.finishedRecord && m.finishedRecord.id === id && App.gameDom) drawBanner();
+    if (App.screen === "rating" && App.ratingRefresh) App.ratingRefresh();
+  }
+
+  // 対局画面の結果表示に添える、レートの一言
+  function ratingNoteFor(record) {
+    if (!record || !record.ratingInfo) return null;
+    if (!record.ratingInfo.eligible) return { cls: "muted", text: `レート対象外(${record.ratingInfo.reason})` };
+    const cur = ratingBusy.current;
+    if (cur && cur.id === record.id) return { cls: "muted", text: `レートを計算しています…(AIが指し手を解析中 ${cur.done} / ${cur.total || "?"})` };
+    const entry = loadRatingStore().games.find((g) => g.id === record.id);
+    if (entry) {
+      const diff = entry.before == null ? null : entry.after - entry.before;
+      const sign = diff == null ? "" : diff >= 0 ? `(+${diff})` : `(${diff})`;
+      const from = entry.before == null ? "" : `${entry.before} → `;
+      return { cls: "ok", text: `レート ${from}${entry.after}${sign}${entry.provisional ? " 暫定" : ""}  内容 ${entry.qualityPerf} / 結果 ${entry.resultPerf}` };
+    }
+    const latest = loadHistory().find((r) => r.id === record.id);
+    if (latest && latest.ratingExcluded) return { cls: "muted", text: `レート対象外(${latest.ratingExcluded})` };
+    return { cls: "muted", text: "レートの計算を待っています…" };
+  }
+
+  // ============================================================ レート画面
+  function renderRating(root) {
+    const screen = el("div", { class: "screen" });
+    screen.appendChild(el("h1", { class: "card-title", text: "レート", style: { fontSize: "24px" } }));
+    screen.appendChild(el("div", { class: "field-hint", text: "AI戦の結果と、あなたの指し手の質(AIが解析した平均損失)から計算します。この端末のブラウザに保存され、他の端末とは共有されません。" }));
+    const body = el("div", { class: "rating-body" });
+    screen.appendChild(body);
+    root.appendChild(screen);
+
+    function draw() {
+      clearNode(body);
+      const store = loadRatingStore();
+      const games = store.games;
+      const cur = currentRating(store);
+
+      const head = el("div", { class: "card rating-head" });
+      head.appendChild(el("div", { class: "rating-now" }, [
+        el("span", { class: "rating-label", text: "現在のレート" }),
+        el("b", { class: "rating-value", text: cur == null ? "----" : String(cur) }),
+        el("span", { class: "rating-sub", text: cur == null ? "AI戦を1局終えると表示されます"
+          : games.length < RT.PROVISIONAL_GAMES ? `暫定(あと${RT.PROVISIONAL_GAMES - games.length}局で確定) / ${games.length}局`
+            : `${games.length}局` }),
+      ]));
+      if (cur != null) {
+        const near = RT.nearestLevel(cur);
+        head.appendChild(el("div", { class: "rating-sub", text: `近い強さのAI: ${ratingLevelName(near[0])}(${near[1]})` }));
+      }
+      const pend = loadHistory().filter((r) => r.ratingPending).length;
+      if (pend) {
+        const c = ratingBusy.current;
+        head.appendChild(el("div", { class: "rating-sub", text: `計算待ち ${pend}局${c && c.total ? `(解析中 ${c.done} / ${c.total})` : ""}` }));
+      }
+      body.appendChild(head);
+
+      // ---- 推移のグラフ ----
+      const card = el("div", { class: "card rating-chart-card" });
+      card.appendChild(el("div", { class: "card-title", text: "レートの推移", style: { fontSize: "14px" } }));
+      if (!games.length) {
+        card.appendChild(el("div", { class: "field-hint", text: "まだ記録がありません。メニューで「AI戦」を選んで対局してください(形勢表示なし・待ったなしの対局が対象です)。" }));
+      } else {
+        card.appendChild(buildRatingChart(games));
+      }
+      body.appendChild(card);
+
+      // ---- 対局ごとの記録(新しい順) ----
+      if (games.length) {
+        const list = el("ul", { class: "rating-list" });
+        games.slice().reverse().forEach((g) => {
+          const diff = g.before == null ? "" : `${g.after - g.before >= 0 ? "+" : ""}${g.after - g.before}`;
+          const res = g.result === "win" ? "勝ち" : g.result === "loss" ? "負け" : "引き分け";
+          const rec = loadHistory().find((r) => r.id === g.id);
+          list.appendChild(el("li", { class: "rating-row" }, [
+            el("div", { class: "rating-row-main" }, [
+              el("span", { class: `rating-res res-${g.result}`, text: res }),
+              el("span", { text: `vs ${g.levelName}(${g.levelRating})${g.side === "A" ? " 先手" : " 後手"}` }),
+              el("b", { class: "rating-after", text: `${g.after}` }),
+              el("span", { class: `rating-diff ${diff.startsWith("-") ? "down" : "up"}`, text: diff }),
+            ]),
+            el("div", { class: "rating-row-sub", text: `${g.timestamp}  平均損失 ${(g.avgLoss * 100).toFixed(1)}%(大悪手${g.counts.大悪手}・悪手${g.counts.悪手}・疑問手${g.counts.疑問手})  内容 ${g.qualityPerf} / 結果 ${g.resultPerf} → この対局 ${g.perf}` }),
+            rec ? el("button", { class: "btn btn-compact", text: "感想戦", onclick: () => openReview(rec) }) : null,
+          ]));
+        });
+        body.appendChild(list);
+      }
+
+      // ---- 計算方法とレベルの目安 ----
+      const how = el("div", { class: "card rating-how" });
+      how.appendChild(el("div", { class: "card-title", text: "計算のしかた", style: { fontSize: "14px" } }));
+      [
+        "1局ごとに「結果」と「内容」のパフォーマンスを出し、その平均をその対局のパフォーマンスにします。",
+        "結果: 相手AIのレート +400(勝ち)/ −400(負け)/ ±0(引き分け)。",
+        "内容: あなたの手の平均損失(感想戦の悪手判定と同じ。AIの最善手と同じ手・他に手がない手は0)をレートに換算した値。強いAIほど平均損失が小さい関係から換算しています。",
+        `最初の${RT.PROVISIONAL_GAMES}局は暫定としてパフォーマンスの平均、その後は レート +${RT.STEP}×(パフォーマンス − レート) で更新します。`,
+        "対象はAI戦のみ。形勢表示あり・待ったを使った・感想戦から再開した対局は数えません。",
+        "AIのレートは特化テンプレート(7×7・持ち駒15・接触3・移動3)でレベル同士を対戦させて測ったもので、ほかの盤の設定でも同じ値を使います(目安です)。",
+      ].forEach((t) => how.appendChild(el("p", { class: "rating-how-p", text: t })));
+      how.appendChild(el("div", { class: "rating-levels" },
+        Object.entries(RATING_LEVELS).sort((a, b) => a[1] - b[1])
+          .map(([k, v]) => el("span", { class: "rating-level-chip", text: `${ratingLevelName(k)} ${v}` }))));
+      if (games.length) {
+        how.appendChild(el("button", {
+          class: "btn btn-compact", text: "レートの記録を消す", style: { marginTop: "10px" },
+          onclick: () => confirmModal("レートの記録をすべて消します(対戦履歴は残ります)。よろしいですか?", "消す").then((ok) => {
+            if (!ok) return;
+            saveRatingStore({ v: 1, games: [] });
+            draw();
+          }),
+        }));
+      }
+      body.appendChild(how);
+    }
+    App.ratingRefresh = draw;
+    draw();
+    processPendingRatings();
+  }
+
+  // レートの推移(折れ線)。横軸は対局の順番、背景にAIレベルの目安の横線を引く
+  function buildRatingChart(games) {
+    const SVGNS = "http://www.w3.org/2000/svg";
+    // 画面の幅に合わせて座標系の幅を決める(スマホで縮小されて文字が小さくなりすぎないように)
+    const W = Math.round(Math.min(600, Math.max(300, (root.clientWidth || 600) - 64))), H = 220, PL = 44, PR = 12, PT = 12, PB = 22;
+    const vals = games.map((g) => g.after).concat(games.map((g) => g.perf));
+    let lo = Math.min(...vals), hi = Math.max(...vals);
+    const padV = Math.max(60, (hi - lo) * 0.12);
+    lo = Math.floor((lo - padV) / 50) * 50; hi = Math.ceil((hi + padV) / 50) * 50;
+    const n = games.length;
+    const x = (i) => PL + (n === 1 ? (W - PL - PR) / 2 : (i / (n - 1)) * (W - PL - PR));
+    const y = (v) => PT + (1 - (v - lo) / (hi - lo)) * (H - PT - PB);
+    const svg = document.createElementNS(SVGNS, "svg");
+    svg.setAttribute("class", "rating-chart");
+    svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+    svg.setAttribute("role", "img");
+    svg.setAttribute("aria-label", `レートの推移(${n}局、最新 ${games[n - 1].after})`);
+    const mk = (tag, attrs, text) => {
+      const node = document.createElementNS(SVGNS, tag);
+      for (const k in attrs) node.setAttribute(k, attrs[k]);
+      if (text != null) node.textContent = text;
+      svg.appendChild(node);
+      return node;
+    };
+    // 縦軸の目盛り
+    const step = (hi - lo) > 800 ? 200 : 100;
+    for (let v = Math.ceil(lo / step) * step; v <= hi; v += step) {
+      mk("line", { x1: PL, x2: W - PR, y1: y(v), y2: y(v), class: "rc-grid" });
+      mk("text", { x: PL - 6, y: y(v) + 4, class: "rc-axis", "text-anchor": "end" }, String(v));
+    }
+    // AIレベルの目安(範囲内のものだけ)。近すぎるレベルどうしは名前をまとめて重ならないようにする
+    const shown = Object.entries(RATING_LEVELS).filter(([, v]) => v > lo && v < hi).sort((p, q) => q[1] - p[1]);
+    let lastY = -Infinity, group = [];
+    const flush = () => {
+      if (!group.length) return;
+      mk("text", { x: W - PR - 2, y: group[0].y - 3, class: "rc-level-label", "text-anchor": "end" }, group.map((g) => g.name).join("・"));
+      group = [];
+    };
+    shown.forEach(([k, v]) => {
+      mk("line", { x1: PL, x2: W - PR, y1: y(v), y2: y(v), class: "rc-level" });
+      if (y(v) - lastY < 13) group.push({ name: ratingLevelName(k), y: group.length ? group[0].y : y(v) });
+      else { flush(); group = [{ name: ratingLevelName(k), y: y(v) }]; lastY = y(v); }
+    });
+    flush();
+    // 対局ごとのパフォーマンス(薄い点)とレート(線と点)
+    games.forEach((g, i) => mk("circle", { cx: x(i), cy: y(g.perf), r: 2.5, class: "rc-perf" }));
+    if (n >= 2) mk("path", { d: games.map((g, i) => `${i ? "L" : "M"} ${x(i)} ${y(g.after)}`).join(" "), class: "rc-line" });
+    games.forEach((g, i) => {
+      const c = mk("circle", { cx: x(i), cy: y(g.after), r: 4, class: `rc-pt res-${g.result}` });
+      const title = document.createElementNS(SVGNS, "title");
+      title.textContent = `${i + 1}局目 ${g.timestamp}\nvs ${g.levelName} ${g.result === "win" ? "勝ち" : g.result === "loss" ? "負け" : "引き分け"}\nレート ${g.after} / この対局 ${g.perf}`;
+      c.appendChild(title);
+    });
+    mk("text", { x: PL, y: H - 6, class: "rc-axis" }, "1局目");
+    if (n > 1) mk("text", { x: W - PR, y: H - 6, class: "rc-axis", "text-anchor": "end" }, `${n}局目`);
+    const wrap = el("div", { class: "rating-chart-wrap" }, [svg]);
+    wrap.appendChild(el("div", { class: "rating-chart-legend" }, [
+      el("span", {}, [el("i", { class: "lg lg-line" }), document.createTextNode("レート")]),
+      el("span", {}, [el("i", { class: "lg lg-perf" }), document.createTextNode("その対局のパフォーマンス")]),
+      el("span", {}, [el("i", { class: "lg lg-win" }), document.createTextNode("勝ち")]),
+      el("span", {}, [el("i", { class: "lg lg-loss" }), document.createTextNode("負け")]),
+      el("span", {}, [el("i", { class: "lg lg-level" }), document.createTextNode("AIの強さの目安")]),
+    ]));
+    return wrap;
+  }
+
   // ============================================================ 対戦履歴
   // payload.preselect: 最初から選択しておく記録のid(LINEから引き継いだ記録など)
   function renderHistory(root, payload) {
@@ -2923,7 +3272,8 @@
 
   // ============================================================ 感想戦(棋譜再生)
   function openReview(record) {
-    App.reviewRecord = record;
+    // レート計算などで解析結果が保存されていれば、そちら(保存済みの記録)を使う
+    App.reviewRecord = loadHistory().find((r) => r.id === record.id) || record;
     App.screen = "review";
     render();
   }
@@ -2976,9 +3326,10 @@
   }
 
   // 感想戦のある局面から、実際に対局を再開する(追加仕様3)。
-  function openResumeSetup(frame) {
+  // frames[ply] が再開する局面(ply = それまでに指された手数)
+  function openResumeSetup(record, frames, ply) {
     const veil = el("div", { class: "veil" });
-    const engine0 = frame.engineClone;
+    const engine0 = frames[ply].engineClone;
     const sideSelect = el("select", { class: "field-select" }, [
       el("option", { value: "A", text: "先手(A)" }),
       el("option", { value: "B", text: "後手(B)" }),
@@ -2995,7 +3346,7 @@
         el("button", { class: "btn", text: "キャンセル", onclick: () => veil.remove() }),
         el("button", { class: "btn btn-primary", text: "再開する", style: { width: "auto", fontSize: "14px", padding: "10px 16px" }, onclick: () => {
           veil.remove();
-          resumeMatchFromEngine(engine0.clone(), sideSelect.value, parseInt(levelSelect.value, 10));
+          resumeMatchFromEngine(engine0.clone(), sideSelect.value, parseInt(levelSelect.value, 10), { record, frames, ply });
         } }),
       ]),
     ]);
@@ -3003,18 +3354,22 @@
     document.body.appendChild(veil);
   }
 
-  function resumeMatchFromEngine(engine, humanPlayer, aiLevel) {
+  // 対戦履歴に残す記録が感想戦の局面だけで途切れないよう、元の対局の持ち駒(初期値)と
+  // 再開までの手を引き継ぐ(engine.stock は「残りの」持ち駒なので記録には使えない)。
+  function resumeMatchFromEngine(engine, humanPlayer, aiLevel, source) {
+    const { record, frames, ply } = source;
     App.match = {
       mode: "pvai",
       boardSize: engine.config.rows, moveRange: engine.config.moveRange, contactLimit: engine.config.contactLimit,
       aiLevel, aiLevelB: null, aiSpecialist: false, aiSpecialistB: false,
-      stockA: engine.stock.A, stockB: engine.stock.B,
-      ruleTemplate: null,
+      stockA: record.stockA, stockB: record.stockB,
+      ruleTemplate: recordUsesTemplate(record) ? C.TEMPLATE_ID : null,
       engine,
       humanPlayer,
+      resumedFrom: { id: record.id, ply },
       selected: null,
-      lastAction: null,
-      logMessages: [`(感想戦から再開: ここまでの手は対戦ログに含まれません)`],
+      lastAction: frames[ply].lastAction,
+      logMessages: [`(感想戦の${ply}手目の局面から再開: それまでの${ply}手も棋譜に含めて保存します)`],
       kifuRecords: [],
       historyStack: [],
       aiThinking: false,
@@ -3027,6 +3382,11 @@
       evalDisplay: !(loadMenuSettings() && loadMenuSettings().evalCasual === false),
       evalView: null,
     };
+    // 再開までの手。指し手の名前(あなた/AI)はこの対局の担当に合わせて付け直す
+    App.match.kifuRecords = record.moves.slice(0, ply).map((mv, i) => {
+      const mover = mv.mover || frames[i].currentPlayer;
+      return Object.assign({}, mv, { turn: i + 1, mover, player: playerDisplayName(mover) });
+    });
     App.screen = "game";
     render();
     proceedTurn();
@@ -3124,7 +3484,7 @@
     jumpBar.appendChild(prevBad); jumpBar.appendChild(nextBad);
     screen.appendChild(jumpBar);
 
-    const resumeBtn = el("button", { class: "btn btn-compact", text: "この局面から対局を再開する", onclick: () => openResumeSetup(frames[index]) });
+    const resumeBtn = el("button", { class: "btn btn-compact", text: "この局面から対局を再開する", onclick: () => openResumeSetup(record, frames, index) });
     screen.appendChild(resumeBtn);
 
     const list = el("ul", { class: "review-list" });
@@ -3509,4 +3869,6 @@
   window.addEventListener("hashchange", () => {
     if (/^#online=/.test(location.hash) && App.screen !== "game") { App.screen = "online"; render(); }
   });
+  // 前回ページを閉じたときにレート計算が終わっていなかった対局があれば、裏で続きを計算する
+  setTimeout(processPendingRatings, 1500);
 })();

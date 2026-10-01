@@ -620,5 +620,34 @@ function refDistance(engine, solver, maxPlies, quiet) {
   check("tutorial reason: no stock", /持ち駒が残っていない/.test(TU.placementBlockReason(TU.buildEngine(lessons[8].board), "A", [3, 3])));
 })();
 
+// ---- 18. レート: 計算式(rating.js) ----
+(function () {
+  const RT = require("./rating.js");
+  const keys = Object.keys(RT.LEVELS).sort();
+  check("rating: every AI level (and 奥義) has a rating", keys.join() === AI.LEVEL_ORDER.map(String).concat(["S"]).sort().join());
+  const L = RT.LEVELS;
+  check("rating: weaker levels rate lower (ランダム < 初級 < 中級 < 上級 < 最強 < 究極)",
+    L[1] < L[2] && L[2] < L[3] && L[3] < L[4] && L[4] < L[5] && L[5] < L[6], JSON.stringify(L));
+  check("rating: ランダム is the anchor at 0", L[1] === 0);
+  check("rating: result performance is ±400 around the opponent",
+    RT.resultPerformance(1200, "win") === 1600 && RT.resultPerformance(1200, "loss") === 800 && RT.resultPerformance(1200, "draw") === 1200);
+  const q1 = RT.qualityPerformance(0.01), q5 = RT.qualityPerformance(0.05), q20 = RT.qualityPerformance(0.2);
+  check("rating: smaller average loss means higher quality performance", q1 > q5 && q5 > q20, [q1, q5, q20].join());
+  const lv = Object.values(L);
+  check("rating: quality performance stays within the level range ±200",
+    RT.qualityPerformance(0) <= Math.max(...lv) + 200 && RT.qualityPerformance(5) >= Math.min(...lv) - 200);
+  const first = RT.rate([], "3", "win", 0.05);
+  check("rating: the first game's rating is its performance (provisional)",
+    first.before === null && first.after === first.perf && first.provisional && first.perf === Math.round((first.resultPerf + first.qualityPerf) / 2));
+  const five = [1100, 1200, 1000, 1300, 1150].map((v) => ({ perf: v, after: 1150 }));
+  const sixth = RT.rate(five, "4", "loss", 0.08);
+  check("rating: after the provisional games the rating moves 20% toward the performance",
+    sixth.before === 1150 && Math.abs(sixth.after - (1150 + 0.2 * (sixth.perf - 1150))) <= 1 && !sixth.provisional);
+  const third = RT.rate(five.slice(0, 2), "4", "draw", 0.08);
+  check("rating: during the provisional games the rating is the mean performance",
+    Math.abs(third.after - (1100 + 1200 + third.perf) / 3) <= 1);
+  check("rating: nearest level", RT.nearestLevel(L[4] + 1)[0] === "4");
+})();
+
 console.log(`\n==== ${pass} passed, ${fail} failed ====`);
 process.exit(fail ? 1 : 0);

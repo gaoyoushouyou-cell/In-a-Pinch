@@ -638,3 +638,59 @@ select.field-select:disabled { opacity: .5; }
 .review-list li.is-bad .review-tag { color: var(--danger); }
 .review-list li.is-dubious .review-tag { color: var(--warning); }
 @media (max-width: 480px) { .review-graph { height: 96px; } .review-score b { min-width: 0; } }
+
+/* ---------- レート ---------- */
+.rating-body { width: min(640px, 100%); display: grid; gap: 14px; }
+.rating-body .card { width: 100%; }
+.rating-head { display: grid; gap: 4px; }
+.rating-now { display: flex; align-items: baseline; flex-wrap: wrap; gap: 6px 14px; }
+.rating-label { font-size: 11px; letter-spacing: .3em; color: var(--text-muted); }
+.rating-value { font-family: var(--f-mono); font-size: 40px; line-height: 1.1; color: var(--accent); font-variant-numeric: tabular-nums; }
+.rating-sub { font-size: 12px; color: var(--text-secondary); }
+.rating-chart-wrap { display: grid; gap: 6px; }
+.rating-chart { width: 100%; height: auto; display: block; background: var(--bg-deep); border-radius: 6px; }
+.rating-chart .rc-grid { stroke: rgba(201,162,39,.12); stroke-width: 1; }
+.rating-chart .rc-axis { fill: var(--text-muted); font-size: 11px; font-family: var(--f-mono); }
+.rating-chart .rc-level { stroke: var(--p-a-legend); stroke-width: 1; stroke-dasharray: 3 4; opacity: .35; }
+.rating-chart .rc-level-label { fill: var(--p-a-legend); font-size: 10px; opacity: .7; }
+.rating-chart .rc-line { fill: none; stroke: var(--accent); stroke-width: 2.2; stroke-linejoin: round; }
+.rating-chart .rc-perf { fill: var(--text-muted); opacity: .55; }
+.rating-chart .rc-pt { stroke: var(--bg-deep); stroke-width: 1.5; }
+.rating-chart .rc-pt.res-win { fill: var(--success); }
+.rating-chart .rc-pt.res-loss { fill: var(--danger); }
+.rating-chart .rc-pt.res-draw { fill: var(--warning); }
+.rating-chart-legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 11px; color: var(--text-muted); }
+.rating-chart-legend .lg { display: inline-block; width: 10px; height: 10px; margin-right: 5px; vertical-align: middle; border-radius: 50%; }
+.rating-chart-legend .lg-line { height: 3px; border-radius: 2px; background: var(--accent); }
+.rating-chart-legend .lg-perf { width: 6px; height: 6px; background: var(--text-muted); }
+.rating-chart-legend .lg-win { background: var(--success); }
+.rating-chart-legend .lg-loss { background: var(--danger); }
+.rating-chart-legend .lg-level { height: 0; border-radius: 0; border-top: 1px dashed var(--p-a-legend); }
+.rating-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
+.rating-row {
+  display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 2px 10px; padding: 8px 12px; border-radius: 6px;
+  background: var(--surface); border: 1px solid rgba(201,162,39,.14);
+}
+.rating-row-main, .rating-row-sub { grid-column: 1; }
+.rating-row .btn { grid-row: 1 / span 2; grid-column: 2; }
+.rating-row-main { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; font-size: 13px; color: var(--text-secondary); }
+.rating-row-sub { font-size: 11px; color: var(--text-muted); }
+.rating-res { font-weight: 600; min-width: 4em; }
+.rating-res.res-win { color: var(--success); }
+.rating-res.res-loss { color: var(--danger); }
+.rating-res.res-draw { color: var(--warning); }
+.rating-after { font-family: var(--f-mono); color: var(--text-primary); }
+.rating-diff { font-family: var(--f-mono); font-size: 12px; }
+.rating-diff.up { color: var(--success); }
+.rating-diff.down { color: var(--danger); }
+.rating-how-p { margin: 4px 0; font-size: 12.5px; color: var(--text-secondary); line-height: 1.6; }
+.rating-levels { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.rating-level-chip { font-size: 11.5px; font-family: var(--f-mono); padding: 3px 8px; border-radius: 999px; border: 1px solid rgba(201,162,39,.3); color: var(--text-secondary); }
+.rating-note {
+  display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; margin-top: 8px;
+  padding: 8px 12px; border-radius: 8px; font-size: 12.5px; border: 1px solid rgba(201,162,39,.25); background: var(--surface);
+}
+.rating-note.ok { color: var(--accent); }
+.rating-note.muted { color: var(--text-muted); }
+.rating-hint { margin-top: -4px; }
+@media (max-width: 480px) { .rating-value { font-size: 32px; } .rating-row { grid-template-columns: 1fr; } .rating-row .btn { grid-row: auto; grid-column: auto; justify-self: start; } }
