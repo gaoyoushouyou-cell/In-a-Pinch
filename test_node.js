@@ -479,5 +479,58 @@ function refDistance(engine, solver, maxPlies, quiet) {
     && back.pieces.get(back.obligated.B[0]).position.join() === "3,0" && back.currentPlayer === "B");
 })();
 
+// ---- 15. 形勢表示: 読み切り・終局・通常局面の値(Python版 test_engine 9h と同じ局面) ----
+(function () {
+  // B の駒(0,0)は角。A が (0,2)→(0,1) と動けば (0,0) は逃げ場がなくなり A の勝ち(1手で決着)
+  const e = new H.GameEngine(H.makeConfig({ rows: 7, cols: 7, moveRange: 1, stockPerPlayer: 10, wallSandwich: true, contactLimit: null }));
+  [[1, "B", [0, 0]], [2, "A", [1, 0]], [3, "A", [0, 2]], [4, "B", [4, 4]]].forEach(([id, player, pos]) => {
+    e.pieces.set(id, { id, player, position: pos }); e.board.set(pos.join(","), id);
+  });
+  e._nextPieceId = 5;
+  e.currentPlayer = "A";
+  e.stock.A = 0; e.stock.B = 0;
+  const r = AI.evaluatePosition(e, false, 300);
+  check("eval: A's forced win is read out (mate A in 1)", r && r.mate === "A" && r.matePlies === 1 && r.winA > 0.999, JSON.stringify(r));
+  check("eval: reading does not change the position", e.currentPlayer === "A" && e.board.size === 4
+    && e.pieces.get(3).position.join() === "0,2" && !e.winner);
+  AI.applyAction(e, "A", ["move", 3, [0, 1]]);
+  const fin = AI.evaluatePosition(e, false, 300);
+  check("eval: finished game reports the winner at 100%", e.winner === "A" && fin.final && fin.winA === 1 && fin.mate === "A", JSON.stringify(fin));
+
+  const e0 = new H.GameEngine(H.makeConfig({ rows: 7, cols: 7, moveRange: 3, wallSandwich: true, contactLimit: 3 }));
+  e0.stock.A = 15; e0.stock.B = 15;
+  const r0 = AI.evaluatePosition(e0, true, 200);
+  check("eval: opening position is a sane win rate with depth >= 1", r0 && !r0.final && r0.winA > 0.2 && r0.winA < 0.8 && r0.depth >= 1, JSON.stringify(r0));
+  check("eval: win rate = sigmoid(score/100)", Math.abs(AI.winRateFromScore(100) - 1 / (1 + Math.exp(-1))) < 1e-12 && AI.winRateFromScore(0) === 0.5);
+})();
+
+// ---- 16. 感想戦: 解析と悪手判定(Python版 test_engine 9j と同じ基準) ----
+(function () {
+  const e = new H.GameEngine(H.makeConfig({ rows: 7, cols: 7, moveRange: 1, stockPerPlayer: 10, wallSandwich: true, contactLimit: null }));
+  [[1, "B", [0, 0]], [2, "A", [1, 0]], [3, "A", [0, 2]], [4, "B", [4, 4]]].forEach(([id, player, pos]) => {
+    e.pieces.set(id, { id, player, position: pos }); e.board.set(pos.join(","), id);
+  });
+  e._nextPieceId = 5;
+  e.currentPlayer = "A";
+  e.stock.A = 0; e.stock.B = 0;
+  const r = AI.analyzePosition(e, false, 300);
+  check("analyze: best move label and legal move count", r && r.best && r.best[0] === "C1" && r.best[1] === "B1"
+    && r.nActs === AI.generateActions(e, "A").length && r.nActs > 1, JSON.stringify(r));
+
+  const pos = (winA, best, nActs) => ({ winA, best: best || null, nActs: nActs == null ? 5 : nActs });
+  let j = AI.judgeMove(pos(0.70, ["C3", "C4"]), pos(0.35), "A", ["D4", "D5"]);
+  check("judge: 70% -> 35% for A is 大悪手 (??)", j.label === "大悪手" && j.mark === "??" && Math.abs(j.loss - 0.35) < 1e-9);
+  j = AI.judgeMove(pos(0.70), pos(0.52), "A", ["", "D4"]);
+  check("judge: an 18% drop is 悪手 (?)", j.label === "悪手" && j.mark === "?");
+  j = AI.judgeMove(pos(0.40), pos(0.50), "B", ["", "D4"]);
+  check("judge: B's drop 60% -> 50% is 疑問手 (?!)", j.label === "疑問手" && Math.abs(j.before - 0.6) < 1e-9);
+  j = AI.judgeMove(pos(0.70, ["D4", "D5"]), pos(0.40), "A", ["D4", "D5"]);
+  check("judge: the AI's best move costs nothing", j.isBest && j.loss === 0 && j.label === null);
+  j = AI.judgeMove(pos(0.70, null, 1), pos(0.40), "A", ["D4", "D5"]);
+  check("judge: a forced move costs nothing", j.forced && j.loss === 0 && j.label === null);
+  check("judge thresholds match Python (30% / 15% / 8%)",
+    AI.MOVE_JUDGE_LEVELS.map((l) => `${l.min}${l.label}${l.mark}`).join() === "0.3大悪手??,0.15悪手?,0.08疑問手?!");
+})();
+
 console.log(`\n==== ${pass} passed, ${fail} failed ====`);
 process.exit(fail ? 1 : 0);

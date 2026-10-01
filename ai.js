@@ -1027,6 +1027,20 @@
       const legal = generateActions(engine, this.player);
       if (!legal.length) return null;
       if (legal.length === 1) return legal[0];
+      const action = this._search(engine);
+      if (!legal.some((a) => actionEquals(a, action))) return this.rng.choice(legal);
+      return action;
+    }
+
+    // 手番側から見た局面の評価値(読みの結果)。合法手が1つでも読む。終局していない局面で呼ぶこと。
+    // そのとき最善と読んだ手は lastBest に残る
+    evaluate(engine) {
+      this.lastBest = this._search(engine);
+      return this.lastScore;
+    }
+
+    // 反復深化で最善手を探し、lastScore / lastDepth を更新する
+    _search(engine) {
       const budget = this.level.timeBudget;
       this._deadline = budget == null ? null : Date.now() + budget;
       const st = this._st = new FastState(engine);
@@ -1073,9 +1087,7 @@
         if (this._deadline != null && Date.now() >= this._deadline) break;
       }
       this.lastScore = bestScore;
-      const action = st.toAction(bestCode);
-      if (!legal.some((a) => actionEquals(a, action))) return this.rng.choice(legal);
-      return action;
+      return st.toAction(bestCode);
     }
 
     _searchRoot(root, depth) {
@@ -1218,6 +1230,84 @@
     return new MinimaxAI(player, level, seed);
   }
 
+  // ---- 対局中の形勢表示(Python 版 evaluate_position と同じ) ----
+  // 学習型AIの評価値は Texel 法で「手番側が勝つ確率」を sigmoid(評価値 / 100) で予測するよう
+  // 学習してあるので、そのまま勝率に直せる。ただし意味は「強いAI同士がこの局面から続けたら
+  // 勝つ確率」で、人間の実際の勝率ではない(画面では「形勢(目安)」と表示する)。
+  const EVAL_TIME_BUDGET = 600; // 形勢表示の1局面あたりの読み(ms)。相手AIの思考中は読まない
+
+  function winRateFromScore(score) {
+    const v = Math.max(-3000, Math.min(3000, score));
+    return 1 / (1 + Math.exp(-v / 100));
+  }
+
+  // 形勢表示用の評価役。千日手を嫌う味付け(contempt)は外し、千日手はルールどおり3回目で引き分け。
+  // 特化テンプレートの設定なら奥義と同じ重み、それ以外は究極・神と同じ汎用の重み
+  function makePositionEvaluator(template, timeBudget) {
+    return new LearnedSearchAI("A", "形勢判断", timeBudget == null ? EVAL_TIME_BUDGET : timeBudget,
+      template ? LEARNED_WEIGHTS_TEMPLATE : LEARNED_WEIGHTS_GENERIC, 0,
+      { contempt: 0, repDrawAt: null, contemptTaper: null });
+  }
+
+  // 局面の形勢を先手(A)から見た値で返す: { score, winA, depth, mate(勝つ側 "A"/"B" か null),
+  // matePlies(決着までの手数), final(終局済み) }。1手先も読み終えられなければ null
+  function evaluatePosition(engine, template, timeBudget) {
+    if (engine.winner) {
+      const aWins = engine.winner === "A";
+      return { score: aWins ? WIN_SCORE : -WIN_SCORE, winA: aWins ? 1 : 0, depth: 0, mate: engine.winner, matePlies: 0, final: true };
+    }
+    if (engine.isDraw) return { score: 0, winA: 0.5, depth: 0, mate: null, matePlies: null, final: true };
+    const ai = makePositionEvaluator(template, timeBudget);
+    const s = ai.evaluate(engine);
+    if (!Number.isFinite(s)) return null;
+    const scoreA = engine.currentPlayer === "A" ? s : -s;
+    let mate = null, matePlies = null;
+    if (Math.abs(s) >= MATE_BOUND) {
+      matePlies = Math.round(WIN_SCORE - Math.abs(s));
+      mate = scoreA > 0 ? "A" : "B";
+    }
+    return { score: scoreA, winA: winRateFromScore(scoreA), depth: ai.lastDepth, mate, matePlies, final: false, best: ai.lastBest };
+  }
+
+  // ---- 感想戦の解析(Python 版 analyze_position / judge_move と同じ) ----
+  // 手を [動かす駒の元のマス("" = 配置), 行き先] のラベルで表す(棋譜の from / to と同じ形)
+  function actionLabels(engine, action) {
+    if (action[0] === "place") return ["", H.posLabel(action[1])];
+    return [H.posLabel(engine.pieces.get(action[1]).position), H.posLabel(action[2])];
+  }
+
+  // 1局面ぶんの解析結果(Worker から送れる素のデータ)。
+  // { winA, mate, matePlies, depth, final, best: 最善手のラベル [from, to] か null, nActs: 手番側の合法手の数 }
+  function analyzePosition(engine, template, timeBudget) {
+    const r = evaluatePosition(engine, template, timeBudget);
+    if (!r) return null;
+    return {
+      winA: r.winA, mate: r.mate, matePlies: r.matePlies, depth: r.depth, final: r.final,
+      best: r.best ? actionLabels(engine, r.best) : null,
+      nActs: r.final ? 0 : generateActions(engine, engine.currentPlayer).length,
+    };
+  }
+
+  // 悪手判定の基準(指した側の勝率の落ち幅)。将棋ソフトの「疑問手・悪手・大悪手」にならう
+  const MOVE_JUDGE_LEVELS = [
+    { min: 0.30, label: "大悪手", mark: "??" },
+    { min: 0.15, label: "悪手", mark: "?" },
+    { min: 0.08, label: "疑問手", mark: "?!" },
+  ];
+
+  // 1手の判定。before / after は指す前・指した後の局面の analyzePosition の結果、played は指した手の
+  // [from, to] ラベル。損失 = 指した側から見た勝率の落ち幅。最善手と同じ手・他に手が無い手は損失0とする
+  // (読みの深さの差で出る小さな揺れを、正しい手の損失と取り違えないため)
+  function judgeMove(before, after, mover, played) {
+    const wb = mover === "A" ? before.winA : 1 - before.winA;
+    const wa = mover === "A" ? after.winA : 1 - after.winA;
+    const forced = before.nActs === 1;
+    const isBest = !!before.best && before.best[0] === played[0] && before.best[1] === played[1];
+    const loss = forced || isBest ? 0 : Math.max(0, wb - wa);
+    const level = MOVE_JUDGE_LEVELS.find((lv) => loss >= lv.min) || null;
+    return { before: wb, after: wa, loss, forced, isBest, label: level ? level.label : null, mark: level ? level.mark : "" };
+  }
+
   const AI = {
     LEVELS, LEVEL_ORDER, SPECIALIST_AI_NAME, SPECIALIST_AI_DESC,
     generateActions, applyAction, actionEquals,
@@ -1225,6 +1315,8 @@
     FastState, LearnedSearchAI, LEARNED_FEATURES, LEARNED_WEIGHTS_GENERIC, LEARNED_WEIGHTS_TEMPLATE,
     PAT_N, PAT_CLASS, buildPatternTables, patternValue,
     LEARNED_LEVEL_IDS, makeAI,
+    EVAL_TIME_BUDGET, winRateFromScore, makePositionEvaluator, evaluatePosition,
+    actionLabels, analyzePosition, MOVE_JUDGE_LEVELS, judgeMove,
   };
 
   if (typeof module !== "undefined" && module.exports) {

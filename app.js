@@ -83,7 +83,7 @@
   function initWorker() {
     if (!Worker_) { workerOk = false; return; }
     try {
-      worker = new Worker_("ai-worker.js?v=5");
+      worker = new Worker_("ai-worker.js?v=6");
       worker.onmessage = (e) => {
         if (e.data.reqId !== pendingReqId || e.data.progress != null) return; // 破棄済み(リスタート等)の応答
         if (onWorkerResult) onWorkerResult(e.data);
@@ -184,6 +184,62 @@
       }, 20);
     }
   }
+
+  // ============================================================ 形勢表示の読み(専用 Worker)
+  // 対局用の Worker(pendingReqId は1件だけ)とは別の Worker で読むので、AIの手や詰めピンチの
+  // 要求と取り違えない。受け取るのは最後に頼んだ局面の結果だけ(古い結果は捨てる)。
+  let evalWorker = null;
+  let evalWorkerOk = true;
+  let evalReq = null; // { reqId, engine, template, callback }
+
+  function ensureEvalWorker() {
+    if (evalWorker || !evalWorkerOk) return;
+    if (!Worker_) { evalWorkerOk = false; return; }
+    try {
+      evalWorker = new Worker_("ai-worker.js?v=6");
+      evalWorker.onmessage = (e) => {
+        if (!evalReq || e.data.reqId !== evalReq.reqId) return;
+        const cb = evalReq.callback;
+        evalReq = null;
+        cb(e.data.ok ? e.data.result : null);
+      };
+      evalWorker.onerror = () => {
+        evalWorkerOk = false;
+        evalWorker = null;
+        if (evalReq) runEvalOnMainThread(evalReq);
+      };
+    } catch (e) {
+      evalWorkerOk = false;
+    }
+  }
+
+  // Worker が使えない環境(file:// を直接開いた等)では、メインスレッドで短めに読む(その間だけ画面が止まる)
+  function runEvalOnMainThread(req) {
+    setTimeout(() => {
+      let result = null;
+      try {
+        result = req.kind === "analyze" ? AI.analyzePosition(req.engine, req.template, 250) : AI.evaluatePosition(req.engine, req.template, 250);
+      } catch (e) { result = null; }
+      if (evalReq === req) { evalReq = null; req.callback(result); }
+    }, 30);
+  }
+
+  // kind: "eval"(形勢表示: evaluatePosition)/ "analyze"(感想戦の解析: analyzePosition)
+  function requestEval(engine, template, callback, kind) {
+    const req = { reqId: reqSeq++, engine: engine.clone(), template, callback, kind: kind || "eval" };
+    evalReq = req;
+    ensureEvalWorker();
+    if (evalWorker && evalWorkerOk) {
+      evalWorker.postMessage({
+        kind: req.kind, reqId: req.reqId, config: engine.config, state: engineSnapshot(engine),
+        template, timeBudget: AI.EVAL_TIME_BUDGET,
+      });
+    } else {
+      runEvalOnMainThread(req);
+    }
+  }
+
+  function cancelEval() { evalReq = null; }
 
   // ============================================================ 汎用ヘルパー
   function el(tag, attrs, children) {
@@ -442,6 +498,25 @@
     card.appendChild(timeExtra);
     const timeHint = timeExtra.lastChild;
 
+    // 形勢表示(対局中に優勢・劣勢の%を出す)。持ち時間ありの対人戦は真剣勝負なので既定はオフ、
+    // それ以外は既定でオン。2つの既定は別々に覚えておき、モード・持ち時間に応じて切り替える
+    const evalPrefs = { casual: true, clock: false };
+    const evalCheck = el("input", { type: "checkbox" });
+    const evalHint = el("div", { class: "field-hint" });
+    card.appendChild(el("div", { class: "eval-option" }, [
+      el("label", { class: "check-row" }, [evalCheck, document.createTextNode("対局中に形勢(優勢・劣勢の%)を表示する")]),
+      evalHint,
+    ]));
+    function evalContext() { return currentMode() === "pvp" && timeSelect.value !== "none" ? "clock" : "casual"; }
+    function syncEvalOption() {
+      const ctx = evalContext();
+      evalCheck.checked = evalPrefs[ctx];
+      evalHint.textContent = (ctx === "clock" ? "持ち時間ありの対人戦では既定でオフです(オンにもできます)。" : "")
+        + "形勢は学習型AIが読んだ「強いAI同士で続けた場合の勝率」の目安です。"
+        + "表示した対局は、棋譜・対戦履歴に「形勢表示あり」と記録され、レートなどの集計では区別されます。";
+    }
+    evalCheck.addEventListener("change", () => { evalPrefs[evalContext()] = evalCheck.checked; });
+
     card.appendChild(el("hr", { class: "hr" }));
     card.appendChild(el("div", { class: "field-hint", text: "持ち駒(AIの強さとは独立に自由に設定できます)" }));
 
@@ -503,6 +578,7 @@
       timeCustom.style.display = show && custom ? "" : "none";
       timeExtra.style.display = show && timeSelect.value !== "none" ? "" : "none";
       timeHint.style.display = timeSelect.value !== "none" ? "" : "none";
+      syncEvalOption();
     }
 
     function selectedTimeControl() {
@@ -522,6 +598,7 @@
         level: levelSelect.value, levelB: levelSelectB.value, side: sideSeg.value,
         stockA: stockA.value, stockB: stockB.value,
         time: timeSelect.value, tcMain: tcMain.value, tcByo: tcByo.value, tcInc: tcInc.value, tcSound: tcSound.checked,
+        evalCasual: evalPrefs.casual, evalClock: evalPrefs.clock,
       };
     }
     function hasOption(sel, value) { return Array.from(sel.options).some((o) => o.value === String(value)); }
@@ -547,6 +624,8 @@
       if (hasOption(tcByo, s.tcByo)) tcByo.value = s.tcByo;
       if (hasOption(tcInc, s.tcInc)) tcInc.value = s.tcInc;
       if (typeof s.tcSound === "boolean") tcSound.checked = s.tcSound;
+      if (typeof s.evalCasual === "boolean") evalPrefs.casual = s.evalCasual;
+      if (typeof s.evalClock === "boolean") evalPrefs.clock = s.evalClock;
       onTimeChange();
     }
     // クリック・入力のたびに保存する(セグメントボタンはクリック処理の後で値が変わるので次のタイミングで読む)
@@ -663,7 +742,7 @@
         stockA: sa, stockB: sb,
         ruleTemplate: template ? C.TEMPLATE_ID : null,
         side: mode === "pvai" ? SIDE_CHOICES.find((s) => s.label === sideSeg.value).id : "A",
-        timeControl, clockSound: tcSound.checked,
+        timeControl, clockSound: tcSound.checked, evalDisplay: evalCheck.checked,
       });
 
       function parseStock(text, def, label) {
@@ -715,12 +794,64 @@
       startedAt: Date.now(),
       // オンライン(手番リンク)関連
       onlineActions: [],
+      // 形勢表示(対局中の優勢・劣勢の%)
+      evalDisplay: !!opts.evalDisplay,
+      evalView: null,
     };
     App.screen = "game";
     render();
     if (side === "random" && opts.mode === "pvai") toast(`ランダムの結果、あなたは${humanPlayer === "A" ? "先手" : "後手"}です`);
     startClockTicker();
+    proceedTurn();
+  }
+
+  // ============================================================ 形勢表示
+  // 局面が変わるたび(着手・待った・対局開始・時間切れ)に読み直す。読むのは専用の Worker だが、
+  // 相手AIの思考中は読まない(Python版では読みが同じCPUを取り合ってAIが弱くなるため。両版で揃える)。
+  function evalUsesTemplate(m) {
+    const cfg = m.engine.config;
+    return m.ruleTemplate === C.TEMPLATE_ID
+      || C.configMatchesTemplate(cfg.rows, cfg.cols, cfg.moveRange, cfg.contactLimit, cfg.wallSandwich, m.stockA, m.stockB);
+  }
+
+  // then: 読み終えたら呼ぶ(AI同士の対戦で、形勢を読んでから次のAIに考えさせるため)
+  function refreshEval(then) {
+    const m = App.match;
+    if (!m || !m.evalDisplay) { if (then) then(); return; }
+    const prev = m.evalView && m.evalView.result;
+    if (m.engine.isOver()) {
+      cancelEval();
+      m.evalView = { status: "ready", result: AI.evaluatePosition(m.engine, false) };
+      drawEvalMeter();
+      if (then) then();
+      return;
+    }
+    if (m.aiThinking) {
+      cancelEval();
+      m.evalView = { status: "paused", result: prev };
+      drawEvalMeter();
+      return;
+    }
+    m.evalView = { status: "thinking", result: prev };
+    drawEvalMeter();
+    requestEval(m.engine, evalUsesTemplate(m), (result) => {
+      if (App.match !== m) return;
+      m.evalView = { status: result ? "ready" : "failed", result: result || prev };
+      drawEvalMeter();
+      if (then) then();
+    });
+  }
+
+  // 次の手番へ進める: 相手AIの思考を始め、形勢を読み直す。AI同士の対戦で形勢表示ありなら、
+  // 形勢を読み終えてから次のAIに考えさせる(AIの読みと形勢の読みを同時に走らせない)
+  function proceedTurn() {
+    const m = App.match;
+    if (m.mode === "ai_vs_ai" && m.evalDisplay && !m.aiVsAiPaused && !m.engine.isOver()) {
+      refreshEval(() => { if (App.match === m && !m.aiVsAiPaused) maybeTriggerAI(); });
+      return;
+    }
     maybeTriggerAI();
+    refreshEval();
   }
 
   // ---- 詰めピンチ ---------------------------------------------------
@@ -1073,7 +1204,7 @@
     const board = TSUME_GEN_BOARDS.find((b) => b.key === App.tsumeGen.board);
     const len = TSUME_GEN_LENGTHS.find((l) => l.key === App.tsumeGen.length);
     let w;
-    try { w = new Worker_("ai-worker.js?v=5"); } catch (e) { toast("自動作問を開始できませんでした(ローカルサーバー経由で開いてください)"); return; }
+    try { w = new Worker_("ai-worker.js?v=6"); } catch (e) { toast("自動作問を開始できませんでした(ローカルサーバー経由で開いてください)"); return; }
     tsumeGenWorker = w;
     btn.disabled = true;
     status.textContent = "作問中…(AI同士の対局から詰み局面を探しています)";
@@ -1206,6 +1337,7 @@
     const m = App.match;
     m.aiThinking = true;
     m.selected = null;
+    if (m.evalDisplay) refreshEval(); // AIの思考中は形勢を読まない(読みかけは捨てる)
     updateGameUI();
     const targetEngine = m.engine;
     requestAIMove(m.engine, player, aiOptsFor(player), (action) => {
@@ -1223,11 +1355,9 @@
   }
 
   function afterPlayerAction() {
-    const m = App.match;
     recordIfFinished();
     updateGameUI();
-    if (m.engine.isOver()) return;
-    maybeTriggerAI();
+    proceedTurn();
   }
 
   // ============================================================ 対局時計(対人戦の持ち時間)
@@ -1342,6 +1472,7 @@
     if (m.clockSound) beep(523, 0.6);
     recordIfFinished();
     updateGameUI();
+    refreshEval();
   }
 
   let audioCtx = null;
@@ -1441,6 +1572,7 @@
       stockA: m.stockA, stockB: m.stockB,
       playerALabel: playerDisplayName("A"), playerBLabel: playerDisplayName("B"),
       resultText: resultText(),
+      evalDisplay: !!m.evalDisplay, // 形勢表示ありの対局(レートなどの集計で区別する)
       moves: m.kifuRecords.map((r) => Object.assign({}, r)),
     };
   }
@@ -1506,6 +1638,27 @@
       screen.appendChild(clockBar);
     }
 
+    // ---- 形勢表示(設定でオンにした対局のみ) ----
+    let evalMeter = null;
+    if (m.evalDisplay) {
+      const nameA = el("span", { class: "eval-name" }), pctA = el("b", { class: "eval-pct" });
+      const nameB = el("span", { class: "eval-name" }), pctB = el("b", { class: "eval-pct" });
+      const fill = el("div", { class: "eval-fill" });
+      const note = el("span", { class: "eval-note" });
+      const meterRoot = el("div", {
+        class: "eval-meter", title: "学習型AIが読んだ「強いAI同士がこの局面から続けた場合の勝率」の目安です(人間どうしの実際の勝率ではありません)",
+      }, [
+        el("div", { class: "eval-head" }, [el("span", { class: "eval-title", text: "形勢(目安)" }), note]),
+        el("div", { class: "eval-row" }, [
+          el("span", { class: "eval-side eval-side-a" }, [nameA, pctA]),
+          el("div", { class: "eval-bar", role: "img" }, [fill, el("div", { class: "eval-mid" })]),
+          el("span", { class: "eval-side eval-side-b" }, [pctB, nameB]),
+        ]),
+      ]);
+      screen.appendChild(meterRoot);
+      evalMeter = { root: meterRoot, nameA, pctA, nameB, pctB, fill, note, bar: meterRoot.querySelector(".eval-bar") };
+    }
+
     // ---- 盤面 ----
     const boardWrap = el("div", { class: "board-wrap" });
     const size = m.engine.config.rows;
@@ -1557,7 +1710,7 @@
     // ---- 保存しておいて updateGameUI から参照する ----
     App.gameDom = {
       modeText, turnText, obligationText, bannerHost, undoBtn, restartBtn, stepBtn, pauseBtn, hintBtn, tsumePanel,
-      clockBtn, clocks,
+      clockBtn, clocks, evalMeter,
       board, grid, cellNodes, piecesLayer, fxLayer, size, sideA, sideB, logList,
     };
     m.pieceNodes = new Map();
@@ -1664,6 +1817,7 @@
     m.selected = null;
     m.lastAction = null;
     updateGameUI();
+    refreshEval();
     if (App.onlineRefreshLink) App.onlineRefreshLink();
   }
 
@@ -1677,6 +1831,7 @@
       aiLevel: m.aiLevel, aiLevelB: m.aiLevelB, aiSpecialist: m.aiSpecialist, aiSpecialistB: m.aiSpecialistB,
       stockA: m.stockA, stockB: m.stockB, ruleTemplate: m.ruleTemplate,
       side: m.sideChoice || m.humanPlayer, timeControl: m.timeControl, clockSound: m.clockSound,
+      evalDisplay: m.evalDisplay,
     });
   }
 
@@ -1710,7 +1865,8 @@
     if (!m || !dom) return;
     const engine = m.engine;
 
-    dom.modeText.textContent = modeLabelText() + (m.ruleTemplate ? " / 特化テンプレート" : "") + ` / 接触制限 ${engine.config.contactLimit}`;
+    dom.modeText.textContent = modeLabelText() + (m.ruleTemplate ? " / 特化テンプレート" : "") + ` / 接触制限 ${engine.config.contactLimit}`
+      + (m.evalDisplay ? " / 形勢表示あり" : "");
     dom.restartBtn.disabled = false;
     dom.undoBtn.disabled = m.aiThinking || !m.historyStack.length || !!m.tsumeReplay || !!m.clock
       || (m.mode !== "tsume" && undoTargetIndex(m) == null);
@@ -1731,6 +1887,7 @@
     drawBoard();
     drawStatus();
     drawClocks();
+    drawEvalMeter();
     drawLog();
     drawBanner();
     if (m.mode === "tsume") updateTsumePanel();
@@ -1861,6 +2018,37 @@
     }
   }
 
+  // 形勢バー: 左が先手、右が後手。読み直している間・AIの思考中は直前の値を薄く残す
+  function drawEvalMeter() {
+    const m = App.match, dom = App.gameDom;
+    if (!m || !dom || !dom.evalMeter) return;
+    const em = dom.evalMeter;
+    const v = m.evalView || { status: "thinking", result: null };
+    const r = v.result;
+    em.nameA.textContent = playerDisplayName("A");
+    em.nameB.textContent = playerDisplayName("B");
+    const winA = r ? r.winA : 0.5;
+    // 読み切り・終局以外は 0% / 100% と言い切らない
+    const pctA = r && (r.final || r.mate) ? Math.round(winA * 100) : Math.min(99, Math.max(1, Math.round(winA * 100)));
+    em.pctA.textContent = r ? `${pctA}%` : "--%";
+    em.pctB.textContent = r ? `${100 - pctA}%` : "--%";
+    em.fill.style.width = `${winA * 100}%`;
+    em.bar.setAttribute("aria-label", r ? `形勢 先手${pctA}% 後手${100 - pctA}%` : "形勢 未計算");
+    em.root.classList.toggle("is-stale", v.status !== "ready");
+    em.note.textContent = evalNoteText(m, v);
+  }
+
+  function evalNoteText(m, v) {
+    const r = v.result;
+    if (r && r.final) return m.engine.winner ? `${playerDisplayName(m.engine.winner)}の勝ち` : "引き分け";
+    if (v.status === "thinking") return "読んでいます…";
+    if (v.status === "paused") return "AIの思考中は読みを止めています";
+    if (v.status === "failed" || !r) return "読めませんでした";
+    if (r.mate) return `${playerDisplayName(r.mate)}の勝ちを読み切り(あと${r.matePlies}手)`;
+    const s = Math.round(r.score);
+    return `先手から見た評価値 ${s > 0 ? "+" : ""}${s}(${r.depth}手先まで)`;
+  }
+
   function drawLog() {
     const dom = App.gameDom;
     const m = App.match;
@@ -1946,6 +2134,7 @@
     lines.push(`# モード: ${record.modeLabel}`);
     lines.push(`# 盤面: ${record.rows}x${record.cols} / 移動範囲: ${record.moveRange} / 接触制限: ${record.contactLimit} / 持ち駒: 先手${record.stockA} 後手${record.stockB}`);
     lines.push(`# 結果: ${record.resultText}`);
+    lines.push(`# 形勢表示: ${record.evalDisplay ? "あり" : "なし"}`);
     lines.push("turn,player,action,from,to,sandwiched,self_sandwiched");
     record.moves.forEach((mv) => {
       const row = [mv.turn, mv.player, mv.action, mv.from, mv.to, (mv.sandwiched || []).join(";"), mv.selfSandwiched ? "○" : ""];
@@ -2014,7 +2203,9 @@
   }
   // 先頭1文字で形式を表す: "z" = deflate圧縮済み, "j" = 生のJSON(圧縮APIが無い環境用)
   async function encodeKifuTransfer(records) {
-    const bytes = new TextEncoder().encode(JSON.stringify(records));
+    // 感想戦の解析結果は開き直した先で作り直せるので、URLを短くするため載せない
+    const slim = records.map((r) => { const c = Object.assign({}, r); delete c.analysis; return c; });
+    const bytes = new TextEncoder().encode(JSON.stringify(slim));
     if (window.CompressionStream) {
       try { return "z" + bytesToBase64Url(await pipeBytes(bytes, new CompressionStream("deflate-raw"))); } catch (e) { /* 生JSONで送る */ }
     }
@@ -2372,7 +2563,7 @@
           cb,
           el("div", { class: "history-text" }, [
             el("div", { class: "history-head", text: `${rec.modeLabel} - ${rec.resultText}` }),
-            el("div", { class: "history-sub", text: `${rec.timestamp}  ${rec.rows}x${rec.cols} / ${cl}` }),
+            el("div", { class: "history-sub", text: `${rec.timestamp}  ${rec.rows}x${rec.cols} / ${cl}${rec.evalDisplay ? " / 形勢表示あり" : ""}` }),
           ]),
         ]));
         const actions = el("div", { class: "history-actions" });
@@ -2490,11 +2681,49 @@
       pieceNodes: new Map(),
       startedAt: Date.now(),
       onlineActions: [],
+      // 形勢表示はメニューの設定(持ち時間なしの対局の既定)に従う
+      evalDisplay: !(loadMenuSettings() && loadMenuSettings().evalCasual === false),
+      evalView: null,
     };
     App.screen = "game";
     render();
-    maybeTriggerAI();
+    proceedTurn();
   }
+
+  // ---- 感想戦の解析(勝率グラフと悪手判定) ----
+  // 各局面を形勢表示と同じ評価役で読み(analyzePosition)、隣り合う局面の勝率の差から1手ずつ判定する
+  // (judgeMove)。読み終えた結果は対戦履歴の記録に保存して、次からはすぐ表示する。
+  const ANALYSIS_VERSION = 1;
+
+  function cachedAnalysis(record, nFrames) {
+    const a = record.analysis;
+    return a && a.v === ANALYSIS_VERSION && Array.isArray(a.frames) && a.frames.length === nFrames ? a.frames : null;
+  }
+
+  function saveRecordAnalysis(record, results) {
+    record.analysis = { v: ANALYSIS_VERSION, budget: AI.EVAL_TIME_BUDGET, frames: results };
+    const list = loadHistory();
+    const i = list.findIndex((r) => r.id === record.id);
+    if (i >= 0) { list[i].analysis = record.analysis; saveHistoryList(list); }
+  }
+
+  function recordUsesTemplate(record) {
+    return C.configMatchesTemplate(record.rows, record.cols, record.moveRange, record.contactLimit,
+      record.wallSandwich !== false, record.stockA, record.stockB);
+  }
+
+  // i手目(1始まり)の判定。解析が両側の局面ぶん揃っていなければ null
+  function judgeAt(record, frames, results, i) {
+    if (i < 1 || !results[i - 1] || !results[i]) return null;
+    const mv = record.moves[i - 1];
+    return AI.judgeMove(results[i - 1], results[i], frames[i - 1].currentPlayer, [mv.from || "", mv.to]);
+  }
+
+  function bestMoveText(best) {
+    return best[0] ? `${best[0]}→${best[1]}` : `${best[1]}に配置`;
+  }
+
+  function pct(w) { return `${Math.round(w * 100)}%`; }
 
   function renderReview(root) {
     const record = App.reviewRecord;
@@ -2502,10 +2731,32 @@
     if (!record) { root.appendChild(el("p", { text: "記録が見つかりません。" })); return; }
     const frames = rebuildFramesFromRecord(record);
     let index = frames.length - 1;
+    const nameOf = (p) => (p === "A" ? record.playerALabel || "先手" : record.playerBLabel || "後手");
+    const cached = cachedAnalysis(record, frames.length);
+    const results = cached ? cached.slice() : new Array(frames.length).fill(null);
 
     screen.appendChild(el("h1", { class: "card-title", text: "感想戦", style: { fontSize: "24px" } }));
     const cl = record.contactLimit != null ? `接触制限${record.contactLimit}` : "接触制限なし";
-    screen.appendChild(el("div", { class: "field-hint", text: `${record.modeLabel} / ${record.rows}x${record.cols} / ${cl} - ${record.resultText}` }));
+    screen.appendChild(el("div", { class: "field-hint", text: `${record.modeLabel} / ${record.rows}x${record.cols} / ${cl}${record.evalDisplay ? " / 形勢表示あり" : ""} - ${record.resultText}` }));
+
+    // ---- 勝率グラフ(上が先手100%、下が後手100%)と、解析の進み具合・手の判定のまとめ ----
+    const graphCard = el("div", { class: "review-graph-card" });
+    const summary = el("div", { class: "review-summary" });
+    graphCard.appendChild(summary);
+    const SVGNS = "http://www.w3.org/2000/svg";
+    const GW = 600, GH = 130, GP = 8;
+    const svg = document.createElementNS(SVGNS, "svg");
+    svg.setAttribute("class", "review-graph");
+    svg.setAttribute("viewBox", `0 0 ${GW} ${GH}`);
+    svg.setAttribute("preserveAspectRatio", "none");
+    svg.setAttribute("role", "img");
+    svg.setAttribute("aria-label", "先手の勝率の推移(上ほど先手が優勢)。クリックでその手へ移動");
+    graphCard.appendChild(svg);
+    graphCard.appendChild(el("div", { class: "review-graph-legend" }, [
+      el("span", { text: `上: ${nameOf("A")}(先手)優勢 / 下: ${nameOf("B")}(後手)優勢` }),
+      el("span", {}, [el("i", { class: "mk mk-big" }), document.createTextNode("悪手・大悪手 "), el("i", { class: "mk mk-small" }), document.createTextNode("疑問手")]),
+    ]));
+    screen.appendChild(graphCard);
 
     const boardWrap = el("div", { class: "board-wrap" });
     const size = record.rows;
@@ -2514,7 +2765,9 @@
     screen.appendChild(boardWrap);
 
     const desc = el("div", { class: "review-desc" });
+    const verdict = el("div", { class: "review-verdict" });
     screen.appendChild(desc);
+    screen.appendChild(verdict);
     const toolbar = el("div", { class: "review-toolbar" });
     const step = el("span", { class: "review-step" });
     const first = el("button", { class: "btn btn-compact", text: "|<< 最初" });
@@ -2523,21 +2776,143 @@
     const last = el("button", { class: "btn btn-compact", text: "最後 >>|" });
     toolbar.appendChild(first); toolbar.appendChild(prev); toolbar.appendChild(step); toolbar.appendChild(next); toolbar.appendChild(last);
     screen.appendChild(toolbar);
+    const jumpBar = el("div", { class: "review-toolbar" });
+    const prevBad = el("button", { class: "btn btn-compact", text: "◀ 前の疑問手・悪手" });
+    const nextBad = el("button", { class: "btn btn-compact", text: "次の疑問手・悪手 ▶" });
+    jumpBar.appendChild(prevBad); jumpBar.appendChild(nextBad);
+    screen.appendChild(jumpBar);
 
     const resumeBtn = el("button", { class: "btn btn-compact", text: "この局面から対局を再開する", onclick: () => openResumeSetup(frames[index]) });
     screen.appendChild(resumeBtn);
 
     const list = el("ul", { class: "review-list" });
     list.appendChild(el("li", { text: "0: (対局開始)", onclick: () => { index = 0; renderFrame(); } }));
-    record.moves.forEach((mv, i) => {
+    const moveItems = [];
+    record.moves.slice(0, frames.length - 1).forEach((mv, i) => {
       let line = `${mv.turn}: ${mv.player} ${mv.action}(${mv.to})`;
       if (mv.sandwiched && mv.sandwiched.length) line += ` [${mv.sandwiched.join(",")}]`;
       if (mv.selfSandwiched) line += " [自分挟み]";
-      list.appendChild(el("li", { text: line, onclick: () => { index = i + 1; renderFrame(); } }));
+      const tag = el("span", { class: "review-tag" });
+      const li = el("li", { onclick: () => { index = i + 1; renderFrame(); } }, [el("span", { text: line }), tag]);
+      moveItems.push({ li, tag });
+      list.appendChild(li);
     });
     screen.appendChild(list);
     screen.appendChild(el("button", { class: "btn", text: "← メニューに戻る", onclick: () => goto("menu"), style: { marginTop: "6px" } }));
     root.appendChild(screen);
+
+    svg.addEventListener("click", (e) => {
+      const rect = svg.getBoundingClientRect();
+      const n = frames.length - 1;
+      if (!n || !rect.width) return;
+      index = Math.round(((e.clientX - rect.left) / rect.width) * n);
+      renderFrame();
+    });
+
+    function judgedMoves() {
+      const out = [];
+      for (let i = 1; i < frames.length; i++) out.push(judgeAt(record, frames, results, i));
+      return out;
+    }
+
+    function drawGraph() {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      const n = Math.max(1, frames.length - 1);
+      const x = (i) => (i / n) * GW;
+      const y = (w) => GP + (1 - w) * (GH - 2 * GP);
+      const mk = (tag, attrs) => {
+        const node = document.createElementNS(SVGNS, tag);
+        for (const k in attrs) node.setAttribute(k, attrs[k]);
+        svg.appendChild(node);
+        return node;
+      };
+      mk("rect", { x: 0, y: 0, width: GW, height: GH, class: "g-bg" });
+      // 読み終えた先頭からの連続部分だけを線にする
+      let upto = -1;
+      while (upto + 1 < results.length && results[upto + 1]) upto++;
+      if (upto >= 0) {
+        let area = `M ${x(0)} ${y(0)}`;
+        let line = "";
+        for (let i = 0; i <= upto; i++) {
+          area += ` L ${x(i)} ${y(results[i].winA)}`;
+          line += `${i ? " L" : "M"} ${x(i)} ${y(results[i].winA)}`;
+        }
+        area += ` L ${x(upto)} ${y(0)} Z`;
+        mk("path", { d: area, class: "g-area" });
+        mk("path", { d: line, class: "g-line", "vector-effect": "non-scaling-stroke" });
+      }
+      mk("line", { x1: 0, x2: GW, y1: y(0.5), y2: y(0.5), class: "g-mid", "vector-effect": "non-scaling-stroke" });
+      mk("line", { x1: x(index), x2: x(index), y1: 0, y2: GH, class: "g-cursor", "vector-effect": "non-scaling-stroke" });
+      judgedMoves().forEach((j, k) => {
+        if (!j || !j.mark) return;
+        const i = k + 1;
+        mk("rect", { x: x(i) - 3, y: y(results[i].winA) - 3, width: 6, height: 6, class: j.mark === "?!" ? "g-mk-small" : "g-mk-big" });
+      });
+    }
+
+    function drawSummary() {
+      clearNode(summary);
+      const done = results.filter(Boolean).length;
+      if (done < results.length) {
+        summary.appendChild(el("span", { class: "review-progress", text: `AIが解析しています… ${done} / ${results.length} 局面(1局面 約${(AI.EVAL_TIME_BUDGET / 1000).toFixed(1)}秒)` }));
+        return;
+      }
+      const judged = judgedMoves();
+      for (const p of ["A", "B"]) {
+        const mine = judged.filter((j, k) => j && frames[k].currentPlayer === p && !j.forced);
+        const count = (lb) => mine.filter((j) => j.label === lb).length;
+        const avg = mine.length ? mine.reduce((s, j) => s + j.loss, 0) / mine.length : 0;
+        const role = p === "A" ? "先手" : "後手";
+        summary.appendChild(el("div", { class: `review-score side-${p.toLowerCase()}` }, [
+          el("b", { text: nameOf(p).startsWith(role) ? nameOf(p) : `${role} ${nameOf(p)}` }),
+          el("span", { text: `大悪手 ${count("大悪手")} / 悪手 ${count("悪手")} / 疑問手 ${count("疑問手")}` }),
+          el("span", { class: "review-avg", text: `平均損失 ${(avg * 100).toFixed(1)}%` }),
+        ]));
+      }
+    }
+
+    function drawTags() {
+      judgedMoves().forEach((j, k) => {
+        const item = moveItems[k];
+        if (!item) return;
+        item.tag.textContent = j && j.label ? ` ${j.mark} ${j.label} −${Math.floor(j.loss * 100)}%` : "";
+        item.li.classList.toggle("is-bad", !!(j && j.mark && j.mark !== "?!"));
+        item.li.classList.toggle("is-dubious", !!(j && j.mark === "?!"));
+      });
+    }
+
+    function drawVerdict() {
+      clearNode(verdict);
+      const r = results[index];
+      let text;
+      if (!r) text = "形勢: 解析中…";
+      else if (r.final) text = frames[index].winner ? `${nameOf(frames[index].winner)}の勝ち` : "引き分け";
+      else if (r.mate) text = `形勢: ${nameOf(r.mate)}の勝ちを読み切り(あと${r.matePlies}手)`;
+      else text = `形勢: 先手 ${pct(r.winA)} / 後手 ${pct(1 - r.winA)}`;
+      verdict.appendChild(el("div", { text }));
+      const j = judgeAt(record, frames, results, index);
+      if (!j) return;
+      const cls = j.mark ? (j.mark === "?!" ? "is-dubious" : "is-bad") : "is-ok";
+      const mover = nameOf(frames[index - 1].currentPlayer);
+      const head = `この手(${mover})`;
+      const rate = `${mover}の勝率 ${pct(j.before)} → ${pct(j.after)}`;
+      let line;
+      if (j.forced) line = `${head}: 他に指せる手がない局面でした`;
+      else if (j.isBest) line = `${head}: 最善手(AIの読みと一致)  ${rate}`;
+      else if (j.loss < 0.01) line = `${head}: 問題なし  ${rate}`;
+      else {
+        line = `${head}: ${j.label ? `${j.mark} ${j.label}` : "問題なし"}  ${rate}(−${Math.floor(j.loss * 100)}%)`;
+        const best = results[index - 1].best;
+        if (best) line += ` / AIの最善手: ${bestMoveText(best)}`;
+      }
+      verdict.appendChild(el("div", { class: `review-judge ${cls}`, text: line }));
+    }
+
+    function badIndices() {
+      const out = [];
+      judgedMoves().forEach((j, k) => { if (j && j.mark) out.push(k + 1); });
+      return out;
+    }
 
     function renderFrame() {
       index = Math.max(0, Math.min(frames.length - 1, index));
@@ -2564,23 +2939,60 @@
       first.disabled = prev.disabled = index === 0;
       next.disabled = last.disabled = index === frames.length - 1;
       resumeBtn.disabled = !!(frame.winner || frame.isDraw);
+      const bad = badIndices();
+      prevBad.disabled = !bad.some((i) => i < index);
+      nextBad.disabled = !bad.some((i) => i > index);
       Array.from(list.children).forEach((li, i) => li.classList.toggle("is-current", i === index));
+      drawVerdict();
+      drawGraph();
     }
     first.addEventListener("click", () => { index = 0; renderFrame(); });
     prev.addEventListener("click", () => { index--; renderFrame(); });
     next.addEventListener("click", () => { index++; renderFrame(); });
     last.addEventListener("click", () => { index = frames.length - 1; renderFrame(); });
-    renderFrame();
+    prevBad.addEventListener("click", () => {
+      const b = badIndices().filter((i) => i < index);
+      if (b.length) { index = b[b.length - 1]; renderFrame(); }
+    });
+    nextBad.addEventListener("click", () => {
+      const b = badIndices().find((i) => i > index);
+      if (b != null) { index = b; renderFrame(); }
+    });
+
+    function refreshAll() { drawSummary(); drawTags(); renderFrame(); }
+    refreshAll();
+
+    // まだ解析していない局面を、最初から1つずつ読む(この画面を離れたら打ち切る)
+    if (results.some((r) => !r)) {
+      const token = App.reviewToken = (App.reviewToken || 0) + 1;
+      const template = recordUsesTemplate(record);
+      const stillHere = () => App.screen === "review" && App.reviewToken === token;
+      const analyzeNext = () => {
+        if (!stillHere()) return;
+        const i = results.findIndex((r) => !r);
+        if (i < 0) { saveRecordAnalysis(record, results); refreshAll(); return; }
+        requestEval(frames[i].engineClone, template, (res) => {
+          if (!stillHere()) return;
+          // 読めなかった局面(Worker の不調など)は互角扱いで埋めて先へ進む
+          results[i] = res || { winA: 0.5, mate: null, matePlies: null, depth: 0, final: false, best: null, nActs: 0 };
+          refreshAll();
+          analyzeNext();
+        }, "analyze");
+      };
+      analyzeNext();
+    }
   }
 
   // ============================================================ オンライン(手番リンク方式)
   // onlineActions の要素は {kind:"place", to:[r,c]} または {kind:"move", from:[r,c], to:[r,c]}。
-  function encodeMatchCode(config, stockA, stockB, onlineActions) {
+  // evalDisplay: 形勢表示あり(作った人が決め、両者に同じ設定で表示する)。なしなら載せない
+  function encodeMatchCode(config, stockA, stockB, onlineActions, evalDisplay) {
     const payload = {
       r: config.rows, mr: config.moveRange, cl: config.contactLimit,
       sa: stockA, sb: stockB,
       mv: onlineActions.map((a) => (a.kind === "place" ? ["p", posLabel(a.to)] : ["m", posLabel(a.from), posLabel(a.to)])),
     };
+    if (evalDisplay) payload.ev = 1;
     const json = JSON.stringify(payload);
     const bytes = new TextEncoder().encode(json);
     let bin = "";
@@ -2644,6 +3056,11 @@
 
     sizeSelect.addEventListener("change", () => { stockInput.value = String(defaultStockForSize(parseInt(sizeSelect.value, 10))); });
 
+    // 形勢表示はオンライン対戦では既定でオフ。オンにすると両者の画面に表示する
+    const evalCheck = el("input", { type: "checkbox" });
+    card.appendChild(el("label", { class: "check-row", style: { marginTop: "8px" } }, [evalCheck, document.createTextNode("対局中に形勢(優勢・劣勢の%)を表示する")]));
+    card.appendChild(el("div", { class: "field-hint", text: "既定はオフです。オンにすると、リンクを受け取った相手の画面にも同じように表示されます(棋譜には「形勢表示あり」と記録)。" }));
+
     const createBtn = el("button", { class: "btn btn-primary", text: "対局を作ってリンクを発行", style: { marginTop: "14px" } });
     card.appendChild(createBtn);
     screen.appendChild(card);
@@ -2652,7 +3069,7 @@
     createBtn.addEventListener("click", () => {
       const config = { rows: parseInt(sizeSelect.value, 10), cols: parseInt(sizeSelect.value, 10), moveRange: parseInt(rangeSelect.value, 10), contactLimit: parseInt(contactSelect.value, 10) };
       const stock = parseInt(stockInput.value, 10) || defaultStockForSize(config.rows);
-      const code = encodeMatchCode(config, stock, stock, []);
+      const code = encodeMatchCode(config, stock, stock, [], evalCheck.checked);
       location.hash = "online=" + code;
       goto("online");
     });
@@ -2696,10 +3113,13 @@
       engine, humanPlayer: "A", selected: null, lastAction: null,
       logMessages: [], kifuRecords: [], historyStack: [], aiThinking: false, aiVsAiPaused: false,
       kifuSaved: false, pieceNodes: new Map(), onlineActions,
+      // 形勢表示は対局を作った人が決め、リンクに載せて両者に同じ設定で表示する
+      evalDisplay: !!payload.ev, evalView: null,
     };
     App.screen = "game";
     render();
     injectOnlineShareUI();
+    refreshEval();
   }
 
   function injectOnlineShareUI() {
@@ -2717,7 +3137,7 @@
     dom.bannerHost.parentElement.insertBefore(box, dom.bannerHost.nextSibling);
 
     function refreshLink() {
-      const code = encodeMatchCode(m.engine.config, m.stockA, m.stockB, m.onlineActions);
+      const code = encodeMatchCode(m.engine.config, m.stockA, m.stockB, m.onlineActions, m.evalDisplay);
       const url = location.origin + location.pathname + "#online=" + code;
       input.value = url;
     }

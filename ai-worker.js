@@ -10,10 +10,11 @@
  * postMessage は構造化複製(structured clone)アルゴリズムを使うため、
  * Map や配列はそのまま送受信できる(JSON化は不要)。
  */
-importScripts("engine.js?v=3", "ai.js?v=5", "tsume.js?v=1");
+importScripts("engine.js?v=3", "ai.js?v=6", "tsume.js?v=1");
 
 self.onmessage = function (e) {
   if (e.data.kind === "tsume") { handleTsume(e.data); return; }
+  if (e.data.kind === "eval" || e.data.kind === "analyze") { handleEval(e.data); return; }
   const { reqId, config, state, player, level, specialist, seed, timeBudget } = e.data;
   try {
     const engine = rebuildEngine(config, state);
@@ -43,6 +44,21 @@ function handleTsume(d) {
         ? T.hintFor(engine, d.solver, d.quietLeft, d.maxPlies)
         : T.defendFor(engine, d.solver, d.quietLeft, d.maxPlies);
     }
+    postMessage({ reqId: d.reqId, ok: true, result });
+  } catch (err) {
+    postMessage({ reqId: d.reqId, ok: false, error: String((err && err.message) || err) });
+  }
+}
+
+// 対局中の形勢表示(kind: "eval")と感想戦の解析(kind: "analyze")。対局用の Worker とは
+// 別の Worker で動かす(app.js の requestEval)
+function handleEval(d) {
+  try {
+    const engine = rebuildEngine(d.config, d.state);
+    const A = self.HasamiAI;
+    const result = d.kind === "analyze"
+      ? A.analyzePosition(engine, d.template, d.timeBudget)
+      : A.evaluatePosition(engine, d.template, d.timeBudget);
     postMessage({ reqId: d.reqId, ok: true, result });
   } catch (err) {
     postMessage({ reqId: d.reqId, ok: false, error: String((err && err.message) || err) });
