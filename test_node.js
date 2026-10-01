@@ -228,6 +228,69 @@ function check(name, cond, detail) {
     [6, 7].every((l) => { const a = AI.makeAI("A", l, false, 1); return a instanceof AI.LearnedSearchAI && a.level.timeBudget === AI.LEVELS[l].timeBudget; }));
   check("makeAI: levels 1-5 stay MinimaxAI",
     [1, 2, 3, 4, 5].every((l) => { const a = AI.makeAI("A", l, false, 1); return a.constructor === AI.MinimaxAI; }));
+  // 達人 = 最強と同じ探索(MinimaxAI・深さ5)で思考時間だけ2秒。選択肢では上級と最強の間
+  const tatsu = AI.makeAI("A", 8, false, 1), saikyo = AI.LEVELS[5];
+  check("makeAI: 達人(8) is 最強 with a 2s budget",
+    tatsu.constructor === AI.MinimaxAI && tatsu.level.name === "達人" && tatsu.level.timeBudget === 2000
+    && ["maxDepth", "blunderRate", "useTT", "ttSize"].every((k) => tatsu.level[k] === saikyo[k]));
+  check("LEVEL_ORDER lists every level once, 達人 between 上級 and 最強",
+    AI.LEVEL_ORDER.slice().sort().join() === Object.keys(AI.LEVELS).sort().join()
+    && AI.LEVEL_ORDER.indexOf(8) === AI.LEVEL_ORDER.indexOf(4) + 1 && AI.LEVEL_ORDER.indexOf(5) === AI.LEVEL_ORDER.indexOf(8) + 1);
+  {
+    const e = new H.GameEngine(H.makeConfig({ rows: 7, cols: 7, moveRange: 1, wallSandwich: true, contactLimit: 3 }));
+    const t0 = Date.now();
+    const act = AI.makeAI("A", 8, false, 1).chooseAction(e);
+    const ms = Date.now() - t0;
+    check(`達人 returns a legal move within ~2s (${ms}ms)`,
+      !!act && AI.generateActions(e, "A").some((a) => AI.actionEquals(a, act)) && ms < 2600, ms);
+  }
+})();
+
+// ---- 9b. 学習型AI: 局所パターン評価 ----
+// 盤を回転・反転しても評価(特徴量の線形和 + 局所パターン)が変わらないこと、
+// 奥義の重みに 55 クラス分のパターンの重みが入っていることを確かめる(究極・神は据え置き)。
+(function () {
+  check("pattern classes: 55 classes", new Set(Array.from(AI.PAT_CLASS)).size === AI.PAT_N && AI.PAT_N === 55);
+  const W = AI.LEARNED_WEIGHTS_TEMPLATE;
+  check("奥義の重みに局所パターン(pat_s / pat_o 各55)が入っている",
+    Array.isArray(W.pat_s) && W.pat_s.length === AI.PAT_N && Array.isArray(W.pat_o) && W.pat_o.length === AI.PAT_N);
+  check("究極・神の重みは局所パターンなし(据え置き)", !AI.LEARNED_WEIGHTS_GENERIC.pat_s);
+  check("パターンの重みがあるときだけ表を作る",
+    AI.makeAI("A", 7, true, 1)._patTabs !== null && AI.makeAI("A", 7, false, 1)._patTabs === null);
+  const syms = [
+    (r, c, n) => [c, r], (r, c, n) => [n - 1 - r, c], (r, c, n) => [r, n - 1 - c],
+    (r, c, n) => [n - 1 - c, n - 1 - r], (r, c, n) => [n - 1 - r, n - 1 - c],
+  ];
+  let bad = 0, n = 0;
+  const w = AI.LEARNED_WEIGHTS_TEMPLATE;
+  // 壁なしの盤(盤外の番兵が 4)でもパターンの表引きが対称になることを確かめる
+  for (const cfgOpts of [{ rows: 7, cols: 7, moveRange: 3, stockPerPlayer: 15, wallSandwich: true, contactLimit: 3 },
+    { rows: 6, cols: 6, moveRange: 2, wallSandwich: false, contactLimit: null }]) {
+    for (let g = 0; g < 8; g++) {
+      const e = new H.GameEngine(H.makeConfig(cfgOpts));
+      let s = 31 + g; const rand = () => { s = (s * 1103515245 + 12345) & 0x7fffffff; return s / 0x7fffffff; };
+      for (let ply = 0; ply < 50 && !e.isOver(); ply++) {
+        const l = AI.generateActions(e, e.currentPlayer);
+        AI.applyAction(e, e.currentPlayer, l[Math.floor(rand() * l.length)]);
+        if (e.isOver()) break;
+        const ai = new AI.LearnedSearchAI(e.currentPlayer, "t", null, w, 1);
+        const v0 = ai._evaluate(new AI.FastState(e), 0, 1);
+        for (const f of syms) {
+          const e2 = new H.GameEngine(e.config);
+          for (const [id, p] of e.pieces) {
+            const pos = f(p.position[0], p.position[1], e.config.rows);
+            e2.pieces.set(id, { id, player: p.player, position: pos }); e2.board.set(pos.join(","), id);
+          }
+          e2._nextPieceId = e._nextPieceId; e2.stock = Object.assign({}, e.stock);
+          e2.currentPlayer = e.currentPlayer; e2.obligated = { A: e.obligated.A.slice(), B: e.obligated.B.slice() };
+          const v1 = ai._evaluate(new AI.FastState(e2), 0, 1);
+          n++;
+          if (Math.abs(v0 - v1) > 1e-6) { bad++; if (bad < 3) console.log("   asym", g, ply, v0, v1); }
+        }
+      }
+    }
+  }
+  check(`learned eval (with patterns) is symmetric under board rotations/reflections (${n} checks)`, bad === 0);
 })();
 
 // ---- 10. 学習型AI: 千日手の入口(一度現れた局面へ戻る手)を避ける ----

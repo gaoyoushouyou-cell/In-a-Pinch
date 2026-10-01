@@ -22,6 +22,56 @@
     try { localStorage.setItem(LS_HISTORY, JSON.stringify(arr.slice(-200))); } catch (e) { /* 保存できなくても致命的ではない */ }
   }
 
+  // メニュー画面の設定。対戦画面などから戻ったときや、次に開いたときも前回の設定を復元する
+  // (保存できない環境でも、このページを開いている間は menuSettingsCache に残る)。
+  const LS_MENU = "hasami:menu:v1";
+  let menuSettingsCache = null;
+  function loadMenuSettings() {
+    if (menuSettingsCache) return menuSettingsCache;
+    try { menuSettingsCache = JSON.parse(localStorage.getItem(LS_MENU) || "null"); } catch (e) { menuSettingsCache = null; }
+    return menuSettingsCache;
+  }
+  function saveMenuSettings(s) {
+    menuSettingsCache = s;
+    try { localStorage.setItem(LS_MENU, JSON.stringify(s)); } catch (e) { /* 同上 */ }
+  }
+
+  // ============================================================ 手番・持ち時間の選択肢
+  const SIDE_CHOICES = [
+    { id: "A", label: "先手" },
+    { id: "B", label: "後手" },
+    { id: "random", label: "ランダム" },
+  ];
+
+  // 持ち時間のプリセット(秒)。main = 持ち時間、byo = 秒読み(持ち時間が尽きたら1手ごとにこの秒数)、
+  // inc = 1手指すごとに持ち時間へ加算(フィッシャー)。将棋ウォーズの切れ負け・10秒将棋、
+  // 道場・大会でおなじみの「持ち時間+秒読み」、ネット対局で使われるフィッシャー方式にならった。
+  const TIME_PRESETS = [
+    { id: "none", label: "なし(時間制限なし)", spec: null },
+    { id: "byo60", label: "1分将棋(1手60秒の秒読み)", spec: { main: 0, byo: 60, inc: 0 } },
+    { id: "byo30", label: "30秒将棋(1手30秒の秒読み)", spec: { main: 0, byo: 30, inc: 0 } },
+    { id: "byo10", label: "10秒将棋(1手10秒・将棋ウォーズ風)", spec: { main: 0, byo: 10, inc: 0 } },
+    { id: "sd3", label: "3分切れ負け(将棋ウォーズ風)", spec: { main: 180, byo: 0, inc: 0 } },
+    { id: "sd10", label: "10分切れ負け(将棋ウォーズ風)", spec: { main: 600, byo: 0, inc: 0 } },
+    { id: "m10b30", label: "持ち時間10分+秒読み30秒", spec: { main: 600, byo: 30, inc: 0 } },
+    { id: "m15b60", label: "持ち時間15分+秒読み60秒", spec: { main: 900, byo: 60, inc: 0 } },
+    { id: "f5i5", label: "5分+1手ごとに5秒加算(フィッシャー)", spec: { main: 300, byo: 0, inc: 5 } },
+    { id: "custom", label: "カスタム(自分で組み合わせる)", spec: null },
+  ];
+  const TIME_MAIN_CHOICES = [0, 1, 3, 5, 10, 15, 20, 30, 60]; // 分
+  const TIME_BYO_CHOICES = [0, 10, 20, 30, 60];              // 秒
+  const TIME_INC_CHOICES = [0, 1, 2, 3, 5, 10, 30];          // 秒
+
+  function timeControlLabel(t) {
+    if (!t) return "持ち時間なし";
+    if (!t.main && !t.inc) return t.byo === 60 ? "1分将棋" : `${t.byo}秒将棋`;
+    let s = t.main % 60 ? `持ち時間${t.main}秒` : `持ち時間${t.main / 60}分`;
+    if (t.byo) s += `+秒読み${t.byo}秒`;
+    if (t.inc) s += `+1手${t.inc}秒加算`;
+    if (!t.byo && !t.inc) s += "切れ負け";
+    return s;
+  }
+
   // ============================================================ Web Worker(AI思考)
   const Worker_ = window.Worker;
   let worker = null;
@@ -33,7 +83,7 @@
   function initWorker() {
     if (!Worker_) { workerOk = false; return; }
     try {
-      worker = new Worker_("ai-worker.js?v=3");
+      worker = new Worker_("ai-worker.js?v=5");
       worker.onmessage = (e) => {
         if (e.data.reqId !== pendingReqId || e.data.progress != null) return; // 破棄済み(リスタート等)の応答
         if (onWorkerResult) onWorkerResult(e.data);
@@ -356,12 +406,48 @@
     levelRowB.appendChild(el("div", { class: "field-control" }, [levelSelectB]));
     card.appendChild(levelRowB);
 
+    // AI戦のときだけ: あなたが先手・後手のどちらを持つか(ランダムは対局開始ごとに抽選)
+    const sideRow = el("div", { class: "field-row" });
+    sideRow.appendChild(el("div", { class: "field-label", text: "あなたの手番" }));
+    const sideSeg = buildSeg(SIDE_CHOICES.map((s) => s.label), SIDE_CHOICES[0].label);
+    sideRow.appendChild(el("div", { class: "field-control" }, [sideSeg.el]));
+    card.appendChild(sideRow);
+
+    // 対人戦のときだけ: 持ち時間(将棋の切れ負け・秒読み・フィッシャーにならう)
+    const timeRow = el("div", { class: "field-row", style: { display: "none" } });
+    timeRow.appendChild(el("div", { class: "field-label", text: "持ち時間" }));
+    const timeSelect = el("select", { class: "field-select" });
+    TIME_PRESETS.forEach((p) => timeSelect.appendChild(el("option", { value: p.id, text: p.label })));
+    timeRow.appendChild(el("div", { class: "field-control" }, [timeSelect]));
+    card.appendChild(timeRow);
+    const timeCustom = el("div", { class: "time-custom", style: { display: "none" } });
+    const tcMain = buildNumSelect(TIME_MAIN_CHOICES, (v) => (v ? `${v}分` : "なし"), 10);
+    const tcByo = buildNumSelect(TIME_BYO_CHOICES, (v) => (v ? `${v}秒` : "なし"), 30);
+    const tcInc = buildNumSelect(TIME_INC_CHOICES, (v) => (v ? `${v}秒` : "なし"), 0);
+    [["持ち時間", tcMain], ["秒読み", tcByo], ["1手ごとの加算", tcInc]].forEach(([label, sel]) => {
+      timeCustom.appendChild(el("label", { class: "time-custom-item" }, [el("span", { text: label }), sel]));
+    });
+    card.appendChild(timeCustom);
+    const tcSound = el("input", { type: "checkbox" });
+    tcSound.checked = true;
+    const timeExtra = el("div", { style: { display: "none" } }, [
+      el("label", { class: "check-row" }, [tcSound, document.createTextNode("残りわずかになったら秒読みの音を鳴らす")]),
+      el("div", {
+        class: "field-hint",
+        text: "持ち時間を使い切ると秒読み(1手ごとにその秒数以内)に入り、秒読みも尽きると時間切れ負けです。"
+          + "秒読みなしは持ち時間が尽きた時点で負け(切れ負け)、加算ありは指すたびに持ち時間が増えます(フィッシャー)。"
+          + "持ち時間ありの対局では「待った」はできません。",
+      }),
+    ]);
+    card.appendChild(timeExtra);
+    const timeHint = timeExtra.lastChild;
+
     card.appendChild(el("hr", { class: "hr" }));
     card.appendChild(el("div", { class: "field-hint", text: "持ち駒(AIの強さとは独立に自由に設定できます)" }));
 
     const defaultStock = defaultStockForSize(7);
     const stockRow = el("div", { class: "field-row" });
-    stockRow.appendChild(el("div", { class: "field-label", text: "先手(1P) / 後手(2P・AI)" }));
+    stockRow.appendChild(el("div", { class: "field-label", text: "先手 / 後手" }));
     const stockA = el("input", { class: "stock-input", type: "number", min: "1", value: String(defaultStock) });
     const stockB = el("input", { class: "stock-input", type: "number", min: "1", value: String(defaultStock) });
     stockRow.appendChild(el("div", { class: "field-control" }, [stockA, stockB]));
@@ -396,10 +482,76 @@
 
     function buildLevelSelect() {
       const sel = el("select", { class: "field-select" });
-      for (let i = 1; i <= 7; i++) sel.appendChild(el("option", { value: String(i), text: AI.LEVELS[i].name }));
+      AI.LEVEL_ORDER.forEach((i) => sel.appendChild(el("option", { value: String(i), text: AI.LEVELS[i].name })));
       sel.value = "3";
       return sel;
     }
+
+    function buildNumSelect(values, labelOf, initial) {
+      const sel = el("select", { class: "field-select" });
+      values.forEach((v) => sel.appendChild(el("option", { value: String(v), text: labelOf(v) })));
+      sel.value = String(initial);
+      return sel;
+    }
+
+    function currentMode() { return modeInputs.pvai.checked ? "pvai" : modeInputs.pvp.checked ? "pvp" : "ai_vs_ai"; }
+
+    function onTimeChange() {
+      const show = currentMode() === "pvp";
+      const custom = timeSelect.value === "custom";
+      timeRow.style.display = show ? "" : "none";
+      timeCustom.style.display = show && custom ? "" : "none";
+      timeExtra.style.display = show && timeSelect.value !== "none" ? "" : "none";
+      timeHint.style.display = timeSelect.value !== "none" ? "" : "none";
+    }
+
+    function selectedTimeControl() {
+      if (timeSelect.value === "custom") {
+        const t = { main: parseInt(tcMain.value, 10) * 60, byo: parseInt(tcByo.value, 10), inc: parseInt(tcInc.value, 10) };
+        return t.main || t.byo ? t : undefined; // 持ち時間も秒読みも無いと1手目で負けてしまう
+      }
+      const preset = TIME_PRESETS.find((p) => p.id === timeSelect.value);
+      return preset && preset.spec ? Object.assign({}, preset.spec) : null;
+    }
+
+    // ---- 設定の保存・復元(対戦画面などから戻っても前回の設定のまま) ----
+    function collectSettings() {
+      return {
+        template: tplSelect.value, mode: currentMode(),
+        size: sizeSelect.value, range: rangeSeg.value, contact: contactSeg.value,
+        level: levelSelect.value, levelB: levelSelectB.value, side: sideSeg.value,
+        stockA: stockA.value, stockB: stockB.value,
+        time: timeSelect.value, tcMain: tcMain.value, tcByo: tcByo.value, tcInc: tcInc.value, tcSound: tcSound.checked,
+      };
+    }
+    function hasOption(sel, value) { return Array.from(sel.options).some((o) => o.value === String(value)); }
+    function applySettings(s) {
+      if (!s) return;
+      if (hasOption(tplSelect, s.template)) tplSelect.value = s.template;
+      if (modeInputs[s.mode]) modeInputs[s.mode].checked = true;
+      applyTemplateLock(isTemplateSelected());
+      onModeChange();
+      if (!isTemplateSelected()) {
+        if (hasOption(sizeSelect, s.size)) sizeSelect.value = s.size;
+        if (s.range) rangeSeg.set(s.range);
+        if (s.contact) contactSeg.set(s.contact);
+        if (s.stockA != null) stockA.value = s.stockA;
+        if (s.stockB != null) stockB.value = s.stockB;
+        onSizeChange();
+      }
+      if (hasOption(levelSelect, s.level)) levelSelect.value = s.level;
+      if (hasOption(levelSelectB, s.levelB)) levelSelectB.value = s.levelB;
+      if (s.side) sideSeg.set(s.side);
+      if (hasOption(timeSelect, s.time)) timeSelect.value = s.time;
+      if (hasOption(tcMain, s.tcMain)) tcMain.value = s.tcMain;
+      if (hasOption(tcByo, s.tcByo)) tcByo.value = s.tcByo;
+      if (hasOption(tcInc, s.tcInc)) tcInc.value = s.tcInc;
+      if (typeof s.tcSound === "boolean") tcSound.checked = s.tcSound;
+      onTimeChange();
+    }
+    // クリック・入力のたびに保存する(セグメントボタンはクリック処理の後で値が変わるので次のタイミングで読む)
+    const persist = () => setTimeout(() => saveMenuSettings(collectSettings()), 0);
+    ["change", "input", "click"].forEach((ev) => screen.addEventListener(ev, persist));
 
     function setSpecialistOption(enabled) {
       const existing = levelSelect.querySelector('option[value="specialist"]');
@@ -452,7 +604,9 @@
     }
 
     function onModeChange() {
-      const mode = modeInputs.pvai.checked ? "pvai" : modeInputs.pvp.checked ? "pvp" : "ai_vs_ai";
+      const mode = currentMode();
+      sideRow.style.display = mode === "pvai" ? "" : "none";
+      onTimeChange();
       if (mode === "pvai") {
         levelLabel.textContent = "AIの強さ";
         levelRow.style.display = "";
@@ -470,10 +624,14 @@
 
     tplSelect.addEventListener("change", () => applyTemplateLock(isTemplateSelected()));
     sizeSelect.addEventListener("change", onSizeChange);
+    timeSelect.addEventListener("change", onTimeChange);
+
+    onModeChange();
+    applySettings(loadMenuSettings());
 
     startBtn.addEventListener("click", () => {
       errorText.textContent = "";
-      const mode = modeInputs.pvai.checked ? "pvai" : modeInputs.pvp.checked ? "pvp" : "ai_vs_ai";
+      const mode = currentMode();
       const template = isTemplateSelected();
       const size = parseInt(sizeSelect.value, 10);
       const moveRange = parseInt(rangeSeg.value, 10);
@@ -492,12 +650,20 @@
       if (sa == null) return;
       const sb = parseStock(stockB.value, dStock, "後手(2P/AI)の持ち駒");
       if (sb == null) return;
+      const timeControl = mode === "pvp" ? selectedTimeControl() : null;
+      if (timeControl === undefined) {
+        errorText.textContent = "持ち時間か秒読みのどちらかは設定してください(両方なしだと1手目で時間切れになります)。";
+        return;
+      }
 
+      saveMenuSettings(collectSettings());
       startNewMatch({
         mode, boardSize: size, moveRange, contactLimit,
         aiLevel, aiLevelB, aiSpecialist: specA, aiSpecialistB: specB,
         stockA: sa, stockB: sb,
         ruleTemplate: template ? C.TEMPLATE_ID : null,
+        side: mode === "pvai" ? SIDE_CHOICES.find((s) => s.label === sideSeg.value).id : "A",
+        timeControl, clockSound: tcSound.checked,
       });
 
       function parseStock(text, def, label) {
@@ -520,6 +686,9 @@
     const engine = new GameEngine(config);
     engine.stock.A = opts.stockA;
     engine.stock.B = opts.stockB;
+    const side = opts.side || "A";
+    const humanPlayer = side === "random" ? (Math.random() < 0.5 ? "A" : "B") : side;
+    const timeControl = opts.mode === "pvp" && opts.timeControl ? opts.timeControl : null;
 
     App.match = {
       mode: opts.mode,
@@ -529,10 +698,14 @@
       stockA: opts.stockA, stockB: opts.stockB,
       ruleTemplate: opts.ruleTemplate,
       engine,
-      humanPlayer: "A",
+      humanPlayer,
+      sideChoice: side,
+      timeControl, clockSound: opts.clockSound !== false,
+      clock: timeControl ? createClock(timeControl) : null,
       selected: null,
       lastAction: null,
-      logMessages: [],
+      logMessages: side === "random" && opts.mode === "pvai"
+        ? [`ランダムで手番を決めました: あなたは${humanPlayer === "A" ? "先手" : "後手"}です`] : [],
       kifuRecords: [],
       historyStack: [],
       aiThinking: false,
@@ -545,6 +718,8 @@
     };
     App.screen = "game";
     render();
+    if (side === "random" && opts.mode === "pvai") toast(`ランダムの結果、あなたは${humanPlayer === "A" ? "先手" : "後手"}です`);
+    startClockTicker();
     maybeTriggerAI();
   }
 
@@ -898,7 +1073,7 @@
     const board = TSUME_GEN_BOARDS.find((b) => b.key === App.tsumeGen.board);
     const len = TSUME_GEN_LENGTHS.find((l) => l.key === App.tsumeGen.length);
     let w;
-    try { w = new Worker_("ai-worker.js?v=3"); } catch (e) { toast("自動作問を開始できませんでした(ローカルサーバー経由で開いてください)"); return; }
+    try { w = new Worker_("ai-worker.js?v=5"); } catch (e) { toast("自動作問を開始できませんでした(ローカルサーバー経由で開いてください)"); return; }
     tsumeGenWorker = w;
     btn.disabled = true;
     status.textContent = "作問中…(AI同士の対局から詰み局面を探しています)";
@@ -953,9 +1128,9 @@
   }
   function modeLabelText() {
     const m = App.match;
-    if (m.mode === "pvai") return `AI戦 - ${aiStrengthName(m.aiLevel, m.aiSpecialist)}`;
+    if (m.mode === "pvai") return `AI戦 - ${aiStrengthName(m.aiLevel, m.aiSpecialist)}(あなたは${m.humanPlayer === "A" ? "先手" : "後手"})`;
     if (m.mode === "tsume") return `詰めピンチ ${tsumeTitle(m.puzzle)}`;
-    if (m.mode === "pvp") return "対人戦(同画面)";
+    if (m.mode === "pvp") return m.timeControl ? `対人戦(同画面) - ${timeControlLabel(m.timeControl)}` : "対人戦(同画面)";
     if (m.mode === "online") return "オンライン対戦(手番リンク)";
     if (m.mode === "ai_vs_ai") return `AI同士の対戦 - 先手:${aiStrengthName(m.aiLevel, m.aiSpecialist)} / 後手:${aiStrengthName(m.aiLevelB, m.aiSpecialistB)}`;
     return m.mode;
@@ -993,6 +1168,10 @@
     const m = App.match;
     const result = AI.applyAction(m.engine, player, action);
     const extra = logAction(player, action, result, fromPos);
+    if (m.clock) {
+      clockCommit(m.clock, player);
+      if (m.engine.isOver()) stopClock(m.clock);
+    }
     if (m.mode === "online" && m.onlineActions) {
       m.onlineActions.push(action[0] === "place"
         ? { kind: "place", to: action[1] }
@@ -1051,6 +1230,177 @@
     maybeTriggerAI();
   }
 
+  // ============================================================ 対局時計(対人戦の持ち時間)
+  // 将棋の対局時計と同じく、手番側の時間だけが減る。持ち時間(main)を使い切ると秒読み(byo)に
+  // 入り、1手ごとに byo 秒以内に指せば秒読みは元に戻る。秒読みなしなら持ち時間切れで負け、
+  // inc>0 なら指すたびに持ち時間へ inc 秒を足す(フィッシャー)。時間は ms で持つ。
+  function createClock(spec) {
+    return {
+      spec,
+      main: { A: spec.main * 1000, B: spec.main * 1000 },
+      side: "A",
+      turnStart: performance.now(),
+      paused: false, pausedElapsed: 0, stopped: false,
+      flagged: null,
+      lastBeep: null,
+    };
+  }
+
+  function clockElapsed(ck) {
+    if (ck.stopped || ck.paused) return ck.pausedElapsed;
+    return performance.now() - ck.turnStart;
+  }
+
+  // 表示用の残り時間。byo は秒読みの残り(秒読みなしなら null)、inByo は秒読みに入っているか
+  function clockView(ck, p) {
+    const byoMs = ck.spec.byo * 1000;
+    const elapsed = p === ck.side ? clockElapsed(ck) : 0;
+    const main = Math.max(0, ck.main[p] - elapsed);
+    const over = Math.max(0, elapsed - ck.main[p]);
+    const byo = byoMs ? Math.max(0, byoMs - over) : null;
+    const inByo = byoMs > 0 && main <= 0;
+    const out = byo == null ? main <= 0 : byo <= 0;
+    // 今カウントダウンしている残り(秒読み中は秒読み、それ以外は持ち時間)
+    const counting = inByo ? byo : main;
+    return { main, byo, inByo, out, counting };
+  }
+
+  // 手を指し終えた側の時計を止めて、相手の時計を動かす
+  function clockCommit(ck, mover) {
+    if (ck.stopped || ck.flagged) return;
+    const v = clockView(ck, mover);
+    ck.main[mover] = v.main + ck.spec.inc * 1000;
+    ck.side = otherPlayer(mover);
+    ck.turnStart = performance.now();
+    ck.pausedElapsed = 0;
+    ck.lastBeep = null;
+  }
+
+  function stopClock(ck) {
+    if (!ck || ck.stopped) return;
+    ck.pausedElapsed = clockElapsed(ck);
+    ck.stopped = true;
+  }
+
+  function toggleClockPause() {
+    const m = App.match;
+    const ck = m && m.clock;
+    if (!ck || ck.stopped) return;
+    if (ck.paused) {
+      ck.turnStart = performance.now() - ck.pausedElapsed;
+      ck.paused = false;
+    } else {
+      ck.pausedElapsed = clockElapsed(ck);
+      ck.paused = true;
+      m.selected = null;
+    }
+    updateGameUI();
+  }
+
+  let clockTimer = null;
+  function startClockTicker() {
+    if (clockTimer) { clearInterval(clockTimer); clockTimer = null; }
+    const m = App.match;
+    if (!m || !m.clock) return;
+    clockTimer = setInterval(() => {
+      if (App.match !== m || m.clock.stopped) { clearInterval(clockTimer); clockTimer = null; drawClocks(); return; }
+      clockTick(m);
+    }, 100);
+  }
+
+  // 時間切れの判定と秒読み音。盤面の操作より前にも呼んで、切れた後の着手を受け付けないようにする
+  function clockTick(m) {
+    const ck = m.clock;
+    if (!ck || ck.stopped || ck.paused) return;
+    if (m.engine.isOver()) { stopClock(ck); drawClocks(); return; }
+    const v = clockView(ck, ck.side);
+    if (v.out) { onClockFlag(m, ck.side); return; }
+    if (m.clockSound && App.screen === "game") {
+      const sec = Math.ceil(v.counting / 1000);
+      if (sec <= clockLowSeconds(ck, v) && sec >= 1 && sec !== ck.lastBeep) {
+        ck.lastBeep = sec;
+        beep(sec <= 3 ? 1046 : 784, sec <= 5 ? 0.12 : 0.06);
+      }
+    }
+    drawClocks();
+  }
+
+  // 残りがこの秒数を切ったら秒読みの音と赤い表示で知らせる
+  // (残り10秒から。10秒将棋のように短い秒読みでは毎手鳴りっぱなしにならないよう半分から)
+  function clockLowSeconds(ck, v) {
+    return v.inByo ? Math.min(10, Math.floor(ck.spec.byo / 2)) : 10;
+  }
+
+  function onClockFlag(m, loser) {
+    const ck = m.clock;
+    ck.flagged = loser;
+    stopClock(ck);
+    m.engine.winner = otherPlayer(loser);
+    m.timeoutLoser = loser;
+    m.selected = null;
+    m.logMessages.push(`${playerDisplayName(loser)}の時間切れ`);
+    if (m.clockSound) beep(523, 0.6);
+    recordIfFinished();
+    updateGameUI();
+  }
+
+  let audioCtx = null;
+  function beep(freq, seconds) {
+    try {
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!Ctx) return;
+      audioCtx = audioCtx || new Ctx();
+      if (audioCtx.state === "suspended") audioCtx.resume();
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      osc.type = "sine";
+      osc.frequency.value = freq;
+      const t = audioCtx.currentTime;
+      gain.gain.setValueAtTime(0.0001, t);
+      gain.gain.exponentialRampToValueAtTime(0.18, t + 0.01);
+      gain.gain.exponentialRampToValueAtTime(0.0001, t + seconds);
+      osc.connect(gain).connect(audioCtx.destination);
+      osc.start(t);
+      osc.stop(t + seconds + 0.02);
+    } catch (e) { /* 音が出せない環境でも時計は動く */ }
+  }
+
+  function formatClock(ms) {
+    const total = Math.ceil(ms / 1000);
+    const mm = Math.floor(total / 60), ss = total % 60;
+    return `${mm}:${String(ss).padStart(2, "0")}`;
+  }
+
+  function drawClocks() {
+    const m = App.match, dom = App.gameDom;
+    if (!m || !m.clock || !dom || !dom.clocks) return;
+    const ck = m.clock;
+    for (const p of ["A", "B"]) {
+      const node = dom.clocks[p];
+      const v = clockView(ck, p);
+      const active = ck.side === p && !ck.stopped && !m.engine.isOver();
+      node.root.classList.toggle("is-active", active);
+      node.root.classList.toggle("is-paused", active && ck.paused);
+      node.root.classList.toggle("is-low", active && v.counting <= clockLowSeconds(ck, v) * 1000);
+      node.root.classList.toggle("is-out", ck.flagged === p);
+      node.name.textContent = playerDisplayName(p);
+      if (ck.flagged === p) {
+        node.time.textContent = "時間切れ";
+        node.sub.textContent = "";
+      } else if (v.inByo) {
+        node.time.textContent = `${Math.ceil(v.byo / 1000)}秒`;
+        node.sub.textContent = `秒読み(1手${ck.spec.byo}秒)`;
+      } else {
+        node.time.textContent = formatClock(v.main);
+        const parts = [];
+        if (ck.spec.byo) parts.push(`秒読み${ck.spec.byo}秒`);
+        if (ck.spec.inc) parts.push(`1手+${ck.spec.inc}秒`);
+        if (!ck.spec.byo && !ck.spec.inc) parts.push("切れ負け");
+        node.sub.textContent = parts.join(" / ");
+      }
+    }
+  }
+
   function recordIfFinished() {
     const m = App.match;
     if (m.mode === "tsume") { // 詰めピンチの挑戦は対戦履歴ではなく問題ごとの星として残す
@@ -1073,6 +1423,7 @@
 
   function resultText() {
     const m = App.match;
+    if (m.engine.winner && m.timeoutLoser) return `${playerDisplayName(m.engine.winner)}の勝ち(${playerDisplayName(m.timeoutLoser)}の時間切れ)`;
     if (m.engine.winner) return `${playerDisplayName(m.engine.winner)}の勝ち`;
     if (m.engine.isDraw) return "引き分け(千日手)";
     return "不明(対局途中)";
@@ -1111,7 +1462,9 @@
     const pauseBtn = el("button", { class: "btn btn-compact", text: "一時停止", onclick: onTogglePause });
     const undoBtn = el("button", { class: "btn btn-compact", text: "待った(1手戻す)", onclick: onUndo });
     const restartBtn = el("button", { class: "btn btn-compact", text: m.mode === "tsume" ? "やり直す" : "新しく対戦", onclick: onRestart });
+    const clockBtn = m.clock ? el("button", { class: "btn btn-compact", text: "時計を止める", onclick: toggleClockPause }) : null;
     if (m.mode === "ai_vs_ai") { topBar.appendChild(pauseBtn); topBar.appendChild(stepBtn); }
+    else if (clockBtn) topBar.appendChild(clockBtn); // 持ち時間ありの対局は待ったなし
     else topBar.appendChild(undoBtn);
     let hintBtn = null;
     if (m.mode === "tsume") {
@@ -1133,6 +1486,25 @@
     screen.appendChild(turnRow);
     const obligationText = el("div", { class: "obligation-text" });
     screen.appendChild(obligationText);
+
+    // ---- 対局時計(持ち時間ありの対人戦のみ) ----
+    let clocks = null;
+    if (m.clock) {
+      const clockBar = el("div", { class: "clock-bar" });
+      clocks = {};
+      for (const p of ["A", "B"]) {
+        const name = el("span", { class: "clock-name" });
+        const time = el("span", { class: "clock-time" });
+        const sub = el("span", { class: "clock-sub" });
+        const node = el("div", { class: `clock clock-${p.toLowerCase()}` }, [
+          el("div", { class: "clock-head" }, [el("span", { class: "clock-role", text: p === "A" ? "先手" : "後手" }), name]),
+          time, sub,
+        ]);
+        clockBar.appendChild(node);
+        clocks[p] = { root: node, name, time, sub };
+      }
+      screen.appendChild(clockBar);
+    }
 
     // ---- 盤面 ----
     const boardWrap = el("div", { class: "board-wrap" });
@@ -1185,6 +1557,7 @@
     // ---- 保存しておいて updateGameUI から参照する ----
     App.gameDom = {
       modeText, turnText, obligationText, bannerHost, undoBtn, restartBtn, stepBtn, pauseBtn, hintBtn, tsumePanel,
+      clockBtn, clocks,
       board, grid, cellNodes, piecesLayer, fxLayer, size, sideA, sideB, logList,
     };
     m.pieceNodes = new Map();
@@ -1206,7 +1579,9 @@
 
   function onCellClick(r, c) {
     const m = App.match;
+    if (m && m.clock) clockTick(m); // 時間切れ後の着手は受け付けない
     if (!m || m.engine.isOver() || m.aiThinking) return;
+    if (m.clock && m.clock.paused) { toast("時計が止まっています。「時計を再開」を押してください"); return; }
     const engine = m.engine;
     const player = engine.currentPlayer;
     if ((m.mode === "pvai" || m.mode === "tsume") && player === otherPlayer(m.humanPlayer)) return;
@@ -1258,9 +1633,17 @@
     }
   }
 
+  // 「待った」で戻る先(historyStack の添字)。AI戦はあなたの手番の局面まで戻す
+  // (あなたが後手でAIの初手しか無いときなど、戻れる局面が無ければ null)
+  function undoTargetIndex(m) {
+    if (m.mode !== "pvai") return m.historyStack.length ? m.historyStack.length - 1 : null;
+    for (let i = m.historyStack.length - 1; i >= 0; i--) if (m.historyStack[i].mover === m.humanPlayer) return i;
+    return null;
+  }
+
   function onUndo() {
     const m = App.match;
-    if (m.aiThinking || !m.historyStack.length) return;
+    if (m.aiThinking || !m.historyStack.length || m.clock) return;
     if (m.mode === "tsume" && m.tsumeReplay) return;
     let snap = null;
     if (m.mode === "tsume") {
@@ -1270,8 +1653,9 @@
       m.tsumeFailed = null;
       m.tsumeHint = null;
     } else {
-      const popCount = (m.mode === "pvai" && m.historyStack.length >= 2) ? 2 : 1;
-      for (let i = 0; i < popCount; i++) snap = m.historyStack.pop();
+      const target = undoTargetIndex(m);
+      if (target == null) return;
+      while (m.historyStack.length > target) snap = m.historyStack.pop();
     }
     m.engine = snap.engine;
     m.logMessages.length = snap.logLen;
@@ -1292,6 +1676,7 @@
       mode: m.mode, boardSize: m.boardSize, moveRange: m.moveRange, contactLimit: m.contactLimit,
       aiLevel: m.aiLevel, aiLevelB: m.aiLevelB, aiSpecialist: m.aiSpecialist, aiSpecialistB: m.aiSpecialistB,
       stockA: m.stockA, stockB: m.stockB, ruleTemplate: m.ruleTemplate,
+      side: m.sideChoice || m.humanPlayer, timeControl: m.timeControl, clockSound: m.clockSound,
     });
   }
 
@@ -1315,6 +1700,7 @@
     if (m.mode === "ai_vs_ai") return false;
     if ((m.mode === "pvai" || m.mode === "tsume") && m.engine.currentPlayer === otherPlayer(m.humanPlayer)) return false;
     if (m.mode === "tsume" && (m.tsumeFailed || m.tsumeReplay)) return false;
+    if (m.clock && m.clock.paused) return false;
     return true;
   }
 
@@ -1326,7 +1712,12 @@
 
     dom.modeText.textContent = modeLabelText() + (m.ruleTemplate ? " / 特化テンプレート" : "") + ` / 接触制限 ${engine.config.contactLimit}`;
     dom.restartBtn.disabled = false;
-    dom.undoBtn.disabled = m.aiThinking || !m.historyStack.length || !!m.tsumeReplay;
+    dom.undoBtn.disabled = m.aiThinking || !m.historyStack.length || !!m.tsumeReplay || !!m.clock
+      || (m.mode !== "tsume" && undoTargetIndex(m) == null);
+    if (dom.clockBtn) {
+      dom.clockBtn.disabled = engine.isOver();
+      dom.clockBtn.textContent = m.clock.paused ? "時計を再開" : "時計を止める";
+    }
     if (dom.hintBtn) {
       dom.hintBtn.disabled = m.aiThinking || engine.isOver() || !!m.tsumeFailed || !!m.tsumeReplay;
       const h = activeTsumeHint(m);
@@ -1339,6 +1730,7 @@
 
     drawBoard();
     drawStatus();
+    drawClocks();
     drawLog();
     drawBanner();
     if (m.mode === "tsume") updateTsumePanel();
@@ -1356,6 +1748,8 @@
       dom.turnText.textContent = `解答を再生しています(${m.tsumeReplay.step} / ${m.puzzle.line.length}手)`;
     } else if (m.mode === "tsume" && m.tsumeFailed) {
       dom.turnText.textContent = "";
+    } else if (m.clock && m.clock.paused && !engine.isOver()) {
+      dom.turnText.textContent = "時計を止めています";
     } else if (!engine.isOver()) {
       dom.turnText.textContent = `${playerDisplayName(engine.currentPlayer)}の番です`;
     } else {
@@ -1488,6 +1882,8 @@
       if (m.mode === "pvai") {
         if (engine.winner === m.humanPlayer) { cls = "success"; text = `${winnerName}の勝ちです。相手の駒を挟んで動けなくしました。`; }
         else { cls = "danger"; text = `${winnerName}の勝ちです。あなたの駒が挟まれて動けなくなりました。`; }
+      } else if (m.timeoutLoser) {
+        cls = "neutral"; text = `${playerDisplayName(m.timeoutLoser)}の時間切れ。${winnerName}の勝ちです。`;
       } else {
         cls = "neutral"; text = `${winnerName}の勝ちです。`;
       }
@@ -2056,7 +2452,7 @@
     ]);
     sideSelect.value = engine0.currentPlayer;
     const levelSelect = el("select", { class: "field-select" });
-    for (let i = 1; i <= 7; i++) levelSelect.appendChild(el("option", { value: String(i), text: AI.LEVELS[i].name }));
+    AI.LEVEL_ORDER.forEach((i) => levelSelect.appendChild(el("option", { value: String(i), text: AI.LEVELS[i].name })));
     levelSelect.value = "5";
     const modal = el("div", { class: "modal" }, [
       el("p", { text: "この局面から、実際に対局を再開します。どちらのプレイヤーを担当しますか?" }),

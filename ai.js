@@ -28,11 +28,16 @@
     5: { id: 5, name: "最強", maxDepth: 5, timeBudget: 3500, blunderRate: 0, useTT: false, ttSize: 0 },
     6: { id: 6, name: "究極", maxDepth: 8, timeBudget: 15000, blunderRate: 0, useTT: true, ttSize: 150000 },
     7: { id: 7, name: "神", maxDepth: 12, timeBudget: 30000, blunderRate: 0, useTT: true, ttSize: 250000 },
+    // 『最強』と同じ探索で、思考時間だけを2秒にした段階(後から追加したので id は 8。
+    // 既存の id 1〜7 は対戦記録やテストが参照しているため振り直さない)。
+    8: { id: 8, name: "達人", maxDepth: 5, timeBudget: 2000, blunderRate: 0, useTT: false, ttSize: 0 },
   };
+  // 画面の選択肢に並べる順(弱い順)。達人は上級と最強の間に入る。
+  const LEVEL_ORDER = [1, 2, 3, 4, 8, 5, 6, 7];
 
   const SPECIALIST_AI_NAME = "奥義";
-  const SPECIALIST_AI_DESC = "このテンプレートの自己対戦から評価関数を学習した最上位AI。"
-    + "高速探索で深く読み、旧版『奥義』に同じ持ち時間で30戦全勝(1手最大30秒)";
+  const SPECIALIST_AI_DESC = "このテンプレートの自己対戦から、評価関数と駒のまわりの形(局所パターン)の"
+    + "点数を学習した最上位AI。高速探索で深く読む(1手最大30秒)";
 
   const TTFlag = { EXACT: 0, LOWER: 1, UPPER: 2 };
 
@@ -880,8 +885,77 @@
     "tempo",
   ];
 
+  // ---- 局所パターン(Python 版 _PAT_CLASS と同じ) ----
+  // 駒の上下左右4マスの状態(0 空き / 1 自分の駒 / 2 相手の駒 / 3 盤外)を、盤の対称変換
+  // (上下反転・左右反転・縦横の入れ替え = 8通り)で同一視した 55 クラスに分ける。
+  // 状態のコード = Σ 状態[d] << (2d)(d は DIRECTIONS の順: 上, 下, 左, 右)。
+  // クラス番号は「コード 0..255 を順に見て、初めて現れた代表形の順」。
+  const PAT_N = 55;
+  const PAT_CLASS = (() => {
+    const perms = [];
+    for (const swapAxes of [false, true]) {
+      for (const f1 of [false, true]) {
+        for (const f2 of [false, true]) {
+          let p = [0, 1, 2, 3];
+          if (f1) p = [p[1], p[0], p[2], p[3]];
+          if (f2) p = [p[0], p[1], p[3], p[2]];
+          if (swapAxes) p = [p[2], p[3], p[0], p[1]];
+          perms.push(p);
+        }
+      }
+    }
+    const cls = new Int16Array(256), canon = new Map();
+    for (let code = 0; code < 256; code++) {
+      const s = [code & 3, (code >> 2) & 3, (code >> 4) & 3, (code >> 6) & 3];
+      let best = 1e9;
+      for (const p of perms) best = Math.min(best, s[p[0]] | (s[p[1]] << 2) | (s[p[2]] << 4) | (s[p[3]] << 6));
+      if (!canon.has(best)) canon.set(best, canon.size);
+      cls[code] = canon.get(best);
+    }
+    return cls;
+  })();
+
+  // パターンの重み(weights.pat_s = 手番側の駒, weights.pat_o = 相手の駒, 各 55 個)から、
+  // 「駒の持ち主 p・手番側の駒か」ごとに、隣4マスの owner 値(0..4)の組 → 重み の表を作る。
+  // 表の添字 = owner[上]*125 + owner[下]*25 + owner[左]*5 + owner[右](盤外は番兵 3/4)。
+  function buildPatternTables(weights) {
+    if (!weights.pat_s || !weights.pat_o) return null;
+    const tabs = [null, [null, null], [null, null]];
+    for (const p of [1, 2]) {
+      for (const [k, w] of [[0, weights.pat_s], [1, weights.pat_o]]) {
+        const t = new Float64Array(625);
+        for (let i = 0; i < 625; i++) {
+          const os = [Math.floor(i / 125), Math.floor(i / 25) % 5, Math.floor(i / 5) % 5, i % 5];
+          let code = 0;
+          for (let d = 0; d < 4; d++) {
+            const o = os[d];
+            code |= (o === 0 ? 0 : o === p ? 1 : o === 3 - p ? 2 : 3) << (2 * d);
+          }
+          t[i] = w[PAT_CLASS[code]] || 0;
+        }
+        tabs[p][k] = t;
+      }
+    }
+    return tabs;
+  }
+
+  // 局所パターンの評価値(手番側視点)
+  function patternValue(st, tabs) {
+    const s = st.side, owner = st.owner, nbr = st.g.nbr, pos = st.pos;
+    let v = 0;
+    for (let p = 1; p <= 2; p++) {
+      const t = tabs[p][p === s ? 0 : 1];
+      for (const pid of st.plist[p]) {
+        const nb = nbr[pos.get(pid)];
+        v += t[owner[nb[0]] * 125 + owner[nb[1]] * 25 + owner[nb[2]] * 5 + owner[nb[3]]];
+      }
+    }
+    return v;
+  }
+
   // Python 版 In_a_Pinch_app_5.py の LEARNED_WEIGHTS_GENERIC / LEARNED_WEIGHTS_TEMPLATE と同じ値
-  // (評価値の単位: 100 = 勝率のロジット 1)
+  // (評価値の単位: 100 = 勝率のロジット 1)。奥義(TEMPLATE)だけ局所パターンの重み pat_s / pat_o を持つ
+  // (2026-09-29 追加。究極・神では効果が確認できず据え置き)
   const LEARNED_WEIGHTS_GENERIC = {
     mob_pieces: 4.689, mob_moves: -0.731, obl_stm: -5.562, obl_opp: 26.285,
     danger_stm: -38.368, danger_opp: 24.342, wall: -6.555, cluster: -31.865,
@@ -891,12 +965,28 @@
     ph_threat_opp: -15.995, ph_tempo: 21.046, tempo: 2.88,
   };
   const LEARNED_WEIGHTS_TEMPLATE = {
-    mob_pieces: 5.097, mob_moves: -0.705, obl_stm: -4.812, obl_opp: 8.221,
-    danger_stm: -2.96, danger_opp: -1.25, wall: -25.456, cluster: -31.959,
-    stock: -19.98, half: -7.344, trapped: 9.87, center: -20.332,
-    threat_stm: 7.667, threat_opp: 4.541, weak_stm: 11.48, weak_opp: -11.376,
-    ph_mob: 18.957, ph_stock: -33.31, ph_center: -24.85, ph_threat_stm: 19.595,
-    ph_threat_opp: -28.854, ph_tempo: 18.887, tempo: 3.664,
+    mob_pieces: 3.77, mob_moves: -0.441, obl_stm: -3.138, obl_opp: 4.101,
+    danger_stm: 0.838, danger_opp: -0.533, wall: -20.2, cluster: 26.384,
+    stock: -3.908, half: -8.462, trapped: 4.625, center: -35.381,
+    threat_stm: 24.145, threat_opp: -7.476, weak_stm: 10.851, weak_opp: -9.456,
+    ph_mob: 3.245, ph_stock: -66.143, ph_center: -10.786, ph_threat_stm: 7.657,
+    ph_threat_opp: -20.75, ph_tempo: 176.921, tempo: -133.035,
+    pat_s: [
+      19.66, 10.51, 45.02, 7.7, -11.47, 47.19, 10.9, -27.13, -51.19, 0.0,
+      -12.58, 39.69, 3.11, 0.0, 12.92, -17.45, -77.13, -65.35, 0.0, 56.94,
+      52.88, 19.14, 63.85, 90.65, -61.27, -122.55, 0.0, -14.06, -18.24, 90.97,
+      -3.56, -25.47, -91.76, 0.0, 0.0, 0.0, 0.0, 0.45, 3.88, 0.0,
+      47.33, 70.73, 28.94, -16.19, 0.0, -14.0, 0.25, -14.36, 0.0, -6.63,
+      -4.47, 0.0, -13.29, 0.0, 0.0,
+    ],
+    pat_o: [
+      -12.26, -1.82, -38.37, 2.31, 26.83, -37.72, -1.74, 18.34, 54.58, 0.0,
+      23.13, -32.05, 10.14, 0.0, -3.75, 28.71, 10.37, -9.81, 0.0, -51.69,
+      -41.47, -16.06, -54.98, -80.74, 43.43, 56.32, 0.0, 26.18, 26.57, -55.16,
+      9.16, 27.89, 71.82, 0.0, 0.0, 0.0, 0.0, 5.43, 0.28, 0.0,
+      -36.4, -59.26, -13.53, 37.98, 0.0, 18.76, -17.32, -20.51, 0.0, 6.28,
+      4.83, 0.0, 17.31, 0.0, 0.0,
+    ],
   };
 
   const TT_EXACT = 0, TT_LOWER = 1, TT_UPPER = 2;
@@ -911,6 +1001,7 @@
         blunderRate: 0, useTT: true, ttSize: opts.ttSize || 400000,
       };
       this.weights = LEARNED_FEATURES.map((f) => weights[f] || 0);
+      this._patTabs = buildPatternTables(weights); // 局所パターンの重み(なければ null)
       this.rng = new RNG(seed == null ? Date.now() & 0xffffffff : seed);
       // 千日手を避ける設計(Python 版と同じ既定値): 引き分けを自分にとってロジット1の損と数え、
       // すでに1度現れた局面へ戻る手を読みの中で引き分け扱いにする。長引いたら徐々に許容する
@@ -1020,6 +1111,7 @@
       const w = this.weights;
       let v = 0;
       for (let i = 0; i < w.length; i++) v += w[i] * x[i];
+      if (this._patTabs) v += patternValue(st, this._patTabs);
       return v;
     }
 
@@ -1110,7 +1202,7 @@
     }
   }
 
-  // 学習型AIを使うレベル。1〜5 は難易度の段階として従来の MinimaxAI のまま。
+  // 学習型AIを使うレベル。1〜5・8(達人)は難易度の段階として従来の MinimaxAI のまま。
   const LEARNED_LEVEL_IDS = [6, 7];
 
   // 画面・Worker から使う AI の生成窓口。奥義 = テンプレート学習版、究極・神 = 汎用学習版。
@@ -1127,10 +1219,11 @@
   }
 
   const AI = {
-    LEVELS, SPECIALIST_AI_NAME, SPECIALIST_AI_DESC,
+    LEVELS, LEVEL_ORDER, SPECIALIST_AI_NAME, SPECIALIST_AI_DESC,
     generateActions, applyAction, actionEquals,
     MinimaxAI, TemplateSpecialistAI, TranspositionTable, SearchTimeout,
     FastState, LearnedSearchAI, LEARNED_FEATURES, LEARNED_WEIGHTS_GENERIC, LEARNED_WEIGHTS_TEMPLATE,
+    PAT_N, PAT_CLASS, buildPatternTables, patternValue,
     LEARNED_LEVEL_IDS, makeAI,
   };
 
