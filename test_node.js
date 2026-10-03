@@ -314,6 +314,64 @@ function check(name, cond, detail) {
   check("learned AI avoids stepping back into an already-seen position", ok);
 })();
 
+// ---- 10b. 詰み探索(MinimaxAI): 読みの深さ以内の詰みを確実に指す(Python 版 9l と同じ局面) ----
+(function () {
+  const put = (e, id, player, r, c) => { e.pieces.set(id, { id, player, position: [r, c] }); e.board.set(r + "," + c, id); e._nextPieceId = Math.max(e._nextPieceId, id + 1); };
+  const same = (a, b) => !!a && AI.actionEquals(a, b);
+  // (1) 挟む1手詰め
+  let e = new H.GameEngine(H.makeConfig({ rows: 7, cols: 7, moveRange: 1, stockPerPlayer: 0, wallSandwich: true, contactLimit: null }));
+  put(e, 1, "B", 0, 0); put(e, 2, "A", 1, 0); put(e, 3, "A", 0, 2); put(e, 4, "B", 4, 4);
+  check("mate search finds a sandwiching mate in 1", same(AI.findForcedWin(e, 1), ["move", 3, [0, 1]]));
+  // (2) 挟まない1手詰め: 義務を背負った B の (3,3) の最後の逃げ道 (3,4) をふさぐ
+  e = new H.GameEngine(H.makeConfig({ rows: 7, cols: 7, moveRange: 1, stockPerPlayer: 0, wallSandwich: true, contactLimit: null }));
+  put(e, 1, "B", 3, 3); put(e, 2, "A", 2, 3); put(e, 3, "A", 4, 3); put(e, 4, "B", 3, 2); put(e, 5, "A", 3, 5); put(e, 6, "B", 6, 6);
+  e.obligated.B = [1];
+  check("mate search finds a blocking (non-sandwich) mate in 1", same(AI.findForcedWin(e, 1), ["move", 5, [3, 4]]));
+  check("上級 MinimaxAI plays a mate within its depth", same(new AI.MinimaxAI("A", 4, 0).chooseAction(e), ["move", 5, [3, 4]]));
+  check("mate search leaves the position unchanged", e.pieces.get(5).position[1] === 5 && e.obligated.B.length === 1);
+  // (3) 実戦に出た3手詰め(B4→C4)。1手詰めはない
+  e = new H.GameEngine(H.makeConfig({ rows: 7, cols: 7, moveRange: 3, wallSandwich: true, contactLimit: 3 }));
+  e.stock.A = 15; e.stock.B = 15;
+  for (const [fr, to] of [["", "E5"], ["", "D6"], ["", "C3"], ["", "B3"], ["", "D4"], ["", "E3"], ["", "D2"], ["", "C2"], ["D2", "D3"], ["", "B4"], ["D3", "D2"]]) {
+    const cur = e.currentPlayer;
+    AI.applyAction(e, cur, AI.generateActions(e, cur).find((a) => { const l = AI.actionLabels(e, a); return l[0] === fr && l[1] === to; }));
+  }
+  check("mate search: no mate in 1 here", AI.findForcedWin(e, 1) === null);
+  const w3 = AI.findForcedWin(e, 3);
+  check("mate search finds the mate in 3 (B4-C4)", !!w3 && AI.actionLabels(e, w3).join("-") === "B4-C4", w3);
+  // GameEngine だけで確かめる: どう受けても次の1手で勝てる
+  let sound = !!w3;
+  if (w3) {
+    const c = e.clone(); AI.applyAction(c, "B", w3);
+    for (const reply of AI.generateActions(c, c.currentPlayer)) {
+      const d = c.clone(); AI.applyAction(d, d.currentPlayer, reply);
+      if (d.isOver()) { if (d.winner !== "B") sound = false; continue; }
+      if (!AI.generateActions(d, "B").some((a) => { const x = d.clone(); AI.applyAction(x, "B", a); return x.winner === "B"; })) sound = false;
+    }
+  }
+  check("the mate in 3 is sound when replayed on GameEngine", sound);
+  check("mate plies per level stay within each level's depth",
+    [1, 2, 3, 4, 8, 5].map((k) => AI.LEVELS[k].matePlies).join() === "0,1,1,3,5,5");
+})();
+
+// ---- 10c. 静止探索(MinimaxAI): 末端で義務を背負った側は逃げ方まで読んでから評価(Python 版 9m と同じ) ----
+(function () {
+  const put = (e, id, player, r, c) => { e.pieces.set(id, { id, player, position: [r, c] }); e.board.set(r + "," + c, id); e._nextPieceId = Math.max(e._nextPieceId, id + 1); };
+  const e = new H.GameEngine(H.makeConfig({ rows: 7, cols: 7, moveRange: 1, stockPerPlayer: 0, wallSandwich: true, contactLimit: null }));
+  put(e, 1, "B", 3, 3); put(e, 2, "A", 2, 3); put(e, 3, "A", 4, 3); put(e, 4, "B", 6, 6);
+  e.obligated.B = [1];
+  e.currentPlayer = "B";
+  const ai = new AI.MinimaxAI("A", 4, 0);
+  const expected = AI.generateActions(e, "B").map((a) => { const c = e.clone(); AI.applyAction(c, "B", a); return ai._evaluate(c); });
+  const got = ai._minimax(e, 0, -Infinity, Infinity, 0);
+  check("quiescence: leaf value = min over the obligated piece's escapes", Math.abs(got - Math.min(...expected)) < 1e-9, [got, expected]);
+  const flat = new AI.MinimaxAI("A", 4, 0);
+  flat.level = Object.assign({}, flat.level, { quiesce: 0 });
+  check("quiescence off: leaf is evaluated as is", Math.abs(flat._minimax(e, 0, -Infinity, Infinity, 0) - flat._evaluate(e)) < 1e-9);
+  check("quiescence only for 初級 and 上級 (odd depth, finishes within the budget)",
+    [1, 2, 3, 4, 8, 5].map((k) => AI.LEVELS[k].quiesce || 0).join() === "0,2,0,2,0,0");
+})();
+
 // ---- 11. 詰めピンチ: ソルバーを GameEngine だけで書いた素朴な参照実装と突き合わせる ----
 // tsume.js は FastState(指す→戻す)と置換表で速く読むが、ここでは clone() と
 // engine.winner だけを使う独立した実装で同じ「最短手数」になることを確かめる。

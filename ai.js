@@ -19,18 +19,21 @@
   const DRAW_SCORE = -50;
   const MAX_ACTIONS_PER_NODE = 20;
 
-  // name, maxDepth, timeBudget(ms) / null, blunderRate, useTT, ttSize
+  // name, maxDepth, timeBudget(ms) / null, blunderRate, useTT, ttSize,
+  // matePlies: 通常の探索の前に読む詰みの手数(findForcedWin。0 なら読まない)。
+  //   各レベルの読みの深さ以内の詰みだけを確実に指すための設定(それより深い詰みは読まない)
+  // quiesce: 静止探索の手数(_quiesce。未指定/0 なら読みの末端でそのまま評価する)
   const LEVELS = {
-    1: { id: 1, name: "ランダム", maxDepth: 0, timeBudget: null, blunderRate: 0, useTT: false, ttSize: 0 },
-    2: { id: 2, name: "初級", maxDepth: 1, timeBudget: null, blunderRate: 0.35, useTT: false, ttSize: 0 },
-    3: { id: 3, name: "中級", maxDepth: 2, timeBudget: 1000, blunderRate: 0.08, useTT: false, ttSize: 0 },
-    4: { id: 4, name: "上級", maxDepth: 3, timeBudget: 2000, blunderRate: 0, useTT: false, ttSize: 0 },
-    5: { id: 5, name: "最強", maxDepth: 5, timeBudget: 3500, blunderRate: 0, useTT: false, ttSize: 0 },
-    6: { id: 6, name: "究極", maxDepth: 8, timeBudget: 15000, blunderRate: 0, useTT: true, ttSize: 150000 },
-    7: { id: 7, name: "神", maxDepth: 12, timeBudget: 30000, blunderRate: 0, useTT: true, ttSize: 250000 },
+    1: { id: 1, name: "ランダム", maxDepth: 0, timeBudget: null, blunderRate: 0, useTT: false, ttSize: 0, matePlies: 0 },
+    2: { id: 2, name: "初級", maxDepth: 1, timeBudget: null, blunderRate: 0.35, useTT: false, ttSize: 0, matePlies: 1, quiesce: 2 },
+    3: { id: 3, name: "中級", maxDepth: 2, timeBudget: 1000, blunderRate: 0.08, useTT: false, ttSize: 0, matePlies: 1 },
+    4: { id: 4, name: "上級", maxDepth: 3, timeBudget: 2000, blunderRate: 0, useTT: false, ttSize: 0, matePlies: 3, quiesce: 2 },
+    5: { id: 5, name: "最強", maxDepth: 5, timeBudget: 3500, blunderRate: 0, useTT: false, ttSize: 0, matePlies: 5 },
+    6: { id: 6, name: "究極", maxDepth: 8, timeBudget: 15000, blunderRate: 0, useTT: true, ttSize: 150000, matePlies: 0 },
+    7: { id: 7, name: "神", maxDepth: 12, timeBudget: 30000, blunderRate: 0, useTT: true, ttSize: 250000, matePlies: 0 },
     // 『最強』と同じ探索で、思考時間だけを2秒にした段階(後から追加したので id は 8。
     // 既存の id 1〜7 は対戦記録やテストが参照しているため振り直さない)。
-    8: { id: 8, name: "達人", maxDepth: 5, timeBudget: 2000, blunderRate: 0, useTT: false, ttSize: 0 },
+    8: { id: 8, name: "達人", maxDepth: 5, timeBudget: 2000, blunderRate: 0, useTT: false, ttSize: 0, matePlies: 5 },
   };
   // 画面の選択肢に並べる順(弱い順)。達人は上級と最強の間に入る。
   const LEVEL_ORDER = [1, 2, 3, 4, 8, 5, 6, 7];
@@ -161,6 +164,12 @@
         return this.rng.choice(actions);
       }
 
+      const tStart = Date.now();
+      if (this.level.matePlies && engine.currentPlayer === this.player) {
+        const win = findForcedWin(engine, this.level.matePlies);
+        if (win) return win;
+      }
+
       this.nodesVisited = 0;
       let bestAction = null;
 
@@ -169,7 +178,7 @@
         return bestAction;
       }
 
-      const overallDeadline = Date.now() + this.level.timeBudget;
+      const overallDeadline = tStart + this.level.timeBudget;
       let depth = 1;
       let pvAction = null;
       while (depth <= this.level.maxDepth) {
@@ -223,7 +232,13 @@
       if (engine.winner === this.player) return WIN_SCORE + depth;
       if (engine.winner === opponent) return -WIN_SCORE - depth;
       if (engine.isDraw) return DRAW_SCORE;
-      if (depth <= 0) return this._evaluate(engine);
+      if (depth <= 0) {
+        const q = this.level.quiesce || 0;
+        if (q > 0 && depth > -q && engine.obligated[engine.currentPlayer].length) {
+          return this._quiesce(engine, depth, alpha, beta);
+        }
+        return this._evaluate(engine);
+      }
 
       let ttKey = null;
       let pvAction = null;
@@ -277,6 +292,25 @@
         this.tt.store(ttKey, depth, value, flag, bestActionHere);
       }
       return value;
+    }
+
+    // 読みの末端(depth <= 0)で手番側が義務を背負っている局面の評価(Python 版 MinimaxAI._quiesce と同じ)。
+    // 末端でそのまま評価すると「相手に義務を負わせた(挟んだ)」だけで加点されるため、すぐ逃げられる
+    // 挟みでも良い手に見え、挟んでは逃げられる追いかけっこを延々と続けていた(同じ局面の3回目だけは
+    // 避けるので、挟む場所を変えながら対局が長引く)。義務の駒の手だけを読み、挟みが解消してから評価する
+    _quiesce(engine, depth, alpha, beta) {
+      const current = engine.currentPlayer;
+      const maximizing = current === this.player;
+      let value = maximizing ? -Infinity : Infinity;
+      for (const action of generateActions(engine, current)) {
+        const child = engine.clone();
+        applyAction(child, current, action);
+        const score = this._minimax(child, depth - 1, alpha, beta, 0);
+        if (maximizing) { if (score > value) value = score; if (value > alpha) alpha = value; }
+        else { if (score < value) value = score; if (value < beta) beta = value; }
+        if (alpha >= beta) break;
+      }
+      return value === Infinity || value === -Infinity ? this._evaluate(engine) : value;
     }
 
     _childSearchDepth(child, depth, ext) {
@@ -1214,6 +1248,105 @@
     }
   }
 
+  // ---- 詰み探索(MinimaxAI 用。Python 版「2.7 詰み探索」と同じ)----------------
+  // MinimaxAI は候補手を静的な点数の上位 N 手に切り詰め、持ち時間で読みを打ち切るので、
+  // 読みの深さ以内の詰みでも見落とし、勝ちが決まってから往復や指し直しで対局を引き延ばしていた。
+  // そこで通常の探索の前に詰みだけを読む。攻め方は「挟む手」だけ(受け方がすでに義務を背負って
+  // いるとき・最後の1手は全部の手)、受け方は全部の手を読む。千日手(ルールの回数、または読み筋の
+  // 中で同じ局面に戻ったとき)は受け方の逃れとみなすので、見つけた詰みは必ず詰む。
+  class MateSearch {
+    constructor(engine, nodeCap) {
+      this.st = new FastState(engine);
+      this.hist = new Map(this.st.rep);
+      this.cap = nodeCap;
+      this.nodes = 0;
+    }
+
+    // maxPlies 手以内(1, 3, 5, …)で詰ませる初手のコード。見つからなければ -1
+    find(maxPlies) {
+      const st = this.st;
+      try {
+        for (let plies = 1; plies <= maxPlies; plies += 2) {
+          const code = this._attack(plies);
+          if (code >= 0) return code;
+        }
+      } catch (e) {
+        if (!(e instanceof SearchTimeout)) throw e;
+        while (st.undo.length) st.unmake();
+      }
+      return -1;
+    }
+
+    _repeated() {
+      const st = this.st, key = st.key();
+      const cnt = (st.rep.get(key) || 0) + 1;
+      return cnt >= st.replimit || cnt - (this.hist.get(key) || 0) >= 2;
+    }
+
+    _enter() {
+      const st = this.st, key = st.key();
+      const cnt = (st.rep.get(key) || 0) + 1;
+      st.rep.set(key, cnt);
+      return [key, cnt];
+    }
+
+    _leave([key, cnt]) {
+      if (cnt === 1) this.st.rep.delete(key); else this.st.rep.set(key, cnt - 1);
+    }
+
+    _attack(plies) {
+      const st = this.st, p = st.side;
+      let acts = st.generate(p);
+      const oppObl = st.obl[3 - p].length > 0;
+      if (plies > 1 && !oppObl) {
+        acts = acts.filter((c) => st.isCapture(c));
+      } else if (plies > 1 || oppObl) {
+        const cap = new Set(acts.filter((c) => st.isCapture(c)));
+        acts.sort((a, b) => (cap.has(b) ? 1 : 0) - (cap.has(a) ? 1 : 0));
+      }
+      for (const code of acts) {
+        if (++this.nodes > this.cap) throw new SearchTimeout();
+        st.make(code);
+        const ok = this._defend(plies - 1);
+        st.unmake();
+        if (ok) return code;
+      }
+      return -1;
+    }
+
+    // 受け方の手番。どう受けても plies 手以内に詰むなら true
+    _defend(plies) {
+      const st = this.st, q = st.side;
+      if (!st.hasAction(q)) return true;
+      if (plies <= 0 || this._repeated()) return false;
+      const mark = this._enter();
+      try {
+        for (const code of st.generate(q)) {
+          this.nodes++;
+          st.make(code);
+          let win = false;
+          if (!this._repeated()) {
+            const m2 = this._enter();
+            try { win = this._attack(plies - 1) >= 0; } finally { this._leave(m2); }
+          }
+          st.unmake();
+          if (!win) return false;
+        }
+        return true;
+      } finally {
+        this._leave(mark);
+      }
+    }
+  }
+
+  // 手番側が maxPlies 手以内に必ず勝てる初手(最短のもの)を返す。なければ null
+  function findForcedWin(engine, maxPlies, nodeCap) {
+    if (!maxPlies || engine.isOver()) return null;
+    const ms = new MateSearch(engine, nodeCap == null ? 200000 : nodeCap);
+    const code = ms.find(maxPlies);
+    return code < 0 ? null : ms.st.toAction(code);
+  }
+
   // 学習型AIを使うレベル。1〜5・8(達人)は難易度の段階として従来の MinimaxAI のまま。
   const LEARNED_LEVEL_IDS = [6, 7];
 
@@ -1312,7 +1445,7 @@
     LEVELS, LEVEL_ORDER, SPECIALIST_AI_NAME, SPECIALIST_AI_DESC,
     generateActions, applyAction, actionEquals,
     MinimaxAI, TemplateSpecialistAI, TranspositionTable, SearchTimeout,
-    FastState, LearnedSearchAI, LEARNED_FEATURES, LEARNED_WEIGHTS_GENERIC, LEARNED_WEIGHTS_TEMPLATE,
+    FastState, LearnedSearchAI, findForcedWin, LEARNED_FEATURES, LEARNED_WEIGHTS_GENERIC, LEARNED_WEIGHTS_TEMPLATE,
     PAT_N, PAT_CLASS, buildPatternTables, patternValue,
     LEARNED_LEVEL_IDS, makeAI,
     EVAL_TIME_BUDGET, winRateFromScore, makePositionEvaluator, evaluatePosition,

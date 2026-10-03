@@ -83,7 +83,7 @@
   function initWorker() {
     if (!Worker_) { workerOk = false; return; }
     try {
-      worker = new Worker_("ai-worker.js?v=6");
+      worker = new Worker_("ai-worker.js?v=7");
       worker.onmessage = (e) => {
         if (e.data.reqId !== pendingReqId || e.data.progress != null) return; // 破棄済み(リスタート等)の応答
         if (onWorkerResult) onWorkerResult(e.data);
@@ -196,7 +196,7 @@
     if (evalWorker || !evalWorkerOk) return;
     if (!Worker_) { evalWorkerOk = false; return; }
     try {
-      evalWorker = new Worker_("ai-worker.js?v=6");
+      evalWorker = new Worker_("ai-worker.js?v=7");
       evalWorker.onmessage = (e) => {
         if (!evalReq || e.data.reqId !== evalReq.reqId) return;
         const cb = evalReq.callback;
@@ -1215,7 +1215,7 @@
     const board = TSUME_GEN_BOARDS.find((b) => b.key === App.tsumeGen.board);
     const len = TSUME_GEN_LENGTHS.find((l) => l.key === App.tsumeGen.length);
     let w;
-    try { w = new Worker_("ai-worker.js?v=6"); } catch (e) { toast("自動作問を開始できませんでした(ローカルサーバー経由で開いてください)"); return; }
+    try { w = new Worker_("ai-worker.js?v=7"); } catch (e) { toast("自動作問を開始できませんでした(ローカルサーバー経由で開いてください)"); return; }
     tsumeGenWorker = w;
     btn.disabled = true;
     status.textContent = "作問中…(AI同士の対局から詰み局面を探しています)";
@@ -2935,7 +2935,7 @@
     return new Promise((resolve) => {
       if (!bgWorker && bgWorkerOk && Worker_) {
         try {
-          bgWorker = new Worker_("ai-worker.js?v=6");
+          bgWorker = new Worker_("ai-worker.js?v=7");
           bgWorker.onmessage = (e) => {
             const cb = bgPending.get(e.data.reqId);
             if (cb) { bgPending.delete(e.data.reqId); cb(e.data.ok ? e.data.result : null); }

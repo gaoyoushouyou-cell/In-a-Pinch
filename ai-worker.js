@@ -10,7 +10,7 @@
  * postMessage は構造化複製(structured clone)アルゴリズムを使うため、
  * Map や配列はそのまま送受信できる(JSON化は不要)。
  */
-importScripts("engine.js?v=3", "ai.js?v=6", "tsume.js?v=1");
+importScripts("engine.js?v=3", "ai.js?v=7", "tsume.js?v=1");
 
 self.onmessage = function (e) {
   if (e.data.kind === "tsume") { handleTsume(e.data); return; }
