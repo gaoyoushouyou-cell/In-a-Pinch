@@ -766,5 +766,30 @@ function refDistance(engine, solver, maxPlies, quiet) {
   check("rating: nearest level", RT.nearestLevel(L[4] + 1)[0] === "4");
 })();
 
+// ---- 19. コラム「AIのレベル解説」が ai.js / rating.js の設定と食い違っていない ----
+(function () {
+  const C = require("./content.js");
+  const RT = require("./rating.js");
+  const G = C.AI_LEVEL_GUIDE;
+  const keys = G.levels.map((g) => g.key);
+  check("ai guide: covers every level in menu order, then 奥義",
+    JSON.stringify(keys) === JSON.stringify(AI.LEVEL_ORDER.map(String).concat(["S"])), keys.join());
+  check("ai guide: names match ai.js",
+    G.levels.every((g) => g.name === (g.key === "S" ? AI.SPECIALIST_AI_NAME : AI.LEVELS[g.key].name)));
+  check("ai guide: every level has a rating", G.levels.every((g) => typeof RT.LEVELS[g.key] === "number"));
+  const bad = [];
+  G.levels.filter((g) => g.key !== "S").forEach((g) => {
+    const lv = AI.LEVELS[g.key];
+    const learned = g.key === "6" || g.key === "7";
+    const read = lv.maxDepth === 0 ? "読まない" : learned ? "時間いっぱい" : `${lv.maxDepth}手先`;
+    const time = lv.timeBudget == null ? "すぐ" : `最大${lv.timeBudget / 1000}秒`;
+    const miss = lv.maxDepth === 0 ? "すべて" : lv.blunderRate ? `${Math.round(lv.blunderRate * 100)}%` : "なし";
+    if (g.read !== read || g.time !== time || g.miss !== miss) bad.push(`${g.name}: ${g.read}/${g.time}/${g.miss} vs ${read}/${time}/${miss}`);
+  });
+  check("ai guide: depth / time / blunder rate match ai.js LEVELS", !bad.length, bad.join("; "));
+  check("ai guide: 奥義 thinks up to 30 seconds", G.levels.find((g) => g.key === "S").time === "最大30秒");
+  check("ai guide: every level has text and a tip", G.levels.every((g) => g.text && g.tip));
+})();
+
 console.log(`\n==== ${pass} passed, ${fail} failed ====`);
 process.exit(fail ? 1 : 0);

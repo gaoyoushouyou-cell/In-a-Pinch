@@ -422,11 +422,42 @@
     render(payload);
   }
 
+  // ---- ヘッダーのメニュー。広い画面は横一列、狭い画面(スマホ・iPad縦)は「メニュー」ボタンで開閉する一覧 ----
+  const navToggle = document.getElementById("nav-toggle");
+  const navScrim = document.getElementById("nav-scrim");
+  function setNavOpen(open) {
+    document.body.classList.toggle("nav-open", open);
+    navToggle.setAttribute("aria-expanded", String(open));
+    navToggle.querySelector(".nav-toggle-text").textContent = open ? "閉じる" : "メニュー";
+    navScrim.hidden = !open;
+  }
+  navToggle.addEventListener("click", () => setNavOpen(!document.body.classList.contains("nav-open")));
+  navScrim.addEventListener("click", () => setNavOpen(false));
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && document.body.classList.contains("nav-open")) { setNavOpen(false); navToggle.focus(); }
+  });
   navbar.addEventListener("click", (e) => {
     const btn = e.target.closest("[data-nav]");
-    if (btn) goto(btn.dataset.nav);
-    if (e.target.closest("#nav-title")) goto("menu");
+    if (btn) { setNavOpen(false); goto(btn.dataset.nav); }
+    if (e.target.closest("#nav-title")) { e.preventDefault(); setNavOpen(false); goto("menu"); }
   });
+
+  // 画面 → ヘッダーで「いまここ」と示す項目(対局・感想戦などは入口になった項目)
+  const NAV_OF_SCREEN = {
+    menu: "menu", game: "menu", tutorial: "tutorial", learn: "learn", strategy: "strategy", aiguide: "aiguide",
+    report: "report", history: "history", review: "history", online: "online", tsume: "tsume", rating: "rating",
+  };
+  function markCurrentNav() {
+    let key = NAV_OF_SCREEN[App.screen] || "menu";
+    if (App.screen === "game" && App.match && App.match.mode === "tsume") key = "tsume";
+    if (App.screen === "game" && App.match && App.match.mode === "online") key = "online";
+    const reading = ["strategy", "aiguide", "report"].includes(key);
+    navbar.querySelectorAll("[data-nav]").forEach((b) => {
+      const on = b.dataset.nav === key || (reading && b.dataset.nav === "learn");
+      if (on) b.setAttribute("aria-current", "page"); else b.removeAttribute("aria-current");
+    });
+    document.body.dataset.screen = App.screen;
+  }
 
   function render(payload) {
     clearNode(root);
@@ -435,93 +466,97 @@
     const renderers = {
       menu: renderMenu, game: renderGame, tutorial: renderTutorial, strategy: renderStrategy,
       report: renderReport, history: renderHistory, review: renderReview, online: renderOnline,
-      tsume: renderTsumeMenu, rating: renderRating,
+      tsume: renderTsumeMenu, rating: renderRating, learn: renderLearn, aiguide: renderAiGuide,
     };
+    markCurrentNav();
     (renderers[App.screen] || renderMenu)(root, payload);
     window.scrollTo({ top: 0, behavior: "instant" in window ? "instant" : "auto" });
   }
 
+  // 画面の見出し(戻る導線・タイトル・説明)。crumbs: [[ラベル, 画面名], ...] は上の階層へのリンク
+  function pageHead(title, opts) {
+    opts = opts || {};
+    const head = el("div", { class: "page-head" });
+    if (opts.crumbs && opts.crumbs.length) {
+      const nav = el("nav", { class: "crumbs", "aria-label": "現在地" });
+      opts.crumbs.forEach(([label, screen]) => {
+        nav.appendChild(el("button", { type: "button", class: "crumb", text: label, onclick: () => goto(screen) }));
+        nav.appendChild(el("span", { class: "crumb-sep", "aria-hidden": "true", text: "›" }));
+      });
+      nav.appendChild(el("span", { class: "crumb-here", text: title }));
+      head.appendChild(nav);
+    }
+    head.appendChild(el("h1", { class: "page-title", text: title }));
+    if (opts.lede) head.appendChild(el("p", { class: "page-lede", text: opts.lede }));
+    return head;
+  }
+
   // ============================================================ メニュー画面
   function renderMenu(root) {
-    const screen = el("div", { class: "screen" });
+    const screen = el("div", { class: "screen home" });
 
+    // ---- 見出し(タイトルと一言説明)。はじめての人にはチュートリアルへの案内を添える ----
+    const tutProg = loadTutorialProgress();
+    const historyCount = loadHistory().length;
     const masthead = el("div", { class: "masthead" }, [
       el("div", { class: "kanji", text: "挟" }),
-      el("h1", { text: "挟みゲーム" }),
-      el("div", { class: "sub", text: "IN A PINCH" }),
-      el("div", { class: "tag", text: "駒を配置・移動して相手の駒を挟み、動けなくしたら勝ち" }),
+      el("div", { class: "masthead-text" }, [
+        el("h1", { text: "挟みゲーム" }),
+        el("div", { class: "sub", text: "IN A PINCH" }),
+        el("div", { class: "tag", text: "駒を配置・移動して相手の駒を挟み、動けなくしたら勝ち" }),
+      ]),
     ]);
-    screen.appendChild(masthead);
+    // 見出しと「はじめての方へ」は、広い画面では横に並べて縦の場所を節約する
+    const homeTop = el("div", { class: "home-top" }, [masthead]);
+    screen.appendChild(homeTop);
+    if (!tutProg.done.length && !historyCount) {
+      homeTop.appendChild(el("div", { class: "welcome" }, [
+        el("div", { class: "welcome-text" }, [
+          el("b", { text: "はじめての方へ" }),
+          el("span", { text: "盤を触りながらルールを覚えるチュートリアル(12レッスン)から始めるのがおすすめです。" }),
+        ]),
+        el("button", { class: "btn btn-accent", type: "button", text: "チュートリアルを始める", onclick: () => goto("tutorial") }),
+      ]));
+    }
 
-    // ---- ルールテンプレート ----
-    const tplCard = el("div", { class: "card" });
-    tplCard.appendChild(el("div", { class: "card-title", text: "ルールテンプレート" }));
-    const tplRow = el("div", { class: "field-control" });
-    const tplSelect = el("select", { class: "field-select" }, [
-      el("option", { value: "custom", text: C.TEMPLATE_MENU_CUSTOM }),
-      el("option", { value: "template", text: C.TEMPLATE_LABEL }),
-    ]);
-    tplRow.appendChild(tplSelect);
-    tplCard.appendChild(tplRow);
-    tplCard.appendChild(el("div", {
-      class: "field-hint", style: { marginTop: "8px" },
-      text: `「特化テンプレート」を選ぶと 盤面7×7・持ち駒15・接触制限3・移動範囲3 に固定され、この設定に特化して調整した最上位AI『${AI.SPECIALIST_AI_NAME}』を相手に選べます(1手最大30秒)。`,
-    }));
-    screen.appendChild(tplCard);
+    const grid = el("div", { class: "home-grid" });
+    screen.appendChild(grid);
 
-    // ---- 対戦モード & 設定 ----
-    const card = el("div", { class: "card" });
-    card.appendChild(el("div", { class: "card-title", text: "対戦モード" }));
+    // ======== 対局する(設定と開始) ========
+    const card = el("section", { class: "card play-card", "aria-labelledby": "play-title" });
+    card.appendChild(el("h2", { class: "card-title", id: "play-title", text: "対局する" }));
+    grid.appendChild(card);
 
-    const modeWrap = el("div", {});
+    // ---- 対戦モード(大きめの3択) ----
+    const modeWrap = el("div", { class: "mode-tiles", role: "radiogroup", "aria-label": "対戦モード" });
     const modes = [
-      ["pvai", "AI戦(自分 対 AI)"],
-      ["pvp", "対人戦(2人で同じ画面を交互に操作)"],
-      ["ai_vs_ai", "AI同士の対戦(観戦)"],
+      ["pvai", "AI戦", "自分 対 AI"],
+      ["pvp", "対人戦", "2人で1台を交互に"],
+      ["ai_vs_ai", "AI観戦", "AI同士の対戦"],
     ];
     const modeInputs = {};
-    modes.forEach(([val, label]) => {
-      const row = el("label", { class: "radio-row" });
-      const input = el("input", { type: "radio", name: "mode", value: val });
+    const modeTiles = [];
+    modes.forEach(([val, label, sub]) => {
+      const input = el("input", { type: "radio", name: "mode", value: val, class: "visually-hidden" });
       if (val === "pvai") input.checked = true;
       modeInputs[val] = input;
-      row.appendChild(input);
-      row.appendChild(document.createTextNode(label));
-      modeWrap.appendChild(row);
+      const tile = el("label", { class: "mode-tile" }, [input, el("span", { class: "mode-name", text: label }), el("span", { class: "mode-sub", text: sub })]);
+      modeTiles.push([tile, input]);
+      modeWrap.appendChild(tile);
       input.addEventListener("change", onModeChange);
     });
     card.appendChild(modeWrap);
-    card.appendChild(el("hr", { class: "hr" }));
 
-    // 盤面サイズ / 移動範囲
-    const sizeRow = el("div", { class: "field-row" });
-    sizeRow.appendChild(el("div", { class: "field-label", text: "盤面サイズ" }));
-    const sizeSelect = el("select", { class: "field-select" });
-    C.BOARD_SIZE_CHOICES.forEach((n) => sizeSelect.appendChild(el("option", { value: n, text: `${n} x ${n}` })));
-    sizeSelect.value = "7";
-    sizeRow.appendChild(el("div", { class: "field-control" }, [sizeSelect]));
-    card.appendChild(sizeRow);
-
-    const rangeRow = el("div", { class: "field-row" });
-    rangeRow.appendChild(el("div", { class: "field-label", text: "移動範囲" }));
-    const rangeSeg = buildSeg(["1マス", "2マス", "3マス"], "1マス");
-    rangeRow.appendChild(el("div", { class: "field-control" }, [rangeSeg.el]));
-    card.appendChild(rangeRow);
-
-    const contactRow = el("div", { class: "field-row" });
-    contactRow.appendChild(el("div", { class: "field-label", text: "接触制限", }));
-    const contactSeg = buildSeg(C.CONTACT_LIMIT_CHOICES.map(String), String(C.DEFAULT_CONTACT_LIMIT));
-    contactRow.appendChild(el("div", { class: "field-control" }, [contactSeg.el]));
-    card.appendChild(contactRow);
-    card.appendChild(el("div", { class: "field-hint", text: "自分の駒はこの個数を超えて上下左右に連結できない(角・辺は壁も挟みに加担する)" }));
-
-    // AIの強さ
+    // ---- 相手と手番(よく変える設定) ----
     const levelRow = el("div", { class: "field-row" });
     const levelLabel = el("div", { class: "field-label", text: "AIの強さ" });
     levelRow.appendChild(levelLabel);
     const levelSelect = buildLevelSelect();
     levelRow.appendChild(el("div", { class: "field-control" }, [levelSelect]));
     card.appendChild(levelRow);
+    // 選んだレベルのひとこと解説(詳しくはコラム「AIのレベル解説」)
+    const levelGuide = el("div", { class: "level-guide" });
+    card.appendChild(levelGuide);
     // AI戦のときだけ: いまのレートと、近い強さのAI
     const ratingHint = el("div", { class: "field-hint rating-hint" });
     const myRating = currentRating();
@@ -549,7 +584,7 @@
     // 対人戦のときだけ: 持ち時間(将棋の切れ負け・秒読み・フィッシャーにならう)
     const timeRow = el("div", { class: "field-row", style: { display: "none" } });
     timeRow.appendChild(el("div", { class: "field-label", text: "持ち時間" }));
-    const timeSelect = el("select", { class: "field-select" });
+    const timeSelect = el("select", { class: "field-select field-select-wide", "aria-label": "持ち時間" });
     TIME_PRESETS.forEach((p) => timeSelect.appendChild(el("option", { value: p.id, text: p.label })));
     timeRow.appendChild(el("div", { class: "field-control" }, [timeSelect]));
     card.appendChild(timeRow);
@@ -594,25 +629,130 @@
     }
     evalCheck.addEventListener("change", () => { evalPrefs[evalContext()] = evalCheck.checked; });
 
-    card.appendChild(el("hr", { class: "hr" }));
-    card.appendChild(el("div", { class: "field-hint", text: "持ち駒(AIの強さとは独立に自由に設定できます)" }));
+    // ---- ルールと持ち駒(ふだんは畳んでおき、今の設定を1行で見せる) ----
+    const adv = el("details", { class: "adv" });
+    const advSummary = el("span", { class: "adv-summary" });
+    adv.appendChild(el("summary", {}, [el("span", { class: "adv-title", text: "ルールと持ち駒" }), advSummary]));
+    const advBody = el("div", { class: "adv-body" });
+    adv.appendChild(advBody);
+    card.appendChild(adv);
+
+    const tplRow = el("div", { class: "field-row field-row-stack" });
+    tplRow.appendChild(el("div", { class: "field-label", text: "ルールテンプレート" }));
+    const tplSelect = el("select", { class: "field-select field-select-wide", "aria-label": "ルールテンプレート" }, [
+      el("option", { value: "custom", text: C.TEMPLATE_MENU_CUSTOM }),
+      el("option", { value: "template", text: C.TEMPLATE_LABEL }),
+    ]);
+    tplRow.appendChild(el("div", { class: "field-control" }, [tplSelect]));
+    advBody.appendChild(tplRow);
+    advBody.appendChild(el("div", {
+      class: "field-hint",
+      text: `「特化テンプレート」を選ぶと 盤面7×7・持ち駒15・接触制限3・移動範囲3 に固定され、この設定に特化して調整した最上位AI『${AI.SPECIALIST_AI_NAME}』を相手に選べます(1手最大30秒)。`,
+    }));
+
+    // 盤面サイズ / 移動範囲
+    const sizeRow = el("div", { class: "field-row" });
+    sizeRow.appendChild(el("div", { class: "field-label", text: "盤面サイズ" }));
+    const sizeSelect = el("select", { class: "field-select", "aria-label": "盤面サイズ" });
+    C.BOARD_SIZE_CHOICES.forEach((n) => sizeSelect.appendChild(el("option", { value: n, text: `${n} x ${n}` })));
+    sizeSelect.value = "7";
+    sizeRow.appendChild(el("div", { class: "field-control" }, [sizeSelect]));
+    advBody.appendChild(sizeRow);
+
+    const rangeRow = el("div", { class: "field-row" });
+    rangeRow.appendChild(el("div", { class: "field-label", text: "移動範囲" }));
+    const rangeSeg = buildSeg(["1マス", "2マス", "3マス"], "1マス");
+    rangeRow.appendChild(el("div", { class: "field-control" }, [rangeSeg.el]));
+    advBody.appendChild(rangeRow);
+
+    const contactRow = el("div", { class: "field-row" });
+    contactRow.appendChild(el("div", { class: "field-label", text: "接触制限", }));
+    const contactSeg = buildSeg(C.CONTACT_LIMIT_CHOICES.map(String), String(C.DEFAULT_CONTACT_LIMIT));
+    contactRow.appendChild(el("div", { class: "field-control" }, [contactSeg.el]));
+    advBody.appendChild(contactRow);
+    advBody.appendChild(el("div", { class: "field-hint", text: "自分の駒はこの個数を超えて上下左右に連結できない(角・辺は壁も挟みに加担する)" }));
 
     const defaultStock = defaultStockForSize(7);
     const stockRow = el("div", { class: "field-row" });
-    stockRow.appendChild(el("div", { class: "field-label", text: "先手 / 後手" }));
-    const stockA = el("input", { class: "stock-input", type: "number", min: "1", value: String(defaultStock) });
-    const stockB = el("input", { class: "stock-input", type: "number", min: "1", value: String(defaultStock) });
-    stockRow.appendChild(el("div", { class: "field-control" }, [stockA, stockB]));
-    card.appendChild(stockRow);
+    stockRow.appendChild(el("div", { class: "field-label" }, [document.createTextNode("持ち駒"), el("span", { class: "field-label-sub", text: "先手 / 後手" })]));
+    const stockA = el("input", { class: "stock-input", type: "number", min: "1", inputmode: "numeric", value: String(defaultStock), "aria-label": "先手の持ち駒" });
+    const stockB = el("input", { class: "stock-input", type: "number", min: "1", inputmode: "numeric", value: String(defaultStock), "aria-label": "後手の持ち駒" });
+    stockRow.appendChild(el("div", { class: "field-control" }, [stockA, el("span", { class: "stock-sep", text: "/" }), stockB]));
+    advBody.appendChild(stockRow);
     const stockHint = el("div", { class: "field-hint", text: `目安: ${defaultStock}(盤面サイズから自動計算)` });
-    card.appendChild(stockHint);
-    const errorText = el("div", { class: "error-text" });
+    advBody.appendChild(stockHint);
+    advBody.appendChild(el("div", { class: "field-hint", text: "持ち駒はAIの強さとは独立に自由に設定できます。" }));
+
+    const errorText = el("div", { class: "error-text", role: "alert" });
     card.appendChild(errorText);
 
-    const startBtn = el("button", { class: "btn btn-primary", text: "対戦開始", style: { marginTop: "16px" } });
+    const startBtn = el("button", { class: "btn btn-primary", type: "button", text: "対戦開始" });
     card.appendChild(startBtn);
-    screen.appendChild(card);
+
+    // ======== 学ぶ・読む / ほかの遊び方 / 記録(ほかの画面への入口) ========
+    const side = el("div", { class: "home-side" });
+    grid.appendChild(side);
+    const tile = (screenName, title, desc, meta, badge) => el("button", {
+      type: "button", class: "tile", onclick: () => goto(screenName),
+    }, [
+      el("span", { class: "tile-title" }, [document.createTextNode(title), badge ? el("span", { class: "tile-badge", text: badge }) : null]),
+      el("span", { class: "tile-desc", text: desc }),
+      meta ? el("span", { class: "tile-meta", text: meta }) : null,
+    ]);
+    const section = (title, tiles) => el("section", { class: "home-section" }, [
+      el("h2", { class: "home-section-title", text: title }),
+      el("div", { class: "tile-grid" }, tiles),
+    ]);
+    const nLessons = C.TUTORIAL_LESSONS.length;
+    const tsumeProg = loadTsumeProgress();
+    const tsumeCleared = TD.PUZZLES.filter((p) => (tsumeProg[p.id] || {}).stars).length;
+    side.appendChild(section("学ぶ・読む", [
+      tile("tutorial", "チュートリアル", "盤を触りながらルールを覚える", `${tutProg.done.length} / ${nLessons} レッスン`),
+      tile("strategy", "戦略コラム", "検証から見えた勝ち筋のヒント", `${C.STRATEGY_ARTICLES.length}本`),
+      tile("aiguide", "AIのレベル解説", "9段階のAIの違いと選び方", "コラム", "NEW"),
+      tile("report", "戦術レポート", "最強AIを作る過程で分かったこと", "データ付き"),
+    ]));
+    side.appendChild(section("ほかの遊び方", [
+      tile("tsume", "詰めピンチ", "詰将棋ふうの問題集", `クリア ${tsumeCleared} / ${TD.PUZZLES.length}`),
+      tile("online", "オンライン対戦", "手番リンクを送り合う通信対局", null),
+    ]));
+    side.appendChild(section("記録", [
+      tile("history", "対戦履歴", "感想戦・棋譜のダウンロード", `${historyCount}局`),
+      tile("rating", "レート", "AI戦の成績の推移", myRating != null ? `現在 ${myRating}` : "未計測"),
+    ]));
     root.appendChild(screen);
+
+    // 選んだAIのひとこと解説
+    function updateLevelGuide() {
+      const mode = currentMode();
+      levelGuide.style.display = mode === "pvp" ? "none" : "";
+      clearNode(levelGuide);
+      const lines = mode === "ai_vs_ai" ? [levelSelect.value, levelSelectB.value] : [levelSelect.value];
+      lines.forEach((v) => {
+        const key = v === "specialist" ? "S" : v;
+        const g = C.AI_LEVEL_GUIDE.levels.find((x) => x.key === key);
+        if (!g) return;
+        const facts = [`読み ${g.read}`, `思考 ${g.time}`, g.miss === "なし" ? "わざとのミスなし" : g.miss === "すべて" ? "すべてでたらめ" : `でたらめな手 ${g.miss}`];
+        if (RATING_LEVELS[key] != null) facts.push(`レート ${RATING_LEVELS[key]}`);
+        levelGuide.appendChild(el("div", { class: "level-guide-line" }, [el("b", { text: g.name })].concat(facts.map((f) => el("span", { text: f })))));
+      });
+      const hint = !isTemplateSelected() ? `『${AI.SPECIALIST_AI_NAME}』は「ルールと持ち駒」で特化テンプレートを選ぶと対戦できます。` : "";
+      levelGuide.appendChild(el("div", { class: "level-guide-foot" }, [
+        hint ? el("span", { text: hint }) : null,
+        el("button", { type: "button", class: "link-btn", text: "AIのレベル解説を読む →", onclick: () => goto("aiguide") }),
+      ]));
+    }
+    // 畳んだ「ルールと持ち駒」の見出しに、今の設定を1行で出す
+    function updateAdvSummary() {
+      const n = sizeSelect.value;
+      advSummary.textContent = `${isTemplateSelected() ? "特化テンプレート" : "カスタム"} ・ ${n}×${n} ・ 移動${rangeSeg.value} ・ 接触${contactSeg.value} ・ 持ち駒 ${stockA.value}/${stockB.value}`;
+    }
+    function updateDynamic() {
+      modeTiles.forEach(([t, input]) => t.classList.toggle("is-checked", input.checked));
+      updateLevelGuide();
+      updateAdvSummary();
+    }
+    ["change", "input", "click"].forEach((ev) => screen.addEventListener(ev, () => setTimeout(updateDynamic, 0)));
 
     function buildSeg(labels, initial) {
       const wrap = el("div", { class: "seg", role: "radiogroup" });
@@ -785,6 +925,7 @@
 
     onModeChange();
     applySettings(loadMenuSettings());
+    updateDynamic();
 
     startBtn.addEventListener("click", () => {
       errorText.textContent = "";
@@ -827,8 +968,8 @@
         text = String(text).trim();
         if (!text) return def;
         const v = parseInt(text, 10);
-        if (!Number.isFinite(v)) { errorText.textContent = `${label}は整数で入力してください。`; return null; }
-        if (v <= 0) { errorText.textContent = `${label}は1以上にしてください。`; return null; }
+        if (!Number.isFinite(v)) { errorText.textContent = `${label}は整数で入力してください。`; adv.open = true; return null; }
+        if (v <= 0) { errorText.textContent = `${label}は1以上にしてください。`; adv.open = true; return null; }
         return v;
       }
     });
@@ -897,16 +1038,19 @@
     const m = App.match;
     if (!m || !m.evalDisplay) { if (then) then(); return; }
     const prev = m.evalView && m.evalView.result;
+    const plies = m.kifuRecords.length; // どの局面の読みか(読み終えた局面でAIが考え始めたら、その値は出したままにする)
     if (m.engine.isOver()) {
       cancelEval();
-      m.evalView = { status: "ready", result: AI.evaluatePosition(m.engine, false) };
+      m.evalView = { status: "ready", result: AI.evaluatePosition(m.engine, false), plies };
       drawEvalMeter();
       if (then) then();
       return;
     }
     if (m.aiThinking) {
       cancelEval();
-      m.evalView = { status: "paused", result: prev };
+      if (!(m.evalView && m.evalView.status === "ready" && m.evalView.plies === plies)) {
+        m.evalView = { status: "paused", result: prev };
+      }
       drawEvalMeter();
       return;
     }
@@ -914,20 +1058,36 @@
     drawEvalMeter();
     requestEval(m.engine, evalUsesTemplate(m), (result) => {
       if (App.match !== m) return;
-      m.evalView = { status: result ? "ready" : "failed", result: result || prev };
+      m.evalView = { status: result ? "ready" : "failed", result: result || prev, plies };
       drawEvalMeter();
       if (then) then();
     });
   }
 
-  // 次の手番へ進める: 相手AIの思考を始め、形勢を読み直す。AI同士の対戦で形勢表示ありなら、
-  // 形勢を読み終えてから次のAIに考えさせる(AIの読みと形勢の読みを同時に走らせない)
+  // 次がAIの手番か(AI戦の相手AI・観戦中のAI同士。一時停止中は含めない)
+  function nextActorIsAI(m) {
+    if (m.engine.isOver()) return false;
+    if (m.mode === "pvai") return m.engine.currentPlayer === otherPlayer(m.humanPlayer);
+    return m.mode === "ai_vs_ai" && !m.aiVsAiPaused;
+  }
+
+  // 次の手番へ進める: 相手AIの思考を始め、形勢を読み直す。形勢表示ありで次がAIの手番なら、
+  // 直前の手(あなたの手・前のAIの手)の形勢を読んで表示してからAIに考えさせる
+  // (AIの読みと形勢の読みを同時に走らせない。AI戦では「指す → 形勢 → AIが考える」の順になる)
   function proceedTurn() {
     const m = App.match;
-    if (m.mode === "ai_vs_ai" && m.evalDisplay && !m.aiVsAiPaused && !m.engine.isOver()) {
-      refreshEval(() => { if (App.match === m && !m.aiVsAiPaused) maybeTriggerAI(); });
+    if (m.evalDisplay && nextActorIsAI(m)) {
+      const engine = m.engine;
+      m.evalGate = true; // 形勢を読み終えるまでAIを待たせている(手番表示に出す)
+      refreshEval(() => {
+        if (App.match !== m || m.engine !== engine) return; // 待った・やり直しで局面が変わった
+        m.evalGate = false;
+        if (nextActorIsAI(m)) maybeTriggerAI(); else updateGameUI();
+      });
+      if (m.evalGate) updateGameUI();
       return;
     }
+    m.evalGate = false;
     maybeTriggerAI();
     refreshEval();
   }
@@ -1181,10 +1341,9 @@
 
   function renderTsumeMenu(root) {
     const screen = el("div", { class: "screen" });
-    screen.appendChild(el("h1", { class: "card-title", text: "詰めピンチ", style: { fontSize: "24px" } }));
-    screen.appendChild(el("div", {
-      class: "field-hint", style: { textAlign: "center", maxWidth: "580px" },
-      text: "「正しく指せば必ず勝てる」と証明済みの局面から、相手を詰ませる問題集です。"
+    screen.appendChild(pageHead("詰めピンチ", {
+      crumbs: [["ホーム", "menu"]],
+      lede: "「正しく指せば必ず勝てる」と証明済みの局面から、相手を詰ませる問題集です。"
         + "詰将棋の王手と同じく、あなたは毎手かならず相手の駒を挟みます(=移動義務を負わせる)。"
         + "相手が義務のある駒をどれも動かせなくなれば詰み。相手は最も長く粘る受けを返してきます。",
     }));
@@ -1668,43 +1827,55 @@
   function renderGame(root) {
     const m = App.match;
     if (!m) { goto("menu"); return; }
-    const screen = el("div", { class: "screen" });
+    const screen = el("div", { class: "screen game-screen" });
 
+    // ---- 上の帯: 戻る + 対局の種類(ルールなどの詳細は小さく2行目に) ----
     const topBar = el("div", { class: "top-bar" });
     topBar.appendChild(m.mode === "tsume"
-      ? el("button", { class: "btn btn-compact", text: "← 問題一覧", onclick: () => goto("tsume") })
-      : el("button", { class: "btn btn-compact", text: "← メニューに戻る", onclick: () => goto("menu") }));
+      ? el("button", { class: "btn btn-compact btn-back", text: "← 問題一覧", onclick: () => goto("tsume") })
+      : el("button", { class: "btn btn-compact btn-back", text: "← メニュー", "aria-label": "メニューに戻る", onclick: () => goto("menu") }));
     const modeText = el("span", { class: "mode-text" });
     topBar.appendChild(modeText);
-    topBar.appendChild(el("div", { class: "grow" }));
+    screen.appendChild(topBar);
+
+    // ---- 操作ボタン(スマホでは盤のすぐ下、広い画面では右の列) ----
+    const actionsBar = el("div", { class: "game-actions" });
     const stepBtn = el("button", { class: "btn btn-compact", text: "1手進める", onclick: onStepOnce });
     const pauseBtn = el("button", { class: "btn btn-compact", text: "一時停止", onclick: onTogglePause });
     const undoBtn = el("button", { class: "btn btn-compact", text: "待った(1手戻す)", onclick: onUndo });
     const restartBtn = el("button", { class: "btn btn-compact", text: m.mode === "tsume" ? "やり直す" : "新しく対戦", onclick: onRestart });
     const clockBtn = m.clock ? el("button", { class: "btn btn-compact", text: "時計を止める", onclick: toggleClockPause }) : null;
-    if (m.mode === "ai_vs_ai") { topBar.appendChild(pauseBtn); topBar.appendChild(stepBtn); }
-    else if (clockBtn) topBar.appendChild(clockBtn); // 持ち時間ありの対局は待ったなし
-    else topBar.appendChild(undoBtn);
+    if (m.mode === "ai_vs_ai") { actionsBar.appendChild(pauseBtn); actionsBar.appendChild(stepBtn); }
+    else if (clockBtn) actionsBar.appendChild(clockBtn); // 持ち時間ありの対局は待ったなし
+    else actionsBar.appendChild(undoBtn);
     let hintBtn = null;
     if (m.mode === "tsume") {
       hintBtn = el("button", { class: "btn btn-compact", text: "ヒント", onclick: requestTsumeHint });
-      topBar.appendChild(hintBtn);
-      topBar.appendChild(el("button", { class: "btn btn-compact", text: "解答を見る", onclick: startTsumeReplay }));
+      actionsBar.appendChild(hintBtn);
+      actionsBar.appendChild(el("button", { class: "btn btn-compact", text: "解答を見る", onclick: startTsumeReplay }));
     }
-    topBar.appendChild(restartBtn);
-    screen.appendChild(topBar);
+    actionsBar.appendChild(restartBtn);
 
-    const bannerHost = el("div", { class: "banner-host", style: { width: "min(560px,100%)" } });
-    screen.appendChild(bannerHost);
+    // 盤の列(boardCol)と情報の列(sideCol)。狭い画面では2つの列を解いて、
+    // 結果 → 手番 → 時計 → 形勢 → 盤 → 操作 → 持ち駒 → ログ の順に1列で並べる(CSS の order)
+    const layout = el("div", { class: "game-layout" });
+    const boardCol = el("div", { class: "game-board-col" });
+    const sideCol = el("div", { class: "game-side-col" });
+    layout.appendChild(boardCol);
+    layout.appendChild(sideCol);
+    screen.appendChild(layout);
+
+    const bannerHost = el("div", { class: "banner-host" });
+    sideCol.appendChild(bannerHost);
     const tsumePanel = m.mode === "tsume" ? el("div", { class: "tsume-panel" }) : null;
-    if (tsumePanel) screen.appendChild(tsumePanel);
+    if (tsumePanel) sideCol.appendChild(tsumePanel);
 
     const turnRow = el("div", { class: "turn-row" });
-    const turnText = el("div", { class: "turn-text" });
+    const turnText = el("div", { class: "turn-text", "aria-live": "polite" });
     turnRow.appendChild(turnText);
-    screen.appendChild(turnRow);
     const obligationText = el("div", { class: "obligation-text" });
-    screen.appendChild(obligationText);
+    turnRow.appendChild(obligationText);
+    sideCol.appendChild(turnRow);
 
     // ---- 対局時計(持ち時間ありの対人戦のみ) ----
     let clocks = null;
@@ -1722,7 +1893,7 @@
         clockBar.appendChild(node);
         clocks[p] = { root: node, name, time, sub };
       }
-      screen.appendChild(clockBar);
+      sideCol.appendChild(clockBar);
     }
 
     // ---- 形勢表示(設定でオンにした対局のみ) ----
@@ -1742,7 +1913,7 @@
           el("span", { class: "eval-side eval-side-b" }, [pctB, nameB]),
         ]),
       ]);
-      screen.appendChild(meterRoot);
+      sideCol.appendChild(meterRoot);
       evalMeter = { root: meterRoot, nameA, pctA, nameB, pctB, fill, note, bar: meterRoot.querySelector(".eval-bar") };
     }
 
@@ -1759,7 +1930,9 @@
     legend.appendChild(legA); legend.appendChild(legB);
     legend.appendChild(el("span", { style: { color: "var(--warning)" }, text: "┅ 直前の手" }));
     boardWrap.appendChild(legend);
-    screen.appendChild(boardWrap);
+    boardCol.appendChild(boardWrap);
+
+    sideCol.appendChild(actionsBar);
 
     // ---- ステータスカード ----
     const statusGrid = el("div", { class: "status-grid" });
@@ -1767,14 +1940,14 @@
     const sideB = buildSideCard("B");
     statusGrid.appendChild(sideA.node);
     statusGrid.appendChild(sideB.node);
-    screen.appendChild(statusGrid);
+    sideCol.appendChild(statusGrid);
 
     // ---- 対戦ログ ----
     const logPanel = el("div", { class: "log-panel" });
     logPanel.appendChild(el("div", { class: "log-head" }, [el("span", { text: "対戦ログ" })]));
     const logList = el("ul", { class: "log-list" });
     logPanel.appendChild(logList);
-    screen.appendChild(logPanel);
+    sideCol.appendChild(logPanel);
 
     root.appendChild(screen);
 
@@ -1899,6 +2072,7 @@
       m.undoUsed = true; // 待ったを使った対局はレートの対象外
     }
     m.engine = snap.engine;
+    m.evalGate = false; // 形勢を読んでからAIが考える途中だった場合も、その読みは捨てる
     m.logMessages.length = snap.logLen;
     m.kifuRecords.length = snap.kifuLen;
     if (m.onlineActions) m.onlineActions.length = snap.onlineLen;
@@ -1993,6 +2167,8 @@
       dom.turnText.textContent = `解答を再生しています(${m.tsumeReplay.step} / ${m.puzzle.line.length}手)`;
     } else if (m.mode === "tsume" && m.tsumeFailed) {
       dom.turnText.textContent = "";
+    } else if (m.evalGate && !engine.isOver()) {
+      dom.turnText.textContent = `形勢を読んでいます…(続いて${playerDisplayName(engine.currentPlayer)}が考えます)`;
     } else if (m.clock && m.clock.paused && !engine.isOver()) {
       dom.turnText.textContent = "時計を止めています";
     } else if (!engine.isOver()) {
@@ -2465,7 +2641,7 @@
     const S = { token: 0, lesson: 0, step: 0, engine: null, start: null, status: "play", selected: null, last: null, lines: [], tried: new Set(), hint: null, pieceNodes: new Map(), dom: null, feedback: { cls: null, lines: [] }, startLast: null, startLines: [] };
 
     const screen = el("div", { class: "screen" });
-    screen.appendChild(el("h1", { class: "card-title", text: "チュートリアル", style: { fontSize: "24px" } }));
+    screen.appendChild(pageHead("チュートリアル", { crumbs: [["ホーム", "menu"], ["読みもの", "learn"]] }));
     const chips = el("div", { class: "tut-chips", role: "tablist", "aria-label": "レッスン一覧" });
     screen.appendChild(chips);
 
@@ -2906,35 +3082,156 @@
     }
   }
 
+  // ============================================================ 読みもの(コラム類の一覧と各ページ)
+  // 一覧 → 各コラム の2階層。各コラムの末尾には前後のコラムへの案内を置く
+  const READING_PAGES = [
+    { screen: "strategy", title: "戦略コラム", desc: "探索AIとの検証を通して見えてきた勝ち筋。退路・孤立駒・壁と角・接触制限など8本。" },
+    { screen: "aiguide", title: "AIのレベル解説", desc: "ランダムから奥義まで、9段階のAIが何をどこまで読んでいるのか。強さの違いと選び方。", badge: "NEW" },
+    { screen: "report", title: "戦術レポート", desc: `最上位AI『${AI.SPECIALIST_AI_NAME}』を自己対戦で仕上げる過程で分かった戦術。データ付きの長文。` },
+  ];
+  const READING_CRUMBS = [["ホーム", "menu"], ["読みもの", "learn"]];
+
+  function renderLearn(root) {
+    const screen = el("div", { class: "screen" });
+    screen.appendChild(pageHead("読みもの", { crumbs: [["ホーム", "menu"]], lede: "ルールを覚える・勝ち筋を知る・AIを知るための読みもの" }));
+    const list = el("div", { class: "reading-list" });
+    const tutDone = loadTutorialProgress().done.length;
+    list.appendChild(readingCard({ screen: "tutorial", title: "チュートリアル", desc: "駒の置き方・動かし方から壁・接触制限まで、本物の盤を触りながら1レッスン1ルールで覚える。" },
+      `${tutDone} / ${C.TUTORIAL_LESSONS.length} レッスン完了`));
+    READING_PAGES.forEach((p) => list.appendChild(readingCard(p)));
+    screen.appendChild(list);
+    root.appendChild(screen);
+
+    function readingCard(p, meta) {
+      return el("button", { type: "button", class: "reading-card", onclick: () => goto(p.screen) }, [
+        el("span", { class: "tile-title" }, [document.createTextNode(p.title), p.badge ? el("span", { class: "tile-badge", text: p.badge }) : null]),
+        el("span", { class: "tile-desc", text: p.desc }),
+        meta ? el("span", { class: "tile-meta", text: meta }) : null,
+      ]);
+    }
+  }
+
+  // コラムの末尾: 前後のコラムと一覧への案内
+  function readingPager(screenName) {
+    const i = READING_PAGES.findIndex((p) => p.screen === screenName);
+    const prev = READING_PAGES[i - 1], next = READING_PAGES[i + 1];
+    const pager = el("nav", { class: "reading-pager", "aria-label": "ほかの読みもの" });
+    pager.appendChild(prev
+      ? el("button", { type: "button", class: "pager-link", onclick: () => goto(prev.screen) }, [el("span", { class: "pager-dir", text: "← 前の読みもの" }), el("span", { text: prev.title })])
+      : el("span"));
+    pager.appendChild(el("button", { type: "button", class: "btn btn-compact", text: "読みもの一覧", onclick: () => goto("learn") }));
+    pager.appendChild(next
+      ? el("button", { type: "button", class: "pager-link is-next", onclick: () => goto(next.screen) }, [el("span", { class: "pager-dir", text: "次の読みもの →" }), el("span", { text: next.title })])
+      : el("span"));
+    return pager;
+  }
+
+  function scrollToNode(node) {
+    const header = document.getElementById("navbar");
+    const top = node.getBoundingClientRect().top + window.scrollY - (header ? header.offsetHeight : 0) - 10;
+    const reduce = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    window.scrollTo({ top, behavior: reduce ? "auto" : "smooth" });
+  }
+
   // ============================================================ 戦略コラム
   function renderStrategy(root) {
     const screen = el("div", { class: "screen" });
-    screen.appendChild(el("h1", { class: "card-title", text: "戦略コラム", style: { fontSize: "24px" } }));
-    const doc = el("div", { class: "doc" });
-    doc.appendChild(el("div", { class: "lede", text: "探索AIとの検証を通して見えてきた勝ち筋" }));
-    C.STRATEGY_ARTICLES.forEach(([heading, body]) => {
-      const item = el("div", { class: "strategy-item" });
-      item.appendChild(el("h3", { text: heading }));
+    screen.appendChild(pageHead("戦略コラム", { crumbs: READING_CRUMBS, lede: "探索AIとの検証を通して見えてきた勝ち筋" }));
+    const doc = el("article", { class: "doc" });
+    C.STRATEGY_ARTICLES.forEach(([heading, body], i) => {
+      const item = el("section", { class: "strategy-item" });
+      item.appendChild(el("h3", {}, [el("span", { class: "item-no", text: String(i + 1) }), document.createTextNode(heading)]));
       item.appendChild(el("p", { text: body }));
       doc.appendChild(item);
     });
     screen.appendChild(doc);
+    screen.appendChild(readingPager("strategy"));
+    root.appendChild(screen);
+  }
+
+  // ============================================================ コラム「AIのレベル解説」
+  function renderAiGuide(root) {
+    const G = C.AI_LEVEL_GUIDE;
+    const screen = el("div", { class: "screen" });
+    screen.appendChild(pageHead("AIのレベル解説", { crumbs: READING_CRUMBS, lede: G.lede }));
+    const doc = el("article", { class: "doc ai-guide" });
+    G.intro.forEach((t) => doc.appendChild(el("p", { text: t })));
+
+    // ひと目で比べる表(横に長いので、狭い画面では表だけ横にスクロールする)
+    doc.appendChild(el("h2", { text: "早見表" }));
+    const table = el("table", { class: "level-table" });
+    table.appendChild(el("thead", {}, [el("tr", {}, ["レベル", "レート", "読み", "1手の思考", "でたらめな手"].map((h) => el("th", { scope: "col", text: h })))]));
+    const tbody = el("tbody");
+    G.levels.forEach((g) => {
+      tbody.appendChild(el("tr", { class: g.key === "S" ? "is-special" : "" }, [
+        el("th", { scope: "row" }, [el("button", { type: "button", class: "link-btn", text: g.name, onclick: () => scrollToNode(doc.querySelector(`[data-level="${g.key}"]`)) })]),
+        el("td", { class: "num", text: RATING_LEVELS[g.key] != null ? String(RATING_LEVELS[g.key]) : "-" }),
+        el("td", { text: g.read }), el("td", { text: g.time }), el("td", { text: g.miss }),
+      ]));
+    });
+    table.appendChild(tbody);
+    doc.appendChild(el("div", { class: "table-scroll", tabindex: "0", role: "region", "aria-label": "AIのレベルの早見表" }, [table]));
+    doc.appendChild(el("p", { class: "doc-note", text: "レートは特化テンプレートの設定で測った値です。『奥義』は特化テンプレートを選んだときだけ選べます。" }));
+
+    doc.appendChild(el("h2", { text: "2種類のAI" }));
+    const kinds = el("div", { class: "kind-grid" });
+    G.kinds.forEach(([title, body]) => kinds.appendChild(el("div", { class: "kind-card" }, [el("h3", { text: title }), el("p", { text: body })])));
+    doc.appendChild(kinds);
+
+    doc.appendChild(el("h2", { text: "レベルごとの解説" }));
+    G.levels.forEach((g) => {
+      const rating = RATING_LEVELS[g.key];
+      const card = el("section", { class: "level-card" + (g.key === "S" ? " is-special" : ""), "data-level": g.key }, [
+        el("div", { class: "level-card-head" }, [
+          el("h3", { text: g.name }),
+          rating != null ? el("span", { class: "level-rating", text: `レート ${rating}` }) : null,
+        ]),
+        el("div", { class: "level-facts" }, [
+          el("span", { text: `読み ${g.read}` }), el("span", { text: `思考 ${g.time}` }), el("span", { text: `でたらめな手 ${g.miss}` }),
+        ]),
+        el("p", { text: g.text }),
+        el("p", { class: "level-tip" }, [el("b", { text: "こんな人に " }), document.createTextNode(g.tip)]),
+      ]);
+      doc.appendChild(card);
+    });
+
+    G.sections.forEach(([kind, text]) => doc.appendChild(el(kind === "h" ? "h2" : "p", { text })));
+    doc.appendChild(el("div", { class: "doc-cta" }, [
+      el("button", { type: "button", class: "btn btn-accent", text: "ホームで対戦相手を選ぶ", onclick: () => goto("menu") }),
+      el("button", { type: "button", class: "btn", text: "自分のレートを見る", onclick: () => goto("rating") }),
+    ]));
+    screen.appendChild(doc);
+    screen.appendChild(readingPager("aiguide"));
     root.appendChild(screen);
   }
 
   // ============================================================ 戦術レポート
   function renderReport(root) {
     const screen = el("div", { class: "screen" });
-    screen.appendChild(el("h1", { class: "card-title", text: "戦術レポート", style: { fontSize: "24px" } }));
-    const doc = el("div", { class: "doc" });
-    doc.appendChild(el("div", { class: "lede", text: `特化テンプレート専用AI『${AI.SPECIALIST_AI_NAME}』を自己対戦で仕上げる過程で判明した、人間の実戦でも使える戦術のまとめ` }));
+    screen.appendChild(pageHead("戦術レポート", {
+      crumbs: READING_CRUMBS,
+      lede: `特化テンプレート専用AI『${AI.SPECIALIST_AI_NAME}』を自己対戦で仕上げる過程で判明した、人間の実戦でも使える戦術のまとめ`,
+    }));
+    const doc = el("article", { class: "doc" });
+    // 長いので先頭に目次(章へ飛べる)を置く
+    const toc = el("details", { class: "toc", open: "" }, [el("summary", { text: "目次" })]);
+    const tocList = el("ol", { class: "toc-list" });
+    toc.appendChild(tocList);
+    doc.appendChild(toc);
     C.TACTICS_REPORT.forEach(([kind, text]) => {
-      if (kind === "h1") doc.appendChild(el("h2", { text }));
-      else if (kind === "h2") doc.appendChild(el("h3", { text }));
+      if (kind === "h1") {
+        const h = el("h2", { text });
+        doc.appendChild(h);
+        tocList.appendChild(el("li", {}, [el("button", { type: "button", class: "link-btn", text, onclick: () => scrollToNode(h) })]));
+      } else if (kind === "h2") doc.appendChild(el("h3", { text }));
       else if (kind === "pre") doc.appendChild(el("pre", { text }));
       else doc.appendChild(el("p", { text }));
     });
+    doc.appendChild(el("div", { class: "doc-cta" }, [
+      el("button", { type: "button", class: "btn btn-compact", text: "↑ 目次へ戻る", onclick: () => scrollToNode(toc) }),
+    ]));
     screen.appendChild(doc);
+    screen.appendChild(readingPager("report"));
     root.appendChild(screen);
   }
 
@@ -3099,8 +3396,10 @@
   // ============================================================ レート画面
   function renderRating(root) {
     const screen = el("div", { class: "screen" });
-    screen.appendChild(el("h1", { class: "card-title", text: "レート", style: { fontSize: "24px" } }));
-    screen.appendChild(el("div", { class: "field-hint", text: "AI戦の結果と、あなたの指し手の質(AIが解析した平均損失)から計算します。この端末のブラウザに保存され、他の端末とは共有されません。" }));
+    screen.appendChild(pageHead("レート", {
+      crumbs: [["ホーム", "menu"]],
+      lede: "AI戦の結果と、あなたの指し手の質(AIが解析した平均損失)から計算します。この端末のブラウザに保存され、他の端末とは共有されません。",
+    }));
     const body = el("div", { class: "rating-body" });
     screen.appendChild(body);
     root.appendChild(screen);
@@ -3263,8 +3562,10 @@
   function renderHistory(root, payload) {
     const preselect = (payload && payload.preselect) || [];
     const screen = el("div", { class: "screen" });
-    screen.appendChild(el("h1", { class: "card-title", text: "対戦履歴", style: { fontSize: "24px" } }));
-    screen.appendChild(el("div", { class: "field-hint", text: "この端末のブラウザに保存されている対戦記録です(他の端末とは共有されません)。" }));
+    screen.appendChild(pageHead("対戦履歴", {
+      crumbs: [["ホーム", "menu"]],
+      lede: "この端末のブラウザに保存されている対戦記録です(他の端末とは共有されません)。",
+    }));
     if (preselect.length) {
       screen.appendChild(el("div", { class: "banner success" }, [
         el("span", { text: `LINEから${preselect.length}件の対局記録を引き継ぎました。選択済みなので「まとめてダウンロード」で保存できます。` }),
@@ -3499,7 +3800,7 @@
 
   function renderReview(root) {
     const record = App.reviewRecord;
-    const screen = el("div", { class: "screen" });
+    const screen = el("div", { class: "screen review-screen" });
     if (!record) { root.appendChild(el("p", { text: "記録が見つかりません。" })); return; }
     const frames = rebuildFramesFromRecord(record);
     let index = frames.length - 1;
@@ -3507,9 +3808,17 @@
     const cached = cachedAnalysis(record, frames.length);
     const results = cached ? cached.slice() : new Array(frames.length).fill(null);
 
-    screen.appendChild(el("h1", { class: "card-title", text: "感想戦", style: { fontSize: "24px" } }));
     const cl = record.contactLimit != null ? `接触制限${record.contactLimit}` : "接触制限なし";
-    screen.appendChild(el("div", { class: "field-hint", text: `${record.modeLabel} / ${record.rows}x${record.cols} / ${cl}${record.evalDisplay ? " / 形勢表示あり" : ""} - ${record.resultText}` }));
+    screen.appendChild(pageHead("感想戦", {
+      crumbs: [["ホーム", "menu"], ["対戦履歴", "history"]],
+      lede: `${record.modeLabel} / ${record.rows}x${record.cols} / ${cl}${record.evalDisplay ? " / 形勢表示あり" : ""} - ${record.resultText}`,
+    }));
+    // 盤の列(main)と、勝率グラフ・検討・棋譜の列(side)。狭い画面では1列に並べ直す(CSS の order)
+    const layout = el("div", { class: "review-layout" });
+    const mainCol = el("div", { class: "review-main" });
+    const sideCol = el("div", { class: "review-side" });
+    layout.appendChild(mainCol); layout.appendChild(sideCol);
+    screen.appendChild(layout);
 
     // ---- 勝率グラフ(上が先手100%、下が後手100%)と、解析の進み具合・手の判定のまとめ ----
     const graphCard = el("div", { class: "review-graph-card" });
@@ -3532,21 +3841,21 @@
         el("i", { class: "mk mk-mate" }), document.createTextNode("詰みを読み切り"),
       ]),
     ]));
-    screen.appendChild(graphCard);
+    sideCol.appendChild(graphCard);
 
     // 検討の変化手順(詰み手順の樹形図で選んだ局面)を盤に出している間の帯
     const varBanner = el("div", { class: "var-banner", style: { display: "none" } });
-    screen.appendChild(varBanner);
+    mainCol.appendChild(varBanner);
     const boardWrap = el("div", { class: "board-wrap" });
     const size = record.rows;
     const { boardFrame, cellNodes, piecesLayer, fxLayer } = buildBoardShell(size, { fx: true });
     boardWrap.appendChild(boardFrame);
-    screen.appendChild(boardWrap);
+    mainCol.appendChild(boardWrap);
 
     const desc = el("div", { class: "review-desc" });
     const verdict = el("div", { class: "review-verdict" });
-    screen.appendChild(desc);
-    screen.appendChild(verdict);
+    mainCol.appendChild(desc);
+    mainCol.appendChild(verdict);
     const toolbar = el("div", { class: "review-toolbar" });
     const step = el("span", { class: "review-step" });
     const first = el("button", { class: "btn btn-compact", text: "|<< 最初" });
@@ -3554,20 +3863,20 @@
     const next = el("button", { class: "btn btn-compact", text: "次へ >" });
     const last = el("button", { class: "btn btn-compact", text: "最後 >>|" });
     toolbar.appendChild(first); toolbar.appendChild(prev); toolbar.appendChild(step); toolbar.appendChild(next); toolbar.appendChild(last);
-    screen.appendChild(toolbar);
-    const jumpBar = el("div", { class: "review-toolbar" });
+    mainCol.appendChild(toolbar);
+    const jumpBar = el("div", { class: "review-toolbar review-jumps" });
     const prevBad = el("button", { class: "btn btn-compact", text: "◀ 前の疑問手・悪手" });
     const nextBad = el("button", { class: "btn btn-compact", text: "次の疑問手・悪手 ▶" });
     const nextMate = el("button", { class: "btn btn-compact", text: "◆ 詰みを読み切った局面へ" });
     jumpBar.appendChild(prevBad); jumpBar.appendChild(nextBad); jumpBar.appendChild(nextMate);
-    screen.appendChild(jumpBar);
+    mainCol.appendChild(jumpBar);
 
     // AIの検討: 最善手・読み筋・詰み手順の樹形図
     const studyCard = el("div", { class: "study-card" });
-    screen.appendChild(studyCard);
+    sideCol.appendChild(studyCard);
 
-    const resumeBtn = el("button", { class: "btn btn-compact", text: "この局面から対局を再開する", onclick: () => openResumeSetup(record, frames, index) });
-    screen.appendChild(resumeBtn);
+    const resumeBtn = el("button", { class: "btn btn-compact review-resume", text: "この局面から対局を再開する", onclick: () => openResumeSetup(record, frames, index) });
+    mainCol.appendChild(resumeBtn);
 
     const list = el("ul", { class: "review-list" });
     list.appendChild(el("li", { text: "0: (対局開始)", onclick: () => { index = 0; renderFrame(); } }));
@@ -3581,7 +3890,7 @@
       moveItems.push({ li, tag });
       list.appendChild(li);
     });
-    screen.appendChild(list);
+    sideCol.appendChild(list);
     screen.appendChild(el("button", { class: "btn", text: "← メニューに戻る", onclick: () => goto("menu"), style: { marginTop: "6px" } }));
     root.appendChild(screen);
 
@@ -4261,7 +4570,7 @@
 
   function renderOnline(root) {
     const screen = el("div", { class: "screen" });
-    screen.appendChild(el("h1", { class: "card-title", text: "オンライン対戦", style: { fontSize: "24px" } }));
+    screen.appendChild(pageHead("オンライン対戦", { crumbs: [["ホーム", "menu"]] }));
 
     const hash = location.hash;
     const m = hash.match(/^#online=(.+)$/);
@@ -4376,7 +4685,7 @@
     const m = App.match;
     if (m.mode !== "online") return;
     const dom = App.gameDom;
-    const box = el("div", { class: "card", style: { width: "min(560px,100%)" } });
+    const box = el("div", { class: "card online-share" });
     box.appendChild(el("div", { class: "card-title", text: "手番を相手に送る", style: { fontSize: "14px" } }));
     box.appendChild(el("div", { class: "field-hint", text: "自分の手を指したら、下のリンクをコピーして相手に送ってください。相手がリンクを開いて指すと、また新しいリンクが作られます。" }));
     const shareBox = el("div", { class: "share-box", style: { marginTop: "10px" } });

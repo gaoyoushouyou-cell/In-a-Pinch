@@ -4,27 +4,48 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>挟みゲーム IN A PINCH</title>
-<meta name="description" content="盤上で駒を配置・移動し、相手の駒を挟んで動けなくしたら勝ち。8段階のAI(+専用最強AI「奥義」)、持ち時間つきの対人戦、チュートリアル、戦略コラムを収録したブラウザ版「挟みゲーム」。">
+<meta name="description" content="盤上で駒を配置・移動し、相手の駒を挟んで動けなくしたら勝ち。8段階のAI(+専用最強AI「奥義」)、持ち時間つきの対人戦、チュートリアル、戦略コラム・AIのレベル解説を収録したブラウザ版「挟みゲーム」。">
 <meta name="theme-color" content="#241012">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='16' fill='%23241012'/%3E%3Ctext x='50' y='68' font-size='58' text-anchor='middle' fill='%23C9A227' font-family='serif'%3E%E6%8C%9F%3C/text%3E%3C/svg%3E">
-<link rel="stylesheet" href="styles.css?v=9">
+<link rel="stylesheet" href="styles.css?v=10">
 </head>
 <body>
-<div id="app">
-  <nav class="navbar" id="navbar">
-    <div class="nav-title" id="nav-title">
+<header class="site-header" id="navbar">
+  <div class="site-header-inner">
+    <a class="nav-title" id="nav-title" href="#" aria-label="ホームへ">
       <span class="glyph">挟みゲーム</span>
       <span class="sub">IN A PINCH</span>
-    </div>
-    <button class="btn btn-compact" data-nav="tutorial">チュートリアル</button>
-    <button class="btn btn-compact" data-nav="strategy">戦略コラム</button>
-    <button class="btn btn-compact" data-nav="report">戦術レポート</button>
-    <button class="btn btn-compact" data-nav="tsume">詰めピンチ</button>
-    <button class="btn btn-compact" data-nav="rating">レート</button>
-    <button class="btn btn-compact" data-nav="history">対戦履歴</button>
-    <button class="btn btn-nav btn-compact" data-nav="online">🌐 オンライン対戦</button>
-  </nav>
+    </a>
+    <!-- 広い画面(PC・iPad横)では横一列、狭い画面(スマホ・iPad縦)では「メニュー」ボタンで開く一覧 -->
+    <button class="nav-toggle" id="nav-toggle" type="button" aria-expanded="false" aria-controls="nav-links">
+      <span class="nav-toggle-icon" aria-hidden="true"></span><span class="nav-toggle-text">メニュー</span>
+    </button>
+    <nav class="nav-links" id="nav-links" aria-label="メインメニュー">
+      <div class="nav-group">
+        <span class="nav-group-label">遊ぶ</span>
+        <button class="nav-link" type="button" data-nav="menu">ホーム<span class="nav-note">対局の設定</span></button>
+        <button class="nav-link" type="button" data-nav="tsume">詰めピンチ<span class="nav-note">詰将棋ふうの問題集</span></button>
+        <button class="nav-link nav-link-online" type="button" data-nav="online">オンライン対戦<span class="nav-note">手番リンクを送り合う</span></button>
+      </div>
+      <div class="nav-group">
+        <span class="nav-group-label">学ぶ・読む</span>
+        <button class="nav-link" type="button" data-nav="tutorial">チュートリアル<span class="nav-note">盤を触って覚える12レッスン</span></button>
+        <button class="nav-link nav-wide-only" type="button" data-nav="learn">読みもの</button>
+        <button class="nav-link nav-drawer-only" type="button" data-nav="strategy">戦略コラム<span class="nav-note">勝ち筋のヒント8本</span></button>
+        <button class="nav-link nav-drawer-only" type="button" data-nav="aiguide">AIのレベル解説<span class="nav-note">9段階のAIの違いと選び方</span></button>
+        <button class="nav-link nav-drawer-only" type="button" data-nav="report">戦術レポート<span class="nav-note">データ付きの長文</span></button>
+      </div>
+      <div class="nav-group">
+        <span class="nav-group-label">記録</span>
+        <button class="nav-link" type="button" data-nav="history">対戦履歴<span class="nav-note">感想戦・棋譜のダウンロード</span></button>
+        <button class="nav-link" type="button" data-nav="rating">レート<span class="nav-note">AI戦の成績の推移</span></button>
+      </div>
+    </nav>
+  </div>
+</header>
+<div class="nav-scrim" id="nav-scrim" hidden></div>
 
+<div id="app">
   <main id="screen-root"></main>
 </div>
 
@@ -34,9 +55,9 @@
 <script src="ai.js?v=8"></script>
 <script src="tsume.js?v=1"></script>
 <script src="tsume-data.js?v=1"></script>
-<script src="content.js?v=6"></script>
+<script src="content.js?v=7"></script>
 <script src="tutorial.js?v=1"></script>
 <script src="rating.js?v=1"></script>
-<script src="app.js?v=11"></script>
+<script src="app.js?v=12"></script>
 </body>
 </html>
