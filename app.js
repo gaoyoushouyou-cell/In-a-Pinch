@@ -36,6 +36,19 @@
     try { localStorage.setItem(LS_MENU, JSON.stringify(s)); } catch (e) { /* 同上 */ }
   }
 
+  // 感想戦の表示設定(盤に最善手の矢印を出すか など)
+  const LS_REVIEW = "hasami:review:v1";
+  function loadReviewPrefs() {
+    try { return JSON.parse(localStorage.getItem(LS_REVIEW) || "{}") || {}; } catch (e) { return {}; }
+  }
+  function saveReviewPref(key, value) {
+    try {
+      const prefs = loadReviewPrefs();
+      prefs[key] = value;
+      localStorage.setItem(LS_REVIEW, JSON.stringify(prefs));
+    } catch (e) { /* 保存できなくても致命的ではない */ }
+  }
+
   // ============================================================ 手番・持ち時間の選択肢
   const SIDE_CHOICES = [
     { id: "A", label: "先手" },
@@ -83,7 +96,7 @@
   function initWorker() {
     if (!Worker_) { workerOk = false; return; }
     try {
-      worker = new Worker_("ai-worker.js?v=7");
+      worker = new Worker_("ai-worker.js?v=8");
       worker.onmessage = (e) => {
         if (e.data.reqId !== pendingReqId || e.data.progress != null) return; // 破棄済み(リスタート等)の応答
         if (onWorkerResult) onWorkerResult(e.data);
@@ -196,7 +209,7 @@
     if (evalWorker || !evalWorkerOk) return;
     if (!Worker_) { evalWorkerOk = false; return; }
     try {
-      evalWorker = new Worker_("ai-worker.js?v=7");
+      evalWorker = new Worker_("ai-worker.js?v=8");
       evalWorker.onmessage = (e) => {
         if (!evalReq || e.data.reqId !== evalReq.reqId) return;
         const cb = evalReq.callback;
@@ -240,6 +253,59 @@
   }
 
   function cancelEval() { evalReq = null; }
+
+  // ============================================================ 感想戦の検討(専用 Worker)
+  // 「じっくり読む」(op: "deep")と詰み手順の樹形図(op: "mateTree")。感想戦の解析(evalWorker)と
+  // 並行して動かすので別の Worker にする。新しい要求が来たら読みかけの Worker は止めて作り直す。
+  let studyWorker = null;
+  let studyWorkerOk = true;
+  let studyReq = null; // { reqId, callback }。callback(result, cancelled)
+
+  function requestStudy(op, engine, extra, callback) {
+    cancelStudy();
+    const req = { reqId: reqSeq++, callback };
+    studyReq = req;
+    const payload = Object.assign({ kind: "study", op, reqId: req.reqId, config: engine.config, state: engineSnapshot(engine) }, extra);
+    if (!studyWorker && studyWorkerOk && Worker_) {
+      try {
+        studyWorker = new Worker_("ai-worker.js?v=8");
+        studyWorker.onmessage = (e) => {
+          if (!studyReq || e.data.reqId !== studyReq.reqId) return;
+          const cb = studyReq.callback;
+          studyReq = null;
+          cb(e.data.ok ? e.data.result : null);
+        };
+        studyWorker.onerror = () => {
+          studyWorkerOk = false;
+          studyWorker = null;
+          if (studyReq) { const cb = studyReq.callback; studyReq = null; cb(null); }
+        };
+      } catch (e) {
+        studyWorkerOk = false;
+      }
+    }
+    if (studyWorker) { studyWorker.postMessage(payload); return; }
+    // Worker が使えない環境では、メインスレッドで短めに読む
+    setTimeout(() => {
+      let result = null;
+      try {
+        const eng = rebuildEngineFromState(payload.config, payload.state);
+        result = op === "deep"
+          ? AI.deepAnalyze(eng, extra.template, 1000)
+          : AI.buildMateTree(eng, extra.winner, extra.plies, extra.path, { timeLimit: 3000 });
+      } catch (e) { result = null; }
+      if (studyReq === req) { studyReq = null; callback(result); }
+    }, 30);
+  }
+
+  // 読みかけの要求を取り消す(呼び出し側の後片づけのため callback(null, true) を呼ぶ)
+  function cancelStudy() {
+    const old = studyReq;
+    if (!old) return;
+    studyReq = null;
+    if (studyWorker) { studyWorker.terminate(); studyWorker = null; }
+    old.callback(null, true);
+  }
 
   // ============================================================ 汎用ヘルパー
   function el(tag, attrs, children) {
@@ -365,6 +431,7 @@
   function render(payload) {
     clearNode(root);
     App.onlineRefreshLink = null; // 前の画面の手番リンク更新フックは無効化する
+    cancelStudy(); // 感想戦の検討(じっくり読む・詰み手順)の読みかけは画面を作り直したら捨てる
     const renderers = {
       menu: renderMenu, game: renderGame, tutorial: renderTutorial, strategy: renderStrategy,
       report: renderReport, history: renderHistory, review: renderReview, online: renderOnline,
@@ -1215,7 +1282,7 @@
     const board = TSUME_GEN_BOARDS.find((b) => b.key === App.tsumeGen.board);
     const len = TSUME_GEN_LENGTHS.find((l) => l.key === App.tsumeGen.length);
     let w;
-    try { w = new Worker_("ai-worker.js?v=7"); } catch (e) { toast("自動作問を開始できませんでした(ローカルサーバー経由で開いてください)"); return; }
+    try { w = new Worker_("ai-worker.js?v=8"); } catch (e) { toast("自動作問を開始できませんでした(ローカルサーバー経由で開いてください)"); return; }
     tsumeGenWorker = w;
     btn.disabled = true;
     status.textContent = "作問中…(AI同士の対局から詰み局面を探しています)";
@@ -2935,7 +3002,7 @@
     return new Promise((resolve) => {
       if (!bgWorker && bgWorkerOk && Worker_) {
         try {
-          bgWorker = new Worker_("ai-worker.js?v=7");
+          bgWorker = new Worker_("ai-worker.js?v=8");
           bgWorker.onmessage = (e) => {
             const cb = bgPending.get(e.data.reqId);
             if (cb) { bgPending.delete(e.data.reqId); cb(e.data.ok ? e.data.result : null); }
@@ -3278,6 +3345,22 @@
     render();
   }
 
+  // 感想戦の盤に描く1局面ぶんの情報(本譜の各手と、検討の変化手順の局面で共通)
+  function frameSnapshot(engine, desc, lastAction) {
+    const board = new Map();
+    for (const [pos, pid] of engine.board) board.set(pos, engine.pieces.get(pid).player);
+    return {
+      board,
+      obligated: {
+        A: engine.obligated.A.map((pid) => engine.pieces.get(pid).position),
+        B: engine.obligated.B.map((pid) => engine.pieces.get(pid).position),
+      },
+      currentPlayer: engine.currentPlayer, winner: engine.winner, isDraw: engine.isDraw,
+      desc, lastAction: lastAction || null,
+      engineClone: engine.clone(), // 「この局面から対局を再開する」機能・検討の読みのために保持しておく
+    };
+  }
+
   function rebuildFramesFromRecord(record) {
     const config = makeConfig({
       rows: record.rows, cols: record.cols, moveRange: record.moveRange,
@@ -3286,20 +3369,7 @@
     const engine = new GameEngine(config);
     engine.stock.A = record.stockA;
     engine.stock.B = record.stockB;
-    function snapshot(desc, lastAction) {
-      const board = new Map();
-      for (const [pos, pid] of engine.board) board.set(pos, engine.pieces.get(pid).player);
-      return {
-        board,
-        obligated: {
-          A: engine.obligated.A.map((pid) => engine.pieces.get(pid).position),
-          B: engine.obligated.B.map((pid) => engine.pieces.get(pid).position),
-        },
-        currentPlayer: engine.currentPlayer, winner: engine.winner, isDraw: engine.isDraw,
-        desc, lastAction: lastAction || null,
-        engineClone: engine.clone(), // 「この局面から対局を再開する」機能のために保持しておく
-      };
-    }
+    const snapshot = (desc, lastAction) => frameSnapshot(engine, desc, lastAction);
     const frames = [snapshot("対局開始", null)];
     for (const mv of record.moves) {
       try {
@@ -3456,13 +3526,20 @@
     graphCard.appendChild(svg);
     graphCard.appendChild(el("div", { class: "review-graph-legend" }, [
       el("span", { text: `上: ${nameOf("A")}(先手)優勢 / 下: ${nameOf("B")}(後手)優勢` }),
-      el("span", {}, [el("i", { class: "mk mk-big" }), document.createTextNode("悪手・大悪手 "), el("i", { class: "mk mk-small" }), document.createTextNode("疑問手")]),
+      el("span", {}, [
+        el("i", { class: "mk mk-big" }), document.createTextNode("悪手・大悪手 "),
+        el("i", { class: "mk mk-small" }), document.createTextNode("疑問手 "),
+        el("i", { class: "mk mk-mate" }), document.createTextNode("詰みを読み切り"),
+      ]),
     ]));
     screen.appendChild(graphCard);
 
+    // 検討の変化手順(詰み手順の樹形図で選んだ局面)を盤に出している間の帯
+    const varBanner = el("div", { class: "var-banner", style: { display: "none" } });
+    screen.appendChild(varBanner);
     const boardWrap = el("div", { class: "board-wrap" });
     const size = record.rows;
-    const { boardFrame, cellNodes, piecesLayer } = buildBoardShell(size, {});
+    const { boardFrame, cellNodes, piecesLayer, fxLayer } = buildBoardShell(size, { fx: true });
     boardWrap.appendChild(boardFrame);
     screen.appendChild(boardWrap);
 
@@ -3481,8 +3558,13 @@
     const jumpBar = el("div", { class: "review-toolbar" });
     const prevBad = el("button", { class: "btn btn-compact", text: "◀ 前の疑問手・悪手" });
     const nextBad = el("button", { class: "btn btn-compact", text: "次の疑問手・悪手 ▶" });
-    jumpBar.appendChild(prevBad); jumpBar.appendChild(nextBad);
+    const nextMate = el("button", { class: "btn btn-compact", text: "◆ 詰みを読み切った局面へ" });
+    jumpBar.appendChild(prevBad); jumpBar.appendChild(nextBad); jumpBar.appendChild(nextMate);
     screen.appendChild(jumpBar);
+
+    // AIの検討: 最善手・読み筋・詰み手順の樹形図
+    const studyCard = el("div", { class: "study-card" });
+    screen.appendChild(studyCard);
 
     const resumeBtn = el("button", { class: "btn btn-compact", text: "この局面から対局を再開する", onclick: () => openResumeSetup(record, frames, index) });
     screen.appendChild(resumeBtn);
@@ -3529,6 +3611,14 @@
         return node;
       };
       mk("rect", { x: 0, y: 0, width: GW, height: GH, class: "g-bg" });
+      // 詰みを読み切った局面の範囲を帯で強調する(先手の詰みは上端、後手の詰みは下端に濃い印)
+      const half = GW / n / 2;
+      const runs = mateRuns();
+      for (const run of runs) {
+        const x0 = Math.max(0, x(run.start) - half), x1 = Math.min(GW, x(run.end) + half);
+        mk("rect", { x: x0, y: 0, width: Math.max(2, x1 - x0), height: GH, class: "g-mate" });
+        mk("rect", { x: x0, y: run.side === "A" ? 0 : GH - 5, width: Math.max(2, x1 - x0), height: 5, class: "g-mate-edge" });
+      }
       // 読み終えた先頭からの連続部分だけを線にする
       let upto = -1;
       while (upto + 1 < results.length && results[upto + 1]) upto++;
@@ -3542,6 +3632,13 @@
         area += ` L ${x(upto)} ${y(0)} Z`;
         mk("path", { d: area, class: "g-area" });
         mk("path", { d: line, class: "g-line", "vector-effect": "non-scaling-stroke" });
+      }
+      // 詰みの範囲の線は金色で重ね、読み切った最初の局面に縦線を引く
+      for (const run of runs) {
+        let d = "";
+        for (let i = run.start; i <= run.end; i++) d += `${i === run.start ? "M" : " L"} ${x(i)} ${y(winAAt(i))}`;
+        if (run.end > run.start) mk("path", { d, class: "g-line-mate", "vector-effect": "non-scaling-stroke" });
+        mk("line", { x1: x(run.start), x2: x(run.start), y1: 0, y2: GH, class: "g-mate-start", "vector-effect": "non-scaling-stroke" });
       }
       mk("line", { x1: 0, x2: GW, y1: y(0.5), y2: y(0.5), class: "g-mid", "vector-effect": "non-scaling-stroke" });
       mk("line", { x1: x(index), x2: x(index), y1: 0, y2: GH, class: "g-cursor", "vector-effect": "non-scaling-stroke" });
@@ -3571,6 +3668,14 @@
           el("span", { class: "review-avg", text: `平均損失 ${(avg * 100).toFixed(1)}%` }),
         ]));
       }
+      const runs = mateRuns();
+      if (runs.length) {
+        const parts = runs.map((run) => {
+          const r = posInfo(run.start);
+          return `${nameOf(run.side)} ${run.start}手目〜(読み切った時点であと${r.matePlies}手)`;
+        });
+        summary.appendChild(el("div", { class: "review-mate-line", text: `◆ 詰みの読み切り: ${parts.join(" / ")}` }));
+      }
     }
 
     function drawTags() {
@@ -3580,12 +3685,13 @@
         item.tag.textContent = j && j.label ? ` ${j.mark} ${j.label} −${Math.floor(j.loss * 100)}%` : "";
         item.li.classList.toggle("is-bad", !!(j && j.mark && j.mark !== "?!"));
         item.li.classList.toggle("is-dubious", !!(j && j.mark === "?!"));
+        item.li.classList.toggle("is-mate", !!mateAt(k + 1));
       });
     }
 
     function drawVerdict() {
       clearNode(verdict);
-      const r = results[index];
+      const r = posInfo(index); // じっくり読んだ局面はその結果を出す
       let text;
       if (!r) text = "形勢: 解析中…";
       else if (r.final) text = frames[index].winner ? `${nameOf(frames[index].winner)}の勝ち` : "引き分け";
@@ -3610,15 +3716,438 @@
       verdict.appendChild(el("div", { class: `review-judge ${cls}`, text: line }));
     }
 
+    // ---- AIの検討(最善手・読み筋・詰み手順の樹形図) ----
+    const deepCache = new Map(); // 局面番号 → じっくり読んだ結果(deepAnalyze)
+    const treeCache = new Map(); // 局面番号 → { status: "loading" | "ready" | "failed", data, reason, rev, expanding }
+    let deepLoading = null;      // じっくり読んでいる局面番号
+    let treeOpen = false;        // 樹形図を開いている(詰みのある別の局面へ移っても開いたまま)
+    let varPath = null;          // 樹形図で選んだ手までのノード列(根の次の手から)。null なら本譜を表示
+    let shownIndex = -1;
+    let studySig = "";
+    let showBest = loadReviewPrefs().showBest !== false;
+    let treeDisp = new Map();    // 樹形図のノード → 表示用ノード(まとめた受けの手の一覧を引くため)
+
+    // i手目の局面の解析結果(じっくり読んだ結果があればそちら)
+    function posInfo(i) { return deepCache.get(i) || results[i] || null; }
+    function winAAt(i) { const r = posInfo(i); return r ? r.winA : 0.5; }
+
+    // i手目の局面で詰みを読み切っていれば勝つ側("A"/"B")。終局の局面は、直前から続く詰みの続きのときだけ数える
+    function mateAt(i) {
+      const r = posInfo(i);
+      if (!r || !r.mate) return null;
+      if (r.final) return i > 0 && mateAt(i - 1) === r.mate ? r.mate : null;
+      return r.mate;
+    }
+
+    // 詰みを読み切った局面の連続する範囲 [{ start, end, side }]
+    function mateRuns() {
+      const runs = [];
+      for (let i = 0; i < frames.length; i++) {
+        const side = mateAt(i);
+        if (!side) continue;
+        const last = runs[runs.length - 1];
+        if (last && last.side === side && last.end === i - 1) last.end = i;
+        else runs.push({ start: i, end: i, side });
+      }
+      return runs;
+    }
+
+    function moveText(n) { return bestMoveText([n.from, n.to]); }
+
+    // 樹形図で選んだ手順を本譜の局面に並べた局面。並べられなければ null
+    function variationFrame(path) {
+      const engine = frames[index].engineClone.clone();
+      let lastAction = null, lastResult = null;
+      try {
+        for (const n of path) {
+          const to = posFromLabel(n.to);
+          if (n.from) {
+            const from = posFromLabel(n.from);
+            lastResult = engine.movePiece(engine.currentPlayer, engine.pieceAt(from).id, to);
+            lastAction = { from, to };
+          } else {
+            lastResult = engine.placePiece(engine.currentPlayer, to);
+            lastAction = { from: null, to };
+          }
+        }
+      } catch (e) { return null; }
+      const sand = lastResult ? lastResult.newlySandwiched.map((pid) => posLabel(engine.pieces.get(pid).position)) : [];
+      return { frame: frameSnapshot(engine, "", lastAction), sand, node: path[path.length - 1] };
+    }
+
+    // 選んだ手の次の手(本線 = 先頭の枝)。path が null なら根の次の手
+    function nextInLine(path) {
+      const t = treeCache.get(index);
+      if (!t || t.status !== "ready") return null;
+      const node = path ? path[path.length - 1] : null;
+      if (node && (node.pending || node.end)) return null;
+      const kids = node ? node.kids : t.data.kids;
+      return kids && kids.length ? kids[0] : null;
+    }
+
+    // 盤の矢印: 本譜では最善手、変化手順では次の手(本線)
+    function drawArrow(variation) {
+      clearNode(fxLayer);
+      let move = null, side = null;
+      if (variation) {
+        const next = nextInLine(varPath);
+        if (next && !variation.frame.winner) { move = [next.from, next.to]; side = next.side; }
+      } else if (showBest) {
+        const frame = frames[index];
+        const r = posInfo(index);
+        if (r && r.best && !frame.winner && !frame.isDraw) { move = r.best; side = frame.currentPlayer; }
+      }
+      if (!move) return;
+      const NS = "http://www.w3.org/2000/svg";
+      const add = (parent, tag, attrs) => {
+        const node = document.createElementNS(NS, tag);
+        for (const k in attrs) node.setAttribute(k, attrs[k]);
+        parent.appendChild(node);
+        return node;
+      };
+      const cell = 100 / size;
+      const center = (label) => { const [r, c] = posFromLabel(label); return [(c + 0.5) * cell, (r + 0.5) * cell]; };
+      const g = add(fxLayer, "g", { class: `best-arrow side-${side.toLowerCase()}` });
+      const [tx, ty] = center(move[1]);
+      const sw = cell * 0.11;
+      if (move[0]) {
+        const [fx, fy] = center(move[0]);
+        const len = Math.hypot(tx - fx, ty - fy) || 1;
+        const ux = (tx - fx) / len, uy = (ty - fy) / len;
+        const head = cell * 0.34;
+        const hx = tx - ux * cell * 0.04, hy = ty - uy * cell * 0.04; // 矢じりの先
+        const bx = hx - ux * head, by = hy - uy * head;                // 矢じりの付け根
+        const px = -uy * head * 0.62, py = ux * head * 0.62;
+        add(g, "line", { x1: fx + ux * cell * 0.3, y1: fy + uy * cell * 0.3, x2: bx, y2: by, "stroke-width": sw, class: "arrow-shaft" });
+        add(g, "polygon", { points: `${hx},${hy} ${bx + px},${by + py} ${bx - px},${by - py}`, class: "arrow-head" });
+      } else {
+        const s = cell * 0.14;
+        add(g, "circle", { cx: tx, cy: ty, r: cell * 0.32, "stroke-width": sw * 0.8, class: "arrow-ring" });
+        add(g, "path", { d: `M ${tx - s} ${ty} H ${tx + s} M ${tx} ${ty - s} V ${ty + s}`, "stroke-width": sw * 0.8, class: "arrow-plus" });
+      }
+    }
+
+    function drawVarBanner(variation) {
+      clearNode(varBanner);
+      if (!variation) { varBanner.style.display = "none"; return; }
+      varBanner.style.display = "";
+      let text = `検討中の変化: ${index}手目の局面から${varPath.length}手進めた局面`;
+      if (variation.frame.winner) text += ` ― ${nameOf(variation.frame.winner)}の勝ち(詰み)`;
+      else text += `(あと${variation.node.mate}手で詰み)`;
+      varBanner.appendChild(el("span", { text }));
+      varBanner.appendChild(el("button", { class: "btn btn-compact", text: "本譜に戻る", onclick: () => { varPath = null; renderFrame(); } }));
+    }
+
+    function runDeep(i) {
+      deepLoading = i;
+      requestStudy("deep", frames[i].engineClone, { template: recordUsesTemplate(record), timeBudget: AI.DEEP_TIME_BUDGET }, (res, cancelled) => {
+        if (deepLoading === i) deepLoading = null;
+        if (cancelled) return;
+        if (res) {
+          const tree = res.tree;
+          delete res.tree;
+          deepCache.set(i, res);
+          // 詰み探索で見つけた詰みは樹形図も一緒に届く。それ以外は詰みの手数が変わりうるので作り直す
+          if (tree) treeCache.set(i, { status: "ready", data: tree, rev: 0 });
+          else treeCache.delete(i);
+        }
+        refreshAll();
+      });
+      renderFrame();
+    }
+
+    function ensureTree(i) {
+      const r = posInfo(i);
+      if (treeCache.has(i) || !r || !r.mate || r.final) return;
+      treeCache.set(i, { status: "loading", rev: 0 });
+      // AIの評価の手数より長い詰み方しか示せないこともあるので、上限には少し余裕を持たせる
+      requestStudy("mateTree", frames[i].engineClone, { winner: r.mate, plies: r.matePlies + 4, path: [] }, (res, cancelled) => {
+        if (cancelled) { treeCache.delete(i); return; }
+        treeCache.set(i, res && res.ok
+          ? { status: "ready", data: res, rev: 0 }
+          : { status: "failed", reason: res ? res.reason : "error", rev: 0 });
+        if (index === i) renderFrame();
+      });
+    }
+
+    // 枝が多くて展開を後回しにしたノード(pending)の続きを読む
+    function expandNode(path) {
+      const i = index;
+      const t = treeCache.get(i);
+      const node = path[path.length - 1];
+      if (!t || t.expanding) return;
+      t.expanding = node; t.rev++;
+      requestStudy("mateTree", frames[i].engineClone, { winner: posInfo(i).mate, plies: node.mate, path: path.map((n) => [n.from, n.to]) }, (res, cancelled) => {
+        t.expanding = null; t.rev++;
+        if (cancelled) return;
+        if (res && res.ok) { node.kids = res.kids; node.pending = false; } else node.failed = true;
+        if (index === i) renderFrame();
+      });
+      renderFrame();
+    }
+
+    function drawStudy() {
+      const frame = frames[index];
+      const r = posInfo(index);
+      if (treeOpen && r && r.mate && !frame.winner && deepLoading == null) ensureTree(index); // じっくり読んでいる間は待つ
+      const tree = treeCache.get(index);
+      const sig = [index, r ? [r.best && r.best.join(), r.mate, r.matePlies, r.deep, r.depth].join() : "-", deepLoading, treeOpen,
+        tree ? `${tree.status}${tree.rev}` : "-", showBest, varPath ? varPath.map((n) => n.from + n.to).join(",") : ""].join("|");
+      if (sig === studySig) return;
+      studySig = sig;
+      const oldScroll = studyCard.querySelector(".mate-tree-scroll");
+      const keep = oldScroll ? [oldScroll.scrollLeft, oldScroll.scrollTop] : null;
+      clearNode(studyCard);
+
+      const bestCheck = el("input", { type: "checkbox" });
+      bestCheck.checked = showBest;
+      bestCheck.addEventListener("change", () => { showBest = bestCheck.checked; saveReviewPref("showBest", showBest); renderFrame(); });
+      studyCard.appendChild(el("div", { class: "study-head" }, [
+        el("span", { class: "study-title", text: "AIの検討" }),
+        el("label", { class: "study-check" }, [bestCheck, document.createTextNode("盤に最善手を矢印で表示")]),
+      ]));
+      if (frame.winner || frame.isDraw) {
+        studyCard.appendChild(el("div", { class: "study-muted", text: "対局が終わった局面です。前の局面に戻ると、その局面の最善手や詰み手順を見られます。" }));
+        return;
+      }
+
+      const bestRow = el("div", { class: "study-best" });
+      if (!r) {
+        bestRow.appendChild(el("span", { class: "study-muted", text: "この局面はまだ解析中です(「じっくり読む」ですぐに読むこともできます)。" }));
+      } else if (r.best) {
+        bestRow.appendChild(document.createTextNode(`最善手(${nameOf(frame.currentPlayer)}の番): `));
+        bestRow.appendChild(el("b", { text: bestMoveText(r.best) }));
+        const how = r.mateBy ? "詰み探索で発見" : `読みの深さ ${r.depth}手`;
+        bestRow.appendChild(el("span", { class: "study-muted", text: `  ${r.deep ? "じっくり読み" : "解析"}・${how}` }));
+      } else {
+        bestRow.appendChild(el("span", { class: "study-muted", text: "最善手を読み切れませんでした。" }));
+      }
+      studyCard.appendChild(bestRow);
+
+      if (r && r.pv && r.pv.length > 1) {
+        const pv = el("div", { class: "study-pv" }, [el("span", { class: "study-muted", text: "読み筋:" })]);
+        let side = frame.currentPlayer;
+        r.pv.forEach((mv) => {
+          pv.appendChild(el("span", { class: `pv-chip side-${side.toLowerCase()}`, text: bestMoveText(mv), title: nameOf(side) }));
+          side = otherPlayer(side);
+        });
+        studyCard.appendChild(pv);
+      }
+
+      const deepBtn = el("button", {
+        class: "btn btn-compact",
+        text: deepLoading === index ? "読んでいます…" : (r && r.deep ? "じっくり読みました" : `じっくり読む(${AI.DEEP_TIME_BUDGET / 1000}秒・読み筋つき)`),
+        onclick: () => runDeep(index),
+      });
+      deepBtn.disabled = deepLoading === index || !!(r && r.deep);
+      studyCard.appendChild(el("div", { class: "study-actions" }, [deepBtn]));
+
+      if (r && r.mate) {
+        studyCard.appendChild(el("div", { class: "study-mate" }, [
+          el("span", { text: `◆ ${nameOf(r.mate)}の勝ちを読み切り ― あと${r.matePlies}手で詰み` }),
+          el("button", {
+            class: "btn btn-compact", text: treeOpen ? "樹形図を閉じる" : "詰み手順を見る(樹形図)",
+            onclick: () => { treeOpen = !treeOpen; if (!treeOpen) varPath = null; renderFrame(); },
+          }),
+        ]));
+        if (treeOpen) drawTreeArea(r, tree, keep);
+      }
+    }
+
+    function drawTreeArea(r, tree, keep) {
+      const area = el("div", { class: "mate-tree-area" });
+      studyCard.appendChild(area);
+      if (!tree || tree.status === "loading") {
+        area.appendChild(el("div", { class: "study-muted", text: "詰み手順を組み立てています…(受けの手をすべて確かめるので、数秒かかることがあります)" }));
+        return;
+      }
+      if (tree.status === "failed") {
+        area.appendChild(el("div", { class: "study-muted", text: tree.reason === "timeout"
+          ? "詰み手順の組み立てが時間内に終わりませんでした(受けの手が多すぎる局面です)。"
+          : "この局面の詰みは、受けの手を1つずつ確かめる探索では示しきれませんでした。" }));
+        area.appendChild(el("div", { class: "study-muted", text: r.pv && r.pv.length > 1
+          ? "上の「読み筋」が、AIが詰みと読んだ本線です。"
+          : "「じっくり読む」を押すと、AIが詰みと読んだ本線(読み筋)を表示します。" }));
+        return;
+      }
+      const data = tree.data;
+      const winner = r.mate;
+      let head = `${nameOf(winner)}の詰み手順(${data.mate}手)。縦に並んだ枝は${nameOf(otherPlayer(winner))}の受けの候補で、上ほど長く粘る受けです。`;
+      if (data.mate > r.matePlies) head += `(AIの評価では最短${r.matePlies}手ですが、ここでは1手ずつ確かめられた手順を示しています)`;
+      area.appendChild(el("div", { class: "mt-head", text: head }));
+      const scroll = el("div", { class: "mate-tree-scroll" }, [buildTreeSvg(data, winner)]);
+      area.appendChild(scroll);
+      if (keep) { scroll.scrollLeft = keep[0]; scroll.scrollTop = keep[1]; }
+      // 選んだ手が見えるところまで(必要なぶんだけ)スクロールする
+      const selRect = scroll.querySelector(".mt-node.is-sel rect");
+      if (selRect) {
+        const x = +selRect.getAttribute("x"), y = +selRect.getAttribute("y");
+        const w = +selRect.getAttribute("width"), h = +selRect.getAttribute("height");
+        if (x + w > scroll.scrollLeft + scroll.clientWidth) scroll.scrollLeft = x + w + 12 - scroll.clientWidth;
+        if (x < scroll.scrollLeft) scroll.scrollLeft = Math.max(0, x - 12);
+        if (y + h > scroll.scrollTop + scroll.clientHeight) scroll.scrollTop = y + h + 12 - scroll.clientHeight;
+        if (y < scroll.scrollTop) scroll.scrollTop = Math.max(0, y - 12);
+      }
+      area.appendChild(treeInfo(winner));
+
+      const back = el("button", { class: "btn btn-compact", text: "◀ 1手戻る", onclick: () => { varPath = varPath.length > 1 ? varPath.slice(0, -1) : null; renderFrame(); } });
+      back.disabled = !varPath;
+      const next = nextInLine(varPath);
+      const fwd = el("button", { class: "btn btn-compact", text: "1手進む ▶", onclick: () => { varPath = (varPath || []).concat([next]); renderFrame(); } });
+      fwd.disabled = !next;
+      const toEnd = el("button", { class: "btn btn-compact", text: "本線を詰みまで ▶▶", onclick: () => {
+        let p = varPath || [], n;
+        while ((n = nextInLine(p.length ? p : null))) p = p.concat([n]);
+        varPath = p.length ? p : null;
+        renderFrame();
+      } });
+      toEnd.disabled = !next;
+      area.appendChild(el("div", { class: "mt-steps" }, [back, fwd, toEnd]));
+    }
+
+    // 樹形図で選んでいる手の説明
+    function treeInfo(winner) {
+      const info = el("div", { class: "mt-info" });
+      if (!varPath) {
+        info.textContent = "手をクリック(タップ)すると、その局面を盤に表示します。金の枠が詰みの局面です。";
+        return info;
+      }
+      const node = varPath[varPath.length - 1];
+      const line = el("div", { class: "study-pv" });
+      varPath.forEach((n, k) => {
+        if (k) line.appendChild(el("span", { class: "study-muted", text: "→" }));
+        line.appendChild(el("span", { class: `pv-chip side-${n.side.toLowerCase()}`, text: moveText(n), title: nameOf(n.side) }));
+      });
+      info.appendChild(line);
+      const v = variationFrame(varPath);
+      let text = `${nameOf(node.side)}が${moveText(node)}`;
+      if (v && v.sand.length) text += `(${v.sand.join("・")}を挟む)`;
+      text += node.end
+        ? `。${nameOf(otherPlayer(node.side))}は動かせる駒がなくなり、${nameOf(node.side)}の勝ち(詰み)です。`
+        : `。ここから${node.mate}手で詰みます。`;
+      info.appendChild(el("div", { text }));
+      const d = treeDisp.get(node);
+      if (d && d.alts.length > 1) {
+        const reply = node.kids[0];
+        info.appendChild(el("div", { class: "study-muted", text: `この局面の受けは ${d.alts.map(moveText).join(" / ")} のどれを選んでも、次の${moveText(reply)}で詰みます(樹形図では1つにまとめています)。` }));
+      }
+      return info;
+    }
+
+    // 受けの手のうち、同じ返し手でその場で詰むもの同士は1つの表示にまとめる
+    function displayKids(kids, winner) {
+      const out = [], groups = new Map();
+      for (const k of kids) {
+        const reply = k.side !== winner && k.kids && k.kids.length === 1 ? k.kids[0] : null;
+        if (reply && reply.end) {
+          const key = reply.from + ">" + reply.to;
+          const g = groups.get(key);
+          if (g) { g.alts.push(k); continue; }
+          const d = { node: k, alts: [k] };
+          groups.set(key, d);
+          out.push(d);
+        } else {
+          out.push({ node: k, alts: [k] });
+        }
+      }
+      return out;
+    }
+
+    // 樹形図(左が今の局面、右へ行くほど先の手)。本線は1行目にまっすぐ並べる
+    function buildTreeSvg(data, winner) {
+      const COL = 118, CW = 104, CH = 24, ROW = 32, PAD = 8;
+      const NS = "http://www.w3.org/2000/svg";
+      const t = treeCache.get(index);
+      let rows = 0, maxDepth = 0;
+      treeDisp = new Map();
+      const root = { node: null, alts: [], parent: null };
+      (function lay(d, depth) {
+        d.depth = depth;
+        maxDepth = Math.max(maxDepth, depth);
+        const raw = d.node ? d.node.kids : data.kids;
+        d.kids = d.node && d.node.pending ? [] : displayKids(raw || [], winner);
+        d.kids.forEach((k) => { k.parent = d; treeDisp.set(k.node, k); });
+        if (d.node && d.node.pending) { maxDepth = Math.max(maxDepth, depth + 1); d.row = rows++; return; }
+        if (!d.kids.length) { d.row = rows++; return; }
+        d.kids.forEach((k) => lay(k, depth + 1));
+        d.row = d.kids[0].row;
+      })(root, 0);
+
+      const W = PAD * 2 + maxDepth * COL + CW, Hh = PAD * 2 + (rows - 1) * ROW + CH;
+      const svg = document.createElementNS(NS, "svg");
+      svg.setAttribute("class", "mate-tree");
+      svg.setAttribute("width", W); svg.setAttribute("height", Hh);
+      svg.setAttribute("viewBox", `0 0 ${W} ${Hh}`);
+      svg.setAttribute("role", "group");
+      svg.setAttribute("aria-label", "詰み手順の樹形図");
+      const add = (parent, tag, attrs, text) => {
+        const node = document.createElementNS(NS, tag);
+        for (const k in attrs) node.setAttribute(k, attrs[k]);
+        if (text != null) node.textContent = text;
+        parent.appendChild(node);
+        return node;
+      };
+      const onPath = new Set(varPath || []);
+      const sel = varPath ? varPath[varPath.length - 1] : null;
+      const xy = (depth, row) => [PAD + depth * COL, PAD + row * ROW];
+      const pathTo = (d) => { const p = []; for (let x = d; x && x.node; x = x.parent) p.unshift(x.node); return p; };
+      const links = add(svg, "g", {});
+      const nodes = add(svg, "g", {});
+
+      function link(d1, depth2, row2, lit) {
+        const [x1, y1] = xy(d1.depth, d1.row);
+        const [x2, y2] = xy(depth2, row2);
+        const xm = x1 + CW + (COL - CW) / 2;
+        add(links, "path", { d: `M ${x1 + CW} ${y1 + CH / 2} H ${xm} V ${y2 + CH / 2} H ${x2}`, class: `mt-link${lit ? " on-path" : ""}` });
+      }
+
+      function chip(depth, row, cls, label, tag, title, onClick) {
+        const [x, y] = xy(depth, row);
+        const g = add(nodes, "g", { class: `mt-node ${cls}`, tabindex: "0", role: "button" });
+        add(g, "title", {}, title);
+        add(g, "rect", { x, y, width: CW, height: CH, rx: 5 });
+        if (cls.includes("side-")) add(g, "circle", { class: "dot", cx: x + 11, cy: y + CH / 2, r: 4.5 });
+        const text = add(g, "text", { x: cls.includes("side-") ? x + 21 : x + CW / 2, y: y + CH / 2 + 4, "text-anchor": cls.includes("side-") ? "start" : "middle" }, label);
+        if (tag) add(text, "tspan", { class: "tag" }, tag);
+        g.addEventListener("click", onClick);
+        g.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onClick(); } });
+      }
+
+      // 読み上げの順が本線→他の受けになるよう、親のノードを先に描く(線は別のグループ)
+      (function draw(d) {
+        drawChip(d);
+        if (d.node && d.node.pending) link(d, d.depth + 1, d.row, false);
+        for (const k of d.kids) { link(d, k.depth, k.row, onPath.has(k.node)); draw(k); }
+      })(root);
+      return svg;
+
+      function drawChip(d) {
+        if (!d.node) {
+          chip(0, d.row, `is-root${varPath ? "" : " is-sel"}`, `${index}手目の局面`, null,
+            `${index}手目の局面(${nameOf(frames[index].currentPlayer)}の番)。クリックで最初に戻る`, () => { varPath = null; renderFrame(); });
+          return;
+        }
+        const n = d.node;
+        const cls = [`side-${n.side.toLowerCase()}`, n.end ? "is-end" : "", onPath.has(n) ? "on-path" : "", n === sel ? "is-sel" : ""].join(" ");
+        const extra = d.alts.length > 1 ? ` 他${d.alts.length - 1}` : (n.end ? " 詰み" : null);
+        let title = `${nameOf(n.side)}: ${d.alts.map(moveText).join(" / ")}`;
+        title += n.end ? "(詰み)" : `(このあと${n.mate}手で詰み)`;
+        chip(d.depth, d.row, cls, moveText(n), extra, title, () => { varPath = pathTo(d); renderFrame(); });
+        if (n.pending) {
+          const busy = t && t.expanding === n;
+          chip(d.depth + 1, d.row, "is-pending", busy ? "読んでいます…" : (n.failed ? "読み切れず" : "続きを読む…"), null,
+            "枝が多いので後回しにした続きを読みます", () => { if (!n.failed) expandNode(pathTo(d)); });
+        }
+      }
+    }
+
     function badIndices() {
       const out = [];
       judgedMoves().forEach((j, k) => { if (j && j.mark) out.push(k + 1); });
       return out;
     }
 
-    function renderFrame() {
-      index = Math.max(0, Math.min(frames.length - 1, index));
-      const frame = frames[index];
+    function paintBoard(frame) {
       clearNode(piecesLayer);
       for (let r = 0; r < size; r++) for (let c = 0; c < size; c++) cellNodes[r][c].classList.remove("is-last");
       const obligatedPositions = new Set();
@@ -3636,6 +4165,17 @@
         const to = frame.lastAction.to;
         cellNodes[to[0]][to[1]].classList.add("is-last");
       }
+    }
+
+    function renderFrame() {
+      index = Math.max(0, Math.min(frames.length - 1, index));
+      if (index !== shownIndex) { varPath = null; shownIndex = index; } // 本譜の手を移ったら変化手順の表示はやめる
+      const frame = frames[index];
+      const variation = varPath ? variationFrame(varPath) : null;
+      if (!variation) varPath = null;
+      paintBoard(variation ? variation.frame : frame);
+      drawArrow(variation);
+      drawVarBanner(variation);
       desc.textContent = frame.desc;
       step.textContent = `${index} / ${frames.length - 1} 手`;
       first.disabled = prev.disabled = index === 0;
@@ -3644,9 +4184,11 @@
       const bad = badIndices();
       prevBad.disabled = !bad.some((i) => i < index);
       nextBad.disabled = !bad.some((i) => i > index);
+      nextMate.disabled = !mateRuns().some((run) => run.start !== index);
       Array.from(list.children).forEach((li, i) => li.classList.toggle("is-current", i === index));
       drawVerdict();
       drawGraph();
+      drawStudy();
     }
     first.addEventListener("click", () => { index = 0; renderFrame(); });
     prev.addEventListener("click", () => { index--; renderFrame(); });
@@ -3659,6 +4201,12 @@
     nextBad.addEventListener("click", () => {
       const b = badIndices().find((i) => i > index);
       if (b != null) { index = b; renderFrame(); }
+    });
+    nextMate.addEventListener("click", () => {
+      const starts = mateRuns().map((run) => run.start).filter((i) => i !== index);
+      if (!starts.length) return;
+      index = starts.find((i) => i > index) != null ? starts.find((i) => i > index) : starts[0]; // 最後まで行ったら先頭へ
+      renderFrame();
     });
 
     function refreshAll() { drawSummary(); drawTags(); renderFrame(); }

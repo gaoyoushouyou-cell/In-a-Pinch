@@ -590,6 +590,65 @@ function refDistance(engine, solver, maxPlies, quiet) {
     AI.MOVE_JUDGE_LEVELS.map((l) => `${l.min}${l.label}${l.mark}`).join() === "0.3大悪手??,0.15悪手?,0.08疑問手?!");
 })();
 
+// ---- 16b. 感想戦の検討: 詰み手順の樹形図・じっくり読む(ブラウザ版のみ) ----
+(function () {
+  // 10b (3) と同じ実戦の3手詰め(B が B4→C4 から詰ませる)
+  const e = new H.GameEngine(H.makeConfig({ rows: 7, cols: 7, moveRange: 3, wallSandwich: true, contactLimit: 3 }));
+  e.stock.A = 15; e.stock.B = 15;
+  const play = (eng, fr, to) => {
+    const cur = eng.currentPlayer;
+    const act = AI.generateActions(eng, cur).find((a) => { const l = AI.actionLabels(eng, a); return l[0] === fr && l[1] === to; });
+    AI.applyAction(eng, cur, act);
+  };
+  for (const [fr, to] of [["", "E5"], ["", "D6"], ["", "C3"], ["", "B3"], ["", "D4"], ["", "E3"], ["", "D2"], ["", "C2"], ["D2", "D3"], ["", "B4"], ["D3", "D2"]]) play(e, fr, to);
+  const key0 = e._stateKey();
+
+  // 樹形図を GameEngine だけでたどり直す: 葉はすべて勝つ側の勝ち、受け方の手番では合法手がすべて枝になっている
+  function verifyTree(eng, winner, kids) {
+    let leaves = 0, ok = true;
+    (function rec(cur, ks) {
+      if (cur.currentPlayer !== winner && ks.length !== AI.generateActions(cur, cur.currentPlayer).length) ok = false;
+      for (const k of ks) {
+        const c = cur.clone();
+        try { play(c, k.from, k.to); } catch (err) { ok = false; continue; }
+        if (k.end) { leaves++; if (c.winner !== winner) ok = false; } else if (c.isOver()) ok = false;
+        else if (!k.pending) rec(c, k.kids);
+      }
+    })(eng, kids);
+    return ok && leaves > 0;
+  }
+
+  const t = AI.buildMateTree(e, "B", 3, []);
+  check("mate tree: built for the mate in 3", t.ok && t.mate === 3, JSON.stringify(t).slice(0, 200));
+  check("mate tree: the winner's first move is B4-C4", t.ok && t.kids.length === 1 && `${t.kids[0].from}-${t.kids[0].to}` === "B4-C4");
+  check("mate tree: every branch ends in B's win and lists all of A's replies", t.ok && verifyTree(e, "B", t.kids));
+  check("mate tree: longer defences come first", t.ok && t.kids[0].kids.every((k, i, a) => i === 0 || a[i - 1].mate >= k.mate));
+  check("mate tree: building leaves the position unchanged", e._stateKey() === key0 && !e.isOver());
+
+  // 負ける側の手番から(根が受け方): 指せる手がすべて根の枝になる
+  const c = e.clone(); play(c, "B4", "C4");
+  const td = AI.buildMateTree(c, "B", 2, []);
+  check("mate tree from the losing side's turn", td.ok && td.mate === 2 && verifyTree(c, "B", td.kids)
+    && td.kids.length === AI.generateActions(c, "A").length);
+
+  // path を渡すとその先だけを組み立てる(「続きを読む」と同じ呼び方)
+  const tp = AI.buildMateTree(e, "B", 2, [["B4", "C4"]]);
+  check("mate tree: expanding below a path", tp.ok && tp.kids.length === td.kids.length
+    && tp.kids.map((k) => k.from + k.to).join() === td.kids.map((k) => k.from + k.to).join());
+  check("mate tree: no proof when the side has no forced win", !AI.buildMateTree(e, "A", 3, []).ok);
+
+  // じっくり読む: 最善手と読み筋。詰みなら手順の樹形図も返す
+  const d = AI.deepAnalyze(e, true, 300);
+  check("deep analyze: finds B's mate with a principal variation", d && d.mate === "B" && d.matePlies === 3
+    && d.best.join("-") === "B4-C4" && d.pv.length >= 1 && d.pv[0].join("-") === "B4-C4", JSON.stringify(d && { mate: d.mate, mp: d.matePlies, best: d.best, pv: d.pv }));
+  const e0 = new H.GameEngine(H.makeConfig({ rows: 7, cols: 7, moveRange: 3, wallSandwich: true, contactLimit: 3 }));
+  e0.stock.A = 15; e0.stock.B = 15;
+  const d0 = AI.deepAnalyze(e0, true, 300);
+  let pvLegal = !!d0 && d0.pv.length >= 2;
+  if (pvLegal) { const x = e0.clone(); try { for (const [fr, to] of d0.pv) play(x, fr, to); } catch (err) { pvLegal = false; } }
+  check("deep analyze: opening PV is a legal sequence starting with the best move", pvLegal && d0.pv[0].join() === d0.best.join(), JSON.stringify(d0 && d0.pv));
+})();
+
 // ---- 17. チュートリアル: 全レッスンの模範手順で課題を達成でき、✕のマスは本当に置けない ----
 // (Python版 test_engine 9k と同じ確認。画面と同じ tutorial.js の判定を使う)
 (function () {

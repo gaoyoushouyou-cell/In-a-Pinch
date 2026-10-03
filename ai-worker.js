@@ -10,11 +10,12 @@
  * postMessage は構造化複製(structured clone)アルゴリズムを使うため、
  * Map や配列はそのまま送受信できる(JSON化は不要)。
  */
-importScripts("engine.js?v=3", "ai.js?v=7", "tsume.js?v=1");
+importScripts("engine.js?v=3", "ai.js?v=8", "tsume.js?v=1");
 
 self.onmessage = function (e) {
   if (e.data.kind === "tsume") { handleTsume(e.data); return; }
   if (e.data.kind === "eval" || e.data.kind === "analyze") { handleEval(e.data); return; }
+  if (e.data.kind === "study") { handleStudy(e.data); return; }
   const { reqId, config, state, player, level, specialist, seed, timeBudget } = e.data;
   try {
     const engine = rebuildEngine(config, state);
@@ -59,6 +60,21 @@ function handleEval(d) {
     const result = d.kind === "analyze"
       ? A.analyzePosition(engine, d.template, d.timeBudget)
       : A.evaluatePosition(engine, d.template, d.timeBudget);
+    postMessage({ reqId: d.reqId, ok: true, result });
+  } catch (err) {
+    postMessage({ reqId: d.reqId, ok: false, error: String((err && err.message) || err) });
+  }
+}
+
+// 感想戦の検討(kind: "study")。op "deep" = 1局面をじっくり読む、"mateTree" = 詰み手順の樹形図。
+// 感想戦の解析とは別の Worker で動かす(app.js の requestStudy)
+function handleStudy(d) {
+  try {
+    const engine = rebuildEngine(d.config, d.state);
+    const A = self.HasamiAI;
+    const result = d.op === "deep"
+      ? A.deepAnalyze(engine, d.template, d.timeBudget)
+      : A.buildMateTree(engine, d.winner, d.plies, d.path);
     postMessage({ reqId: d.reqId, ok: true, result });
   } catch (err) {
     postMessage({ reqId: d.reqId, ok: false, error: String((err && err.message) || err) });

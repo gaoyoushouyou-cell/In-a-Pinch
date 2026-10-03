@@ -1121,7 +1121,28 @@
         if (this._deadline != null && Date.now() >= this._deadline) break;
       }
       this.lastScore = bestScore;
+      this.lastBestCode = bestCode;
       return st.toAction(bestCode);
+    }
+
+    // 直前の _search の読み筋(根の最善手から、置換表に残った各局面の最善手をたどる)。
+    // [from, to] ラベルの配列。置換表が途中で消えていれば短くなる
+    principalVariation(engine, maxLen) {
+      const st = new FastState(engine);
+      const out = [];
+      const seen = new Set([st.key()]);
+      let code = this.lastBestCode;
+      while (out.length < maxLen && code != null && code >= 0 && st.generate(st.side).includes(code)) {
+        out.push(codeLabels(st, code));
+        st.make(code);
+        if (!st.hasAction(st.side)) break;
+        const key = st.key();
+        if (seen.has(key)) break;
+        seen.add(key);
+        const ent = this.tt.get(key);
+        code = ent ? ent[3] : -1;
+      }
+      return out;
     }
 
     _searchRoot(root, depth) {
@@ -1260,6 +1281,9 @@
       this.hist = new Map(this.st.rep);
       this.cap = nodeCap;
       this.nodes = 0;
+      // true なら攻め方の挟まない手も読む(感想戦の詰み手順用。対局のAIは false のまま)
+      this.full = false;
+      this.foundPlies = 0;
     }
 
     // maxPlies 手以内(1, 3, 5, …)で詰ませる初手のコード。見つからなければ -1
@@ -1268,7 +1292,7 @@
       try {
         for (let plies = 1; plies <= maxPlies; plies += 2) {
           const code = this._attack(plies);
-          if (code >= 0) return code;
+          if (code >= 0) { this.foundPlies = plies; return code; }
         }
       } catch (e) {
         if (!(e instanceof SearchTimeout)) throw e;
@@ -1298,7 +1322,7 @@
       const st = this.st, p = st.side;
       let acts = st.generate(p);
       const oppObl = st.obl[3 - p].length > 0;
-      if (plies > 1 && !oppObl) {
+      if (plies > 1 && !oppObl && !this.full) {
         acts = acts.filter((c) => st.isCapture(c));
       } else if (plies > 1 || oppObl) {
         const cap = new Set(acts.filter((c) => st.isCapture(c)));
@@ -1390,7 +1414,11 @@
       return { score: aWins ? WIN_SCORE : -WIN_SCORE, winA: aWins ? 1 : 0, depth: 0, mate: engine.winner, matePlies: 0, final: true };
     }
     if (engine.isDraw) return { score: 0, winA: 0.5, depth: 0, mate: null, matePlies: null, final: true };
-    const ai = makePositionEvaluator(template, timeBudget);
+    return scoreResult(engine, makePositionEvaluator(template, timeBudget));
+  }
+
+  // 評価役 ai に engine を読ませ、先手(A)から見た形勢の形にまとめる
+  function scoreResult(engine, ai) {
     const s = ai.evaluate(engine);
     if (!Number.isFinite(s)) return null;
     const scoreA = engine.currentPlayer === "A" ? s : -s;
@@ -1441,6 +1469,204 @@
     return { before: wb, after: wa, loss, forced, isBest, label: level ? level.label : null, mark: level ? level.mark : "" };
   }
 
+  // ---- 感想戦の検討: じっくり読む・詰み手順の樹形図 ----
+  // 手のコード(FastState)を [from, to] ラベルに直す。from が "" なら配置
+  function codeLabels(st, code) {
+    const N = st.g.N, cols = st.g.cols;
+    const lab = (i) => H.posLabel([Math.floor(i / cols), i % cols]);
+    if (code < N) return ["", lab(code)];
+    return [lab(Math.floor(code / N) - 1), lab(code % N)];
+  }
+
+  const DEEP_TIME_BUDGET = 5000; // 「じっくり読む」の読み(ms)
+  const DEEP_MATE_PLIES = 11;    // 学習型の読みで詰みが見えないとき、詰み専用の探索で確かめる手数
+
+  // 1局面をじっくり読む。analyzePosition の結果に読み筋 pv([from, to] の配列)を足したもの。
+  // 学習型の読みで決着が見えなければ、手番側の詰みを詰み探索(挟む手中心)でも確かめる
+  function deepAnalyze(engine, template, timeBudget) {
+    if (engine.isOver()) return analyzePosition(engine, template);
+    const ai = makePositionEvaluator(template, timeBudget == null ? DEEP_TIME_BUDGET : timeBudget);
+    const r = scoreResult(engine, ai);
+    if (!r) return null;
+    const out = {
+      winA: r.winA, mate: r.mate, matePlies: r.matePlies, depth: r.depth, final: false,
+      best: r.best ? actionLabels(engine, r.best) : null,
+      nActs: generateActions(engine, engine.currentPlayer).length,
+      pv: ai.principalVariation(engine, 16), deep: true,
+    };
+    if (!out.mate) {
+      const ms = new MateSearch(engine, 1500000);
+      const code = ms.find(DEEP_MATE_PLIES);
+      if (code >= 0) {
+        out.mate = engine.currentPlayer;
+        out.matePlies = ms.foundPlies;
+        out.winA = out.mate === "A" ? 1 : 0;
+        out.best = codeLabels(ms.st, code);
+        out.mateBy = "mateSearch";
+        // 詰み手順の樹形図もここで作って返す(画面はそのまま樹形図に使う)。読み筋はその本線
+        const tree = buildMateTree(engine, out.mate, out.matePlies + 4, []);
+        out.pv = [out.best];
+        if (tree.ok) {
+          out.tree = tree;
+          out.best = [tree.kids[0].from, tree.kids[0].to];
+          out.pv = [];
+          for (let kids = tree.kids; kids && kids.length; kids = kids[0].kids) out.pv.push([kids[0].from, kids[0].to]);
+        }
+      }
+    }
+    return out;
+  }
+
+  // 詰み手順の樹形図。勝つ側(攻め方)は最短で詰ませる1手、負ける側(受け方)は指せる手をすべて枝にし、
+  // 長く粘る受けから順に並べる(先頭の枝をたどると本線)。各ノードは
+  //   { from, to, side: "A"/"B", mate: この手のあと決着までの手数, end: この手で詰み,
+  //     kids: 次の手のノード, pending: 枝が多すぎて未展開(expand で続きを読む) }
+  // 詰みの証明は MateSearch と同じ(千日手は受け方の逃れ)。挟む手だけで詰まなければ全部の手も読む。
+  const MATE_TREE_NODES = 240;       // 1回に組み立てるノード数の目安(超えた枝は pending)
+  const MATE_TREE_TIME = 8000;       // 1回の組み立ての時間の上限(ms)
+
+  class MateTreeBuilder {
+    constructor(engine, winner, opts) {
+      opts = opts || {};
+      this.ms = new MateSearch(engine, 0);
+      this.st = this.ms.st;
+      this.win = winner === "A" ? 1 : 2;
+      this.maxNodes = opts.maxNodes || MATE_TREE_NODES;
+      const limit = opts.timeLimit || MATE_TREE_TIME;
+      this.deadline = Date.now() + limit;
+      this.softDeadline = Date.now() + limit / 3; // これを過ぎたら残りの枝は展開せず pending にする
+      this.nodes = 0;
+      this.searched = 0;
+      this.marks = [];
+    }
+
+    // 1手進める。"end"(相手が動けず決着)/ "rep"(千日手=逃れ。戻してある)/ "ok"
+    _descend(code) {
+      const st = this.st, ms = this.ms;
+      st.make(code);
+      if (!st.hasAction(st.side)) { this.marks.push(null); return "end"; }
+      if (ms._repeated()) { st.unmake(); return "rep"; }
+      this.marks.push(ms._enter());
+      return "ok";
+    }
+
+    _ascend() {
+      const mark = this.marks.pop();
+      if (mark) this.ms._leave(mark);
+      this.st.unmake();
+    }
+
+    // 攻め方の手番で limit 手以内の詰み { plies, code }。読み切れなければ null。
+    // まず挟む手だけの探索で最短を探し、それで詰まなければ全部の手の探索(局面数を絞る)で探す
+    // (挟む手の詰みは速く読めて手順もわかりやすいので、全部の手で探すより短くなくても優先する)
+    _shortest(limit) {
+      const st = this.st, ms = this.ms, depth = st.undo.length;
+      for (const full of [false, true]) {
+        for (let n = full ? 3 : 1; n <= limit; n += 2) {
+          if (Date.now() > this.deadline) throw new SearchTimeout();
+          ms.full = full;
+          ms.nodes = 0;
+          ms.cap = full ? 300000 : 1500000;
+          let code = -1;
+          try {
+            code = ms._attack(n);
+          } catch (e) {
+            if (!(e instanceof SearchTimeout)) throw e;
+            while (st.undo.length > depth) st.unmake();
+          }
+          this.searched += ms.nodes;
+          if (code >= 0) return { plies: n, code };
+        }
+      }
+      return null;
+    }
+
+    _moveNode(code, mate) {
+      const [from, to] = codeLabels(this.st, code);
+      this.nodes++;
+      return { from, to, side: this.st.side === 1 ? "A" : "B", mate, end: false, kids: [] };
+    }
+
+    // 攻め方の1手(sm = _shortest の結果)をノードにし、その先も組み立てる
+    _attackNode(sm) {
+      const node = this._moveNode(sm.code, sm.plies - 1);
+      const r = this._descend(sm.code);
+      if (r === "rep") return null;
+      if (r === "end") { node.end = true; this._ascend(); return node; }
+      if (this.nodes >= this.maxNodes || Date.now() > this.softDeadline) node.pending = true;
+      else {
+        const sub = this._defenderKids(sm.plies - 1);
+        if (!sub) { this._ascend(); return null; }
+        node.kids = sub.kids;
+      }
+      this._ascend();
+      return node;
+    }
+
+    // 受け方の手番の局面から、全部の受けの枝を作る。{ kids, mate } か、詰みを示せなければ null
+    _defenderKids(plies) {
+      const st = this.st;
+      if (plies <= 0) return null;
+      const branches = [];
+      for (const code of st.generate(st.side)) {
+        const node = this._moveNode(code, 0);
+        const r = this._descend(code);
+        if (r !== "ok") { if (r === "end") this._ascend(); return null; } // 受けの手で決着・千日手は想定外(逃れ)
+        const sm = this._shortest(plies - 1);
+        this._ascend();
+        if (!sm) return null;
+        node.mate = sm.plies;
+        branches.push({ code, node, sm });
+      }
+      // 長く粘る受けを先頭に(同じ長さなら生成順 = 盤の上から)
+      branches.sort((a, b) => b.sm.plies - a.sm.plies);
+      for (const b of branches) {
+        this._descend(b.code);
+        const reply = this._attackNode(b.sm);
+        this._ascend();
+        if (!reply) return null;
+        b.node.kids = [reply];
+      }
+      return { kids: branches.map((b) => b.node), mate: branches.length ? branches[0].sm.plies + 1 : 0 };
+    }
+
+    // 今の局面(手番 st.side)から下を組み立てる。plies = 決着までの手数の上限
+    build(plies) {
+      const st = this.st;
+      if (st.side === this.win) {
+        const sm = this._shortest(plies);
+        if (!sm) return null;
+        const node = this._attackNode(sm);
+        return node ? { kids: [node], mate: sm.plies } : null;
+      }
+      return this._defenderKids(plies);
+    }
+  }
+
+  // engine の局面から winner の詰み手順の樹形図を作る。path(根からの手の [from, to] の列)を
+  // 渡すと、その手順の先(pending だったノード)だけを組み立てる。plies = その局面から決着までの手数の上限。
+  // 戻り値 { ok, kids, mate, nodes, searched } / { ok: false, reason: "timeout" | "unproven" }
+  function buildMateTree(engine, winner, plies, path, opts) {
+    if (engine.isOver()) return { ok: false, reason: "over" };
+    const b = new MateTreeBuilder(engine, winner, opts);
+    const st = b.st;
+    try {
+      for (const [from, to] of path || []) {
+        const code = st.generate(st.side).find((c) => {
+          const l = codeLabels(st, c);
+          return l[0] === from && l[1] === to;
+        });
+        if (code == null || b._descend(code) !== "ok") return { ok: false, reason: "unproven" };
+      }
+      const res = b.build(plies);
+      if (!res) return { ok: false, reason: "unproven" };
+      return { ok: true, kids: res.kids, mate: res.mate, nodes: b.nodes, searched: b.searched };
+    } catch (e) {
+      if (!(e instanceof SearchTimeout)) throw e;
+      return { ok: false, reason: "timeout" };
+    }
+  }
+
   const AI = {
     LEVELS, LEVEL_ORDER, SPECIALIST_AI_NAME, SPECIALIST_AI_DESC,
     generateActions, applyAction, actionEquals,
@@ -1450,6 +1676,7 @@
     LEARNED_LEVEL_IDS, makeAI,
     EVAL_TIME_BUDGET, winRateFromScore, makePositionEvaluator, evaluatePosition,
     actionLabels, analyzePosition, MOVE_JUDGE_LEVELS, judgeMove,
+    DEEP_TIME_BUDGET, deepAnalyze, buildMateTree, MateSearch,
   };
 
   if (typeof module !== "undefined" && module.exports) {
