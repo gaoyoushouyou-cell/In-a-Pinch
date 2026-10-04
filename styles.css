@@ -195,7 +195,30 @@ button { font-family: inherit; }
   touch-action: manipulation;
 }
 .btn:hover { border-color: var(--accent); color: var(--warning); background: rgba(201,162,39,.08); }
-.btn:active { transform: translateY(1px); }
+.btn:active { transform: translateY(1px) scale(.97); }
+/* ボタン(A5): 乗せると金の光が一筋走る */
+.btn { position: relative; overflow: hidden; }
+.btn::after {
+  content: ""; position: absolute; top: 0; left: -70%; width: 45%; height: 100%; pointer-events: none;
+  background: linear-gradient(100deg, transparent, rgba(228,199,102,.28), transparent); transform: skewX(-20deg);
+}
+.btn:hover:not(:disabled)::after { animation: btn-sheen .65s ease-out; }
+@keyframes btn-sheen { to { left: 130%; } }
+
+/* 効果音のオン・オフ(ヘッダー) */
+.sound-toggle {
+  display: inline-flex; align-items: center; justify-content: center; width: 40px; height: 40px; flex: none;
+  border: 1px solid rgba(201,162,39,.3); border-radius: 8px; background: transparent; color: var(--warning); cursor: pointer;
+  -webkit-tap-highlight-color: transparent; transition: border-color .15s, color .15s, background .15s;
+}
+.sound-toggle:hover { border-color: var(--accent); background: rgba(201,162,39,.1); }
+.sound-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.sound-toggle .snd-off { display: none; }
+.sound-toggle.is-off { color: var(--text-muted); }
+.sound-toggle.is-off .snd-on { display: none; }
+.sound-toggle.is-off .snd-off { display: inline; }
+@media (min-width: 1024px) { .sound-toggle { order: 3; width: 36px; height: 36px; } .settings-btn { order: 4; } }
+@media (max-width: 380px) { .site-header-inner { gap: 8px; } .nav-title .sub { display: none; } }
 .btn:disabled { opacity: .35; cursor: not-allowed; }
 .btn:disabled:hover { border-color: rgba(201,162,39,.3); color: var(--text-secondary); background: rgba(255,255,255,.02); }
 .btn-compact { padding: 6px 12px; font-size: 12.5px; min-height: 34px; }
@@ -495,22 +518,241 @@ details.adv[open] > summary::after { transform: rotate(-135deg); margin-top: -2p
   100% { transform: translateY(0) scale(1) rotate(0); }
 }
 .fx-svg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; }
-.flank-line { fill: none; stroke: var(--danger); stroke-width: 2.5px; stroke-linecap: round; stroke-dasharray: 1; stroke-dashoffset: 1px; animation: flank-draw .3s ease-out forwards, flank-fade .5s ease-in .8s forwards; }
-@keyframes flank-draw { to { stroke-dashoffset: 0; } }
-@keyframes flank-fade { to { opacity: 0; } }
-.ring { position: absolute; top: 50%; left: 50%; border: 1.5px solid var(--warning); border-radius: 50%; pointer-events: none; transform: translate(-50%,-50%); animation: ring-out .7s cubic-bezier(.1,.7,.3,1) forwards; }
-.ring.danger { border-color: var(--danger); }
-@keyframes ring-out { 0% { opacity: .95; width: 20%; height: 20%; border-width: 3px; } 100% { opacity: 0; width: 230%; height: 230%; border-width: .5px; } }
 
-/* きらめき(蒔絵風の光の粒。演出をより豪華にするための独自追加) */
-.sparkle { position: absolute; border-radius: 50%; background: radial-gradient(circle, #fff9e2 0%, var(--warning) 45%, transparent 70%); pointer-events: none; animation: sparkle-pop .9s ease-out forwards; }
-@keyframes sparkle-pop { 0% { opacity: 0; transform: scale(.2) translateY(0);} 15% { opacity: 1; } 100% { opacity: 0; transform: scale(1) translateY(-18px);} }
+/* ---------- 盤の演出(第1弾) ---------- */
+/* 駒を選ぶ(A1): 少し持ち上がり、影が伸びる */
+.disc { transition: transform .2s var(--ease-pop); }
+.piece.is-selected .disc { transform: translateY(-7%) scale(1.06); }
+/* 2方向から挟まれた駒(B3): 朱い輪が少し遅れてもう1本 */
+.piece.is-obligated-2 .disc::after {
+  content: ""; position: absolute; inset: -31%; border: 1.5px solid var(--danger); border-radius: 50%; pointer-events: none;
+  animation: seal-snap .45s cubic-bezier(.2,1.4,.4,1) .16s backwards, seal-breathe 1.7s ease-in-out .85s infinite;
+}
+/* 挟んだ瞬間(B0): 挟まれた駒が挟まれた向きにつぶれ、挟んだ2駒が内へ寄る */
+.piece.sq-h .disc { animation: sq-h .46s cubic-bezier(.3,1.5,.5,1); }
+.piece.sq-v .disc { animation: sq-v .46s cubic-bezier(.3,1.5,.5,1); }
+@keyframes sq-h { 35% { transform: scaleX(.74) scaleY(1.1); } }
+@keyframes sq-v { 35% { transform: scaleY(.74) scaleX(1.1); } }
+.piece.nd-r .disc { animation: nd-r .4s ease-out; } .piece.nd-l .disc { animation: nd-l .4s ease-out; }
+.piece.nd-d .disc { animation: nd-d .4s ease-out; } .piece.nd-u .disc { animation: nd-u .4s ease-out; }
+@keyframes nd-r { 35% { transform: translateX(8%); } } @keyframes nd-l { 35% { transform: translateX(-8%); } }
+@keyframes nd-d { 35% { transform: translateY(8%); } } @keyframes nd-u { 35% { transform: translateY(-8%); } }
+/* 終局で動けなくなった駒: 朱い輪が2回だけ脈打つ */
+.piece.is-trapped .disc::before { animation: trap .62s ease-in-out 2; }
+@keyframes trap { 50% { opacity: 1; box-shadow: 0 0 22px 6px rgba(206,74,46,.9); transform: scale(1.08); } }
 
-.verdict-veil { position: absolute; inset: 0; z-index: 3; background: rgba(20,6,8,.62); backdrop-filter: blur(2px); animation: verdict-in .55s ease-out .3s both; display: flex; align-items: flex-end; justify-content: center; }
-@keyframes verdict-in { from { opacity: 0; } }
-.verdict { position: relative; z-index: 4; text-align: center; padding-bottom: 20px; }
-.verdict-title { font-family: var(--f-disp); letter-spacing: .18em; font-size: 26px; color: var(--warning); text-shadow: 0 2px 14px rgba(20,6,8,.95); }
-.verdict-reason { font-size: 12px; letter-spacing: .16em; color: var(--text-secondary); margin-top: 4px; text-shadow: 0 2px 10px rgba(20,6,8,.95); }
+/* 一瞬の演出の層(駒の下): 波紋(A2/A3)・壁の光(B0)・割れる輪(B4) */
+.fx-under { overflow: hidden; }
+.fx-under > span { position: absolute; pointer-events: none; }
+.fx-ripple {
+  width: calc(var(--cell) * .22); height: calc(var(--cell) * .22); border: 1.5px solid rgba(110,80,40,.5); border-radius: 50%;
+  transform: translate(-50%,-50%); animation: fx-ripple .95s cubic-bezier(.1,.7,.3,1) both;
+}
+.fx-ripple.r2 { border-color: rgba(201,162,39,.55); animation-delay: .12s; }
+@keyframes fx-ripple { 0% { opacity: .9; border-width: 2.5px; } 100% { opacity: 0; width: calc(var(--cell) * 2); height: calc(var(--cell) * 2); border-width: .5px; } }
+.fx-wallhit { background: var(--danger); border-radius: 2px; animation: fx-wallhit .7s ease-out forwards; }
+@keyframes fx-wallhit { 0% { opacity: 0; } 20% { opacity: .9; } 100% { opacity: 0; } }
+.fx-shatter { width: 0; height: 0; }
+.fx-shatter .burst { position: absolute; left: -30px; top: -30px; width: 60px; height: 60px; border-radius: 50%; border: 2px solid rgba(232,120,92,.7); animation: fx-burst .5s ease-out forwards; }
+@keyframes fx-burst { to { opacity: 0; transform: scale(1.5); } }
+.fx-shatter .shard { position: absolute; left: -6px; top: -4px; width: 12px; height: 8px; background: var(--danger); clip-path: polygon(0 0,100% 30%,40% 100%); opacity: 0; animation: .75s cubic-bezier(.15,.8,.3,1) forwards; }
+.fx-shatter .s0 { animation-name: sh0; } .fx-shatter .s1 { animation-name: sh1; animation-delay: .02s; }
+.fx-shatter .s2 { animation-name: sh2; animation-delay: .01s; } .fx-shatter .s3 { animation-name: sh3; animation-delay: .03s; }
+.fx-shatter .s4 { animation-name: sh4; } .fx-shatter .s5 { animation-name: sh5; animation-delay: .02s; }
+.fx-shatter .s6 { animation-name: sh6; animation-delay: .01s; } .fx-shatter .s7 { animation-name: sh7; animation-delay: .03s; }
+@keyframes sh0 { 0% { opacity: 1; transform: translate(0,-30px); } 100% { opacity: 0; transform: translate(6px,-62px) rotate(140deg); } }
+@keyframes sh1 { 0% { opacity: 1; transform: translate(21px,-21px) rotate(45deg); } 100% { opacity: 0; transform: translate(48px,-40px) rotate(230deg); } }
+@keyframes sh2 { 0% { opacity: 1; transform: translate(30px,0) rotate(90deg); } 100% { opacity: 0; transform: translate(64px,8px) rotate(260deg); } }
+@keyframes sh3 { 0% { opacity: 1; transform: translate(21px,21px) rotate(135deg); } 100% { opacity: 0; transform: translate(44px,52px) rotate(300deg); } }
+@keyframes sh4 { 0% { opacity: 1; transform: translate(0,30px) rotate(180deg); } 100% { opacity: 0; transform: translate(-8px,66px) rotate(20deg); } }
+@keyframes sh5 { 0% { opacity: 1; transform: translate(-21px,21px) rotate(225deg); } 100% { opacity: 0; transform: translate(-50px,46px) rotate(60deg); } }
+@keyframes sh6 { 0% { opacity: 1; transform: translate(-30px,0) rotate(270deg); } 100% { opacity: 0; transform: translate(-62px,-10px) rotate(90deg); } }
+@keyframes sh7 { 0% { opacity: 1; transform: translate(-21px,-21px) rotate(315deg); } 100% { opacity: 0; transform: translate(-44px,-54px) rotate(120deg); } }
+
+/* 動いた跡(A3): 出発点の輪 + 墨の線。先手=青墨・後手=墨、直前に指した側を濃く。1マス=1 の座標 */
+.trail-svg { width: 100%; height: 100%; overflow: visible; }
+.trail-line { fill: none; stroke-width: .075; stroke-linecap: round; stroke-dasharray: 1; }
+.trail-from { fill: none; stroke-width: .05; }
+.trail.side-a .trail-line { stroke: rgba(47,110,114,.62); } .trail.side-a .trail-from { stroke: rgba(47,110,114,.78); }
+.trail.side-b .trail-line { stroke: rgba(23,19,15,.5); } .trail.side-b .trail-from { stroke: rgba(23,19,15,.62); }
+.trail.side-a .trail-drop { fill: rgba(47,110,114,.13); stroke: rgba(47,110,114,.35); stroke-width: .03; }
+.trail.side-b .trail-drop { fill: rgba(23,19,15,.09); stroke: rgba(23,19,15,.3); stroke-width: .03; }
+.trail.is-old { opacity: .42; }
+.trail.is-new .trail-line { animation: trail-draw .32s cubic-bezier(.22,.9,.28,1) both; }
+.trail.is-new .trail-from, .trail.is-new .trail-drop { animation: trail-in .3s ease-out both; }
+.trail.is-new .trail-drop { animation-delay: .2s; }
+@keyframes trail-draw { from { stroke-dashoffset: 1; } to { stroke-dashoffset: 0; } }
+@keyframes trail-in { from { opacity: 0; } }
+
+/* 対局開始(C1): 盤が少し奥から現れる */
+.board-frame.is-entering { animation: board-enter .8s var(--ease-slide) both; }
+@keyframes board-enter { from { opacity: 0; transform: translateY(8px); } } /* 大きさは変えない(盤の寸法を測る処理に影響させない) */
+
+/* 終局(C2〜C4・控えめ): 薄い幕・縦書きの結果・勝ちは金粉10粒・負けは墨のにじみ・引き分けは円相 */
+.vd-layer { position: absolute; inset: 0; z-index: 3; pointer-events: none; }
+.vd-shade { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; background: rgba(20,6,8,.42); animation: vd-fade .8s ease-out .5s both; }
+.vd-lose .vd-shade { background: rgba(14,6,6,.5); }
+.vd-draw .vd-shade { background: rgba(20,6,8,.38); animation-delay: .2s; }
+@keyframes vd-fade { from { opacity: 0; } }
+.vd-ink { position: absolute; inset: 0; animation: vd-ink 1.6s ease-out .2s both; box-shadow: inset 0 0 27cqw 8cqw rgba(8,4,3,.7); }
+@keyframes vd-ink { from { box-shadow: inset 0 0 0 0 rgba(8,4,3,0); } }
+.vd-text { position: relative; display: flex; align-items: center; gap: 4%; }
+.vd-title {
+  writing-mode: vertical-rl; font-family: var(--f-disp); font-weight: 600; font-size: clamp(30px, 11cqw, 60px); letter-spacing: .24em;
+  text-shadow: 0 2px 18px rgba(20,6,8,.9); clip-path: inset(0 0 100% 0); animation: vd-wipe .9s cubic-bezier(.5,0,.3,1) .9s forwards;
+}
+.board { container-type: inline-size; }
+.vd-win .vd-title { color: var(--warning); }
+.vd-lose .vd-title { color: #E6DCC8; }
+.vd-title.is-long { font-size: clamp(22px, 7cqw, 40px); letter-spacing: .18em; }
+.vd-draw .vd-title { color: #D8CDBB; animation-delay: 1.3s; }
+@keyframes vd-wipe { to { clip-path: inset(0 0 0 0); } }
+.vd-sub { writing-mode: vertical-rl; font-size: clamp(11px, 2.6cqw, 13px); letter-spacing: .2em; color: var(--text-secondary); text-shadow: 0 2px 10px rgba(20,6,8,.95); opacity: 0; animation: vd-show .6s ease-out 1.6s forwards; }
+.vd-draw .vd-sub { animation-delay: 2s; }
+@keyframes vd-show { to { opacity: 1; } }
+.vd-dust { position: absolute; width: 4px; height: 4px; border-radius: 50%; background: radial-gradient(circle, #fff9e2 0%, var(--warning) 50%, transparent 72%); opacity: 0; animation: vd-dust 2.6s ease-out forwards; }
+.vd-dust.d0 { left: 22%; top: 70%; animation-delay: 1s; } .vd-dust.d1 { left: 34%; top: 62%; animation-delay: 1.25s; }
+.vd-dust.d2 { left: 47%; top: 74%; animation-delay: 1.1s; } .vd-dust.d3 { left: 58%; top: 66%; animation-delay: 1.4s; }
+.vd-dust.d4 { left: 69%; top: 72%; animation-delay: 1.05s; } .vd-dust.d5 { left: 28%; top: 52%; animation-delay: 1.55s; }
+.vd-dust.d6 { left: 41%; top: 46%; animation-delay: 1.35s; } .vd-dust.d7 { left: 63%; top: 50%; animation-delay: 1.6s; }
+.vd-dust.d8 { left: 76%; top: 58%; animation-delay: 1.2s; } .vd-dust.d9 { left: 52%; top: 56%; animation-delay: 1.7s; }
+@keyframes vd-dust { 0% { opacity: 0; transform: translateY(0) scale(.6); } 20% { opacity: .9; } 100% { opacity: 0; transform: translateY(-70px) scale(1.2); } }
+.vd-enso { position: absolute; left: 50%; top: 50%; width: 46%; height: 46%; transform: translate(-50%,-50%); overflow: visible; }
+.vd-enso path { fill: none; stroke-linecap: round; stroke-dasharray: 1; stroke-dashoffset: 1; animation: vd-draw 1.3s cubic-bezier(.6,.05,.35,1) .25s forwards; }
+.vd-enso .e1 { stroke: rgba(216,205,187,.75); stroke-width: 10px; }
+.vd-enso .e2 { stroke: rgba(216,205,187,.35); stroke-width: 4px; animation-delay: .32s; }
+@keyframes vd-draw { to { stroke-dashoffset: 0; } }
+/* 終わった対局を開き直したとき・動きを減らす設定: 最後の状態で止めて出す */
+.vd-layer.is-static *, .vd-layer.is-static { animation: none !important; }
+.vd-layer.is-static .vd-title { clip-path: none; }
+.vd-layer.is-static .vd-sub { opacity: 1; }
+.vd-layer.is-static .vd-enso path { stroke-dashoffset: 0; }
+.vd-layer.is-static .vd-dust { display: none; }
+
+/* ---------- 演出(第2弾) ---------- */
+/* AIの思考中(D1): 盤の縁を金の光がゆっくり一周し続ける(3.4秒で1周)。縁だけを残すマスクで枠の上に描く */
+@property --think-angle { syntax: "<angle>"; inherits: false; initial-value: 0deg; }
+.board-frame::before {
+  content: ""; position: absolute; inset: -2px; border-radius: 12px; padding: 2px; pointer-events: none; opacity: 0; transition: opacity .5s;
+  background: conic-gradient(from var(--think-angle), rgba(228,199,102,0) 0deg 250deg, rgba(228,199,102,.25) 300deg, rgba(255,240,190,.95) 350deg, rgba(228,199,102,0) 360deg);
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0); -webkit-mask-composite: xor;
+  mask: linear-gradient(#000 0 0) content-box exclude, linear-gradient(#000 0 0);
+}
+.board-frame.is-thinking::before { opacity: 1; animation: think-spin 3.4s linear infinite; }
+@keyframes think-spin { to { --think-angle: 360deg; } }
+/* AIが指す直前の合図(D2): 動かす駒に金の輪が一瞬重なる */
+.piece.is-cue .disc { box-shadow: 0 0 0 2px var(--warning), 0 0 18px 4px rgba(228,199,102,.7); transition: box-shadow .15s; }
+/* 秒読みの最後5秒(E): 盤の縁が秒に合わせて赤く脈打つ */
+.board-frame.is-urgent { animation: urgent 1s ease-out infinite; }
+@keyframes urgent { 0% { box-shadow: 0 0 0 0 rgba(232,120,92,0); } 12% { box-shadow: 0 0 0 3px rgba(232,120,92,.85), 0 0 34px 4px rgba(232,120,92,.35); } 100% { box-shadow: 0 0 0 0 rgba(232,120,92,0); } }
+/* 形勢が大きく動いた(D3)・詰みを読み切った(D4) */
+.eval-meter { position: relative; }
+.eval-flash { position: absolute; inset: 0; background: linear-gradient(90deg, transparent, rgba(255,244,210,.85), transparent); transform: translateX(-100%); animation: eval-flash .7s ease-out forwards; pointer-events: none; }
+@keyframes eval-flash { to { transform: translateX(100%); } }
+.eval-swing {
+  position: absolute; right: 10px; top: -12px; z-index: 2; font-family: var(--f-disp); font-size: 13px; letter-spacing: .18em; font-weight: 600;
+  padding: 2px 10px; border-radius: 4px; background: var(--warning-bg); color: var(--warning); border: 1px solid rgba(228,199,102,.5);
+  animation: swing-in .3s var(--ease-pop) both, swing-out .4s ease-in 1.6s forwards; pointer-events: none;
+}
+.eval-swing.is-bad { background: var(--danger-bg); color: var(--danger); border-color: rgba(232,120,92,.5); }
+@keyframes swing-in { from { opacity: 0; transform: translateY(6px) scale(.9); } }
+@keyframes swing-out { to { opacity: 0; } }
+.eval-meter.is-mate .eval-fill {
+  background: linear-gradient(90deg, #A8862A, #E4C766 40%, #fff1c0 50%, #E4C766 60%, #A8862A); background-size: 220% 100%;
+  animation: mate-gold 2.2s linear infinite;
+}
+@keyframes mate-gold { from { background-position: 120% 0; } to { background-position: -100% 0; } }
+.eval-meter.is-mate .eval-note { color: var(--warning); }
+
+/* 初めての「音を出しますか?」 */
+.sound-prompt {
+  position: fixed; left: 50%; bottom: max(16px, env(safe-area-inset-bottom)); transform: translateX(-50%); z-index: 35; /* 確認の窓(40)より下 */
+  width: min(560px, calc(100vw - 2 * var(--gutter))); display: flex; align-items: center; gap: 14px; flex-wrap: wrap; justify-content: space-between;
+  padding: 14px 16px; border-radius: 10px; background: var(--warning-bg); border: 1px solid rgba(228,199,102,.45); box-shadow: 0 20px 50px -20px #000;
+  animation: swing-in .3s var(--ease-slide) both;
+}
+.sound-prompt-text { display: grid; gap: 2px; min-width: 0; flex: 1 1 260px; }
+.sound-prompt-text b { font-family: var(--f-disp); font-size: 15px; color: var(--warning); }
+.sound-prompt-text span { font-size: 12px; color: var(--text-secondary); line-height: 1.6; }
+.sound-prompt-actions { display: flex; gap: 8px; }
+
+/* 音と演出の設定(H) */
+.settings-modal { width: min(560px, 100%); max-height: calc(100dvh - 40px); overflow-y: auto; }
+.settings-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 6px; }
+.settings-head h2 { margin: 0; font-family: var(--f-disp); font-size: 19px; letter-spacing: .08em; color: var(--text-primary); font-weight: 600; }
+.set-row { display: grid; grid-template-columns: 112px minmax(0, 1fr) auto; gap: 4px 12px; align-items: center; padding: 12px 0; border-bottom: 1px solid rgba(201,162,39,.12); }
+.set-row:last-child { border-bottom: 0; }
+.set-label { font-size: 13.5px; color: var(--text-primary); }
+.set-help { grid-column: 2 / 4; font-size: 11.5px; color: var(--text-muted); line-height: 1.6; }
+.set-num { font-family: var(--f-mono); font-size: 12.5px; color: var(--text-secondary); min-width: 4ch; text-align: right; }
+.set-slider { width: 100%; accent-color: var(--accent); min-height: 32px; }
+.set-pair { display: flex; align-items: center; gap: 12px; min-width: 0; }
+.set-pair .set-slider { flex: 1; min-width: 0; }
+.switch { position: relative; flex: none; width: 46px; height: 26px; border-radius: 13px; padding: 0; cursor: pointer; background: var(--bg-deep); border: 1px solid var(--border); transition: background .2s, border-color .2s; }
+.switch::after { content: ""; position: absolute; top: 3px; left: 3px; width: 18px; height: 18px; border-radius: 50%; background: var(--text-muted); transition: transform .2s var(--ease-slide), background .2s; }
+.switch.is-on { background: var(--accent-light); border-color: var(--accent); }
+.switch.is-on::after { transform: translateX(20px); background: var(--warning); }
+.switch:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+@media (max-width: 480px) { .set-row { grid-template-columns: 76px minmax(0, 1fr) auto; } .set-row .seg button { padding: 8px 10px; } }
+
+/* ---------- 演出(第3弾) ---------- */
+/* 画面の切り替え(F1): 新しい画面の上を、墨が刷毛でひと塗り分抜ける/襖が左右に開く */
+.screen-wipe { position: fixed; left: 0; right: 0; bottom: 0; top: var(--header-h); z-index: 20; pointer-events: none; overflow: hidden; }
+.screen-wipe .ink {
+  position: absolute; top: 0; bottom: 0; left: 0; width: 160%;
+  background: linear-gradient(90deg, rgba(14,7,6,0) 0%, rgba(14,7,6,.96) 18%, #0E0706 25%, #0E0706 100%);
+  transform: translateX(-25%); animation: wipe-ink .55s cubic-bezier(.55,0,.35,1) forwards;
+}
+@keyframes wipe-ink { to { transform: translateX(62.5%); } }
+.screen-wipe .fu {
+  position: absolute; top: 0; bottom: 0; width: 50%; box-sizing: border-box; border: 7px solid #17130F;
+  background: #E9E0CB; background-image: repeating-linear-gradient(0deg, rgba(160,140,100,.10) 0 1px, transparent 1px 5px), repeating-linear-gradient(90deg, rgba(160,140,100,.08) 0 1px, transparent 1px 4px);
+}
+.screen-wipe .fu::after { content: ""; position: absolute; top: 50%; width: 22px; height: 22px; margin-top: -11px; border-radius: 50%; border: 2px solid var(--border); background: var(--accent); box-shadow: inset 0 0 0 5px var(--accent-light); }
+.screen-wipe .fu-l { left: 0; animation: fu-open-l .5s cubic-bezier(.6,0,.3,1) .08s forwards; }
+.screen-wipe .fu-r { right: 0; animation: fu-open-r .5s cubic-bezier(.6,0,.3,1) .08s forwards; }
+.screen-wipe .fu-l::after { right: 14px; } .screen-wipe .fu-r::after { left: 14px; }
+@keyframes fu-open-l { to { transform: translateX(-102%); } }
+@keyframes fu-open-r { to { transform: translateX(102%); } }
+/* ホームの背景(F2): 薄く傾けた盤で、駒がゆっくり動き続ける */
+.home-backdrop { position: fixed; z-index: 0; pointer-events: none; right: max(-60px, -6vw); top: calc(var(--header-h) + 40px); width: min(70vw, 520px); aspect-ratio: 1; opacity: .07; transform: rotate(-7deg); }
+#app { position: relative; z-index: 1; }
+.home-backdrop-board {
+  position: absolute; inset: 0; border-radius: 6px; background-color: var(--board-bg);
+  background-image: repeating-linear-gradient(90deg, transparent 0 calc(100% / 7 - 1px), var(--board-line) calc(100% / 7 - 1px) calc(100% / 7)),
+    repeating-linear-gradient(0deg, transparent 0 calc(100% / 7 - 1px), var(--board-line) calc(100% / 7 - 1px) calc(100% / 7));
+}
+.bd-piece { position: absolute; top: 0; left: 0; width: calc(100% / 7); height: calc(100% / 7); display: flex; align-items: center; justify-content: center; transition: transform 1.4s cubic-bezier(.45,0,.25,1); }
+.bd-piece i { width: 76%; height: 76%; border-radius: 50%; display: block; }
+.bd-piece.a i { background: #3d7a7d; } .bd-piece.b i { background: #050403; }
+/* 詰めピンチの星(F3): 判のように1つずつ押す */
+.tsume-star { display: inline-block; color: var(--text-muted); }
+.tsume-star.is-got { color: var(--warning); }
+.tsume-star.is-stamp { animation: star-stamp .42s cubic-bezier(.2,1.5,.4,1) both; }
+@keyframes star-stamp { 0% { opacity: 0; transform: scale(2.1) rotate(-18deg); } 60% { opacity: 1; transform: scale(.92) rotate(3deg); } 100% { transform: none; } }
+/* チュートリアルの課題達成(F4): 朱の判子「よし」 */
+.yoshi { position: absolute; inset: 0; z-index: 4; pointer-events: none; display: flex; align-items: center; justify-content: center; animation: yoshi-out .5s ease-in 1.9s forwards; }
+.yoshi-seal {
+  position: relative; width: 30%; aspect-ratio: 1; border-radius: 50%; border: 4px solid #C2402A; color: #C2402A; display: flex; align-items: center; justify-content: center;
+  font-family: var(--f-disp); font-weight: 700; font-size: clamp(20px, 8cqw, 36px); writing-mode: vertical-rl; transform: rotate(-8deg); mix-blend-mode: multiply; opacity: .88;
+  animation: yoshi-stamp .38s cubic-bezier(.3,1.4,.5,1) both;
+}
+.yoshi-blot { position: absolute; width: 36%; aspect-ratio: 1; border-radius: 50%; background: radial-gradient(circle, rgba(194,64,42,.18), transparent 65%); animation: vd-fade .6s ease-out .1s both; }
+@keyframes yoshi-stamp { 0% { opacity: 0; transform: scale(1.7) rotate(-14deg); } 55% { opacity: .95; transform: scale(.96) rotate(-7deg); } 100% { transform: rotate(-8deg); } }
+@keyframes yoshi-out { to { opacity: 0; } }
+/* レートの更新(F5) */
+.rating-delta { font-family: var(--f-mono); font-size: 15px; }
+.rating-delta.is-up { color: var(--warning); animation: swing-in .4s var(--ease-pop) both; }
+.rating-delta.is-down { color: var(--danger); }
+.rating-value.is-best { color: var(--warning); text-shadow: 0 0 18px rgba(228,199,102,.45); }
+.rating-note.is-up { text-shadow: 0 0 14px rgba(228,199,102,.4); }
+
+/* 演出の強さ: 控えめ(二重の波紋・線の描き込み・盤の脈打ち・金粉を省く)/ オフ(動きなし) */
+.fx-calm .trail.is-new *, .fx-calm .board-frame.is-urgent { animation: none !important; }
+.fx-off .board-frame.is-entering, .fx-off .board-frame.is-shaking, .fx-off .board-frame.is-urgent, .fx-off .trail.is-new *,
+.fx-off .piece .disc, .fx-off .eval-meter.is-mate .eval-fill, .fx-off .tsume-star, .fx-off .screen, .fx-off .vd-layer * { animation: none !important; }
+.fx-off .vd-layer .vd-title { clip-path: none; } .fx-off .vd-layer .vd-sub { opacity: 1; } .fx-off .vd-enso path { stroke-dashoffset: 0; }
+.fx-off .btn::after, .fx-off .home-backdrop { display: none; }
 
 .legend-row { display: flex; align-items: center; gap: 14px; font-size: 12px; color: var(--text-secondary); flex-wrap: wrap; justify-content: center; }
 .legend-dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 5px; }
@@ -724,6 +966,7 @@ details.adv[open] > summary::after { transform: rotate(-135deg); margin-top: -2p
 .veil { position: fixed; inset: 0; background: rgba(20,6,8,.82); backdrop-filter: blur(3px); z-index: 40; display: flex; align-items: center; justify-content: center; padding: 20px; }
 .modal { width: min(420px, 100%); background: var(--surface); border: 1px solid rgba(201,162,39,.4); border-radius: 10px; padding: 22px; box-shadow: 0 30px 80px -30px #000; }
 .modal p { color: var(--text-primary); font-size: 13.5px; line-height: 1.7; margin: 0 0 18px; }
+.modal-title { margin: 0 0 10px; font-family: var(--f-disp); font-size: 18px; font-weight: 600; letter-spacing: .06em; color: var(--warning); }
 .modal .modal-actions { display: flex; justify-content: flex-end; gap: 10px; flex-wrap: wrap; }
 
 .thinking-dots::after { content: ""; display: inline-block; width: 1.2em; text-align: left; animation: dots 1.1s steps(4,end) infinite; }
@@ -1111,4 +1354,6 @@ details.adv[open] > summary::after { transform: rotate(-135deg); margin-top: -2p
 @media (prefers-reduced-motion: reduce) {
   .screen, .nav-open .nav-links { animation: none; }
   .tile:hover, .reading-card:hover { transform: none; }
+  .board-frame.is-entering, .board-frame.is-shaking, .trail.is-new *, .piece .disc { animation: none !important; }
+  .btn::after { display: none; }
 }

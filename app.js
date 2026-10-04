@@ -356,6 +356,18 @@
     }
     const piecesLayer = el("div", { class: "layer pieces" });
     board.appendChild(grid);
+    // 対局の盤だけ: 駒の下に「動いた跡」(SVG、1マス=1の座標)と、波紋などの一瞬の演出の層を敷く
+    let trailLayer = null, fxUnder = null;
+    if (opts.trail) {
+      trailLayer = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+      trailLayer.setAttribute("class", "trail-svg layer");
+      trailLayer.setAttribute("viewBox", `0 0 ${size} ${size}`);
+      trailLayer.setAttribute("aria-hidden", "true");
+      board.appendChild(trailLayer);
+      fxUnder = el("div", { class: "layer fx-under", "aria-hidden": "true" });
+      fxUnder.style.setProperty("--cell", (100 / size) + "%");
+      board.appendChild(fxUnder);
+    }
     board.appendChild(piecesLayer);
     let fxLayer = null;
     if (opts.fx) {
@@ -369,26 +381,36 @@
     shell.appendChild(railLeft);
     shell.appendChild(board);
     boardFrame.appendChild(shell);
-    return { boardFrame, board, grid, cellNodes, piecesLayer, fxLayer };
+    return { boardFrame, board, grid, cellNodes, piecesLayer, fxLayer, trailLayer, fxUnder };
   }
 
-  function confirmModal(message, okLabel, cancelLabel) {
+  // 確認の窓。title を渡すと見出しを付ける。最初は取り消し側にフォーカスし、Esc・外側のクリックでも取り消す
+  function confirmModal(message, okLabel, cancelLabel, title) {
     return new Promise((resolve) => {
       const veil = el("div", { class: "veil" });
-      const modal = el("div", { class: "modal" }, [
+      const done = (ok) => { veil.remove(); document.removeEventListener("keydown", onKey); resolve(ok); };
+      const onKey = (e) => { if (e.key === "Escape") done(false); };
+      const cancelBtn = el("button", { class: "btn", type: "button", text: cancelLabel || "キャンセル", onclick: () => done(false) });
+      const modal = el("div", { class: "modal", role: "alertdialog", "aria-modal": "true" }, [
+        title ? el("h2", { class: "modal-title", text: title }) : null,
         el("p", { text: message }),
         el("div", { class: "modal-actions" }, [
-          el("button", { class: "btn", text: cancelLabel || "キャンセル", onclick: () => { veil.remove(); resolve(false); } }),
-          el("button", { class: "btn btn-danger", text: okLabel || "OK", onclick: () => { veil.remove(); resolve(true); } }),
+          cancelBtn,
+          el("button", { class: "btn btn-danger", type: "button", text: okLabel || "OK", onclick: () => done(true) }),
         ]),
       ]);
+      veil.addEventListener("click", (e) => { if (e.target === veil) done(false); });
+      document.addEventListener("keydown", onKey);
       veil.appendChild(modal);
       document.body.appendChild(veil);
+      cancelBtn.focus();
     });
   }
 
+  let toastNode = null;
   function toast(message) {
-    const t = el("div", {
+    if (toastNode) toastNode.remove(); // 続けて出したときは前のものと入れ替える(積み重ならない)
+    const t = toastNode = el("div", {
       text: message,
       style: {
         position: "fixed", left: "50%", bottom: "24px", transform: "translateX(-50%)",
@@ -397,7 +419,10 @@
       },
     });
     document.body.appendChild(t);
-    setTimeout(() => { t.style.transition = "opacity .4s"; t.style.opacity = "0"; setTimeout(() => t.remove(), 400); }, 1800);
+    setTimeout(() => {
+      t.style.transition = "opacity .4s"; t.style.opacity = "0";
+      setTimeout(() => { t.remove(); if (toastNode === t) toastNode = null; }, 400);
+    }, 1800);
   }
 
   // ============================================================ アプリ状態
@@ -409,11 +434,18 @@
   function goto(screen, payload) {
     if (App.match && App.match.mode === "tsume") stopTsumeReplay(App.match);
     if (App.match && App.screen === "game" && screen !== "game" && App.match.mode !== "tsume") {
-      // 対局中にメニュー等へ抜けようとした場合は確認する
-      const engine = App.match.engine;
-      if (engine && !engine.isOver() && !App.match.aiThinking) {
-        confirmModal("対戦中です。移動すると今の対戦は失われます。よろしいですか?").then((ok) => {
-          if (ok) { App.match = null; App.screen = screen; render(payload); }
+      // 終わっていない対局から別の画面へ抜けようとしたら、対局が破棄されることを伝えて確認する
+      // (AIの思考中・AI同士の観戦中も同じ。以前は AI の思考中だけ確認を飛ばしていたため、観戦中はほぼ出なかった)
+      const m = App.match;
+      if (m.engine && !m.engine.isOver()) {
+        const what = m.mode === "ai_vs_ai" ? "観戦中の対局" : "対戦中の対局";
+        const note = m.mode === "online"
+          ? "オンライン対戦は、最後に送り合った手番リンクを開けばその局面から続けられます。"
+          : "途中の対局は対戦履歴・棋譜に残りません。";
+        confirmModal(`ほかの画面へ移ると、${what}は破棄されます。${note}`, "破棄して移動する", "対局に戻る", "対局を破棄しますか?").then((ok) => {
+          if (!ok || App.match !== m) return;
+          if (thinkTimer) { clearInterval(thinkTimer); thinkTimer = null; } // 思考中の「…」の更新も止める
+          App.match = null; App.screen = screen; render(payload);
         });
         return;
       }
@@ -442,6 +474,150 @@
     if (e.target.closest("#nav-title")) { e.preventDefault(); setNavOpen(false); goto("menu"); }
   });
 
+  // ---- 音と演出(sound.js)。ヘッダーのスピーカーで1回で消せる・その隣で細かい設定 ----
+  const SND = window.HasamiSound;
+  const soundToggle = document.getElementById("sound-toggle");
+  function markSoundToggle() {
+    const on = SND.isOn();
+    soundToggle.setAttribute("aria-pressed", String(on));
+    soundToggle.setAttribute("aria-label", on ? "音: オン(押すと消す)" : "音: オフ(押すと鳴らす)");
+    soundToggle.classList.toggle("is-off", !on);
+  }
+  markSoundToggle();
+  soundToggle.addEventListener("click", () => { SND.setOn(!SND.isOn()); markSoundToggle(); closeSoundPrompt(); updateBgm(); });
+  document.getElementById("settings-btn").addEventListener("click", openSoundSettings);
+  // ブラウザは画面に触れるまで音を出せないので、タップのたびに音の準備をしておく(AIの手の音・BGMのため)
+  document.addEventListener("pointerdown", () => SND.unlock(), { passive: true });
+  document.addEventListener("click", (e) => {
+    const b = e.target.closest("button");
+    if (b && !b.disabled && b !== soundToggle) SND.play("tap");
+  }, true);
+
+  // 演出の強さ: full(標準)/ calm(控えめ: 二重の波紋・線の描き込み・盤の脈打ち・金粉を省く)/ off(動きなし)。
+  // 端末で「視差効果を減らす」がオンなら off
+  function fxLevel() {
+    const p = SND.get("fx");
+    if (p === "オフ" || (window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches)) return "off";
+    return p === "控えめ" ? "calm" : "full";
+  }
+  function reducedMotion() { return fxLevel() === "off"; }
+  function applyFxClass() {
+    const lv = fxLevel();
+    document.body.classList.toggle("fx-calm", lv === "calm");
+    document.body.classList.toggle("fx-off", lv === "off");
+  }
+  applyFxClass();
+
+  // 初めて対局するときに一度だけ「音を出しますか?」(最初は無音。電車の中などで急に鳴らないように)
+  let soundPromptNode = null;
+  function closeSoundPrompt() { if (soundPromptNode) { soundPromptNode.remove(); soundPromptNode = null; } }
+  function showSoundPrompt() {
+    if (SND.isAsked() || soundPromptNode) return;
+    const answer = (on) => { SND.setOn(on); markSoundToggle(); closeSoundPrompt(); updateBgm(); };
+    soundPromptNode = el("div", { class: "sound-prompt", role: "dialog", "aria-label": "音を出しますか" }, [
+      el("div", { class: "sound-prompt-text" }, [
+        el("b", { text: "音を出しますか?" }),
+        el("span", { text: "駒の音・BGMなど。あとからヘッダーのスピーカーと設定で変えられます。" }),
+      ]),
+      el("div", { class: "sound-prompt-actions" }, [
+        el("button", { type: "button", class: "btn btn-accent", text: "音を出す", onclick: () => answer(true) }),
+        el("button", { type: "button", class: "btn", text: "出さない", onclick: () => answer(false) }),
+      ]),
+    ]);
+    document.body.appendChild(soundPromptNode);
+  }
+
+  // 音と演出の設定(H)
+  function openSoundSettings() {
+    setNavOpen(false);
+    const veil = el("div", { class: "veil" });
+    const close = () => { veil.remove(); document.removeEventListener("keydown", onKey); document.getElementById("settings-btn").focus(); };
+    const onKey = (e) => { if (e.key === "Escape") close(); };
+    document.addEventListener("keydown", onKey);
+    veil.addEventListener("click", (e) => { if (e.target === veil) close(); });
+    const sw = (key, label, after) => {
+      const b = el("button", { type: "button", class: "switch", role: "switch", "aria-label": label });
+      const mark = () => { const on = key === "on" ? SND.isOn() : !!SND.get(key); b.classList.toggle("is-on", on); b.setAttribute("aria-checked", String(on)); };
+      b.addEventListener("click", () => {
+        if (key === "on") SND.setOn(!SND.isOn()); else SND.set(key, !SND.get(key));
+        mark(); markSoundToggle(); if (after) after(); updateBgm();
+      });
+      mark();
+      return b;
+    };
+    const slider = (key, label, test) => {
+      const out = el("span", { class: "set-num", text: `${Math.round(SND.get(key) * 100)}%` });
+      const input = el("input", { type: "range", min: "0", max: "100", step: "5", class: "set-slider", "aria-label": label });
+      input.value = String(Math.round(SND.get(key) * 100));
+      let t = null;
+      input.addEventListener("input", () => {
+        SND.set(key, Number(input.value) / 100);
+        out.textContent = `${input.value}%`;
+        clearTimeout(t); t = setTimeout(test, 260);
+      });
+      return [input, out];
+    };
+    const seg = (key, options, label, after) => {
+      const wrap = el("div", { class: "seg", role: "radiogroup", "aria-label": label });
+      options.forEach((o) => {
+        const b = el("button", { type: "button", role: "radio", text: o, "aria-checked": String(SND.get(key) === o) });
+        b.addEventListener("click", () => {
+          SND.set(key, o);
+          wrap.querySelectorAll("button").forEach((x) => x.setAttribute("aria-checked", String(x === b)));
+          if (after) after();
+        });
+        wrap.appendChild(b);
+      });
+      return wrap;
+    };
+    const row = (label, control, help, extra) => el("div", { class: "set-row" }, [
+      el("span", { class: "set-label", text: label }), control, extra || el("span"), help ? el("span", { class: "set-help", text: help }) : null,
+    ]);
+    const [seIn, seOut] = slider("volume", "効果音の音量", () => SND.play("pachi"));
+    const [bgIn, bgOut] = slider("bgmVolume", "BGMの音量", () => SND.previewBgm());
+    const panel = el("div", { class: "modal settings-modal", role: "dialog", "aria-modal": "true", "aria-labelledby": "settings-title" }, [
+      el("div", { class: "settings-head" }, [
+        el("h2", { id: "settings-title", text: "音と演出" }),
+        el("button", { type: "button", class: "btn btn-compact", text: "閉じる", onclick: close }),
+      ]),
+      row("音", sw("on", "音を出す"), "効果音とBGMをまとめてオン・オフ(ヘッダーのスピーカーと同じ)"),
+      row("効果音", seIn, "駒・ボタン・時計の音。動かすと「パチ」で試聴", seOut),
+      row("BGM", el("div", { class: "set-pair" }, [sw("bgm", "BGMを流す"), bgIn]), "場面ごとの音楽(その場で作曲)。動かすと箏のひとふしで試聴", bgOut),
+      row("演出の強さ", seg("fx", ["標準", "控えめ", "オフ"], "演出の強さ", applyFxClass),
+        "控えめ: 二重の波紋・線の描き込み・盤の脈打ち・金粉を省く。オフ: 動きを止める(音は鳴る)。端末で「視差効果を減らす」がオンなら、いつもオフ"),
+      row("画面の切り替え", seg("transition", ["墨", "襖", "なし"], "画面の切り替え"), "墨: 刷毛でひと塗りして抜ける。襖: 左右に開く"),
+      SND.canVibrate() ? row("振動", sw("vibrate", "振動"), "駒を置いた・動かしたとき、秒読みの最後5秒に短く振動") : null,
+    ]);
+    veil.appendChild(panel);
+    document.body.appendChild(veil);
+    panel.querySelector("button.switch").focus();
+  }
+
+  // ---- BGM: 画面と局面から場面を決めて sound.js に伝える(切り替えはフレーズの切れ目で) ----
+  function desiredBgmScene() {
+    const m = App.match;
+    switch (App.screen) {
+      case "game": {
+        if (!m) return "home";
+        if (m.mode === "tsume") return m.engine.isOver() || m.tsumeFailed ? null : "tsume";
+        if (m.engine.isOver()) return null; // 終局の音を聞かせるため止める
+        if (m.clockUrgent) return "byoyomi";
+        const r = m.evalDisplay && m.mode === "pvai" && m.evalView && m.evalView.result;
+        if (r) {
+          if (r.mate) return r.mate === m.humanPlayer ? "mateWin" : "mateLose";
+          const mine = m.humanPlayer === "A" ? r.winA : 1 - r.winA;
+          return mine > 0.65 ? "ahead" : mine < 0.35 ? "behind" : "even";
+        }
+        return "even";
+      }
+      case "review": return "review";
+      case "tsume": return "tsume";
+      case "tutorial": return "tutorial";
+      default: return "home";
+    }
+  }
+  function updateBgm() { SND.bgm(desiredBgmScene()); }
+
   // 画面 → ヘッダーで「いまここ」と示す項目(対局・感想戦などは入口になった項目)
   const NAV_OF_SCREEN = {
     menu: "menu", game: "menu", tutorial: "tutorial", learn: "learn", strategy: "strategy", aiguide: "aiguide",
@@ -469,8 +645,63 @@
       tsume: renderTsumeMenu, rating: renderRating, learn: renderLearn, aiguide: renderAiGuide,
     };
     markCurrentNav();
+    closeSoundPrompt();
     (renderers[App.screen] || renderMenu)(root, payload);
     window.scrollTo({ top: 0, behavior: "instant" in window ? "instant" : "auto" });
+    if (lastRenderedScreen && lastRenderedScreen !== App.screen) screenTransition();
+    lastRenderedScreen = App.screen;
+    homeBackdrop(App.screen === "menu");
+    updateBgm();
+  }
+
+  // ---- 画面の切り替え(F1): 新しい画面はすぐ描いておき、その上を墨が抜ける/襖が開く(0.5秒ほど) ----
+  let lastRenderedScreen = null, transitionNode = null;
+  function screenTransition() {
+    const kind = SND.get("transition");
+    if (kind === "なし" || fxLevel() === "off") return;
+    if (transitionNode) transitionNode.remove();
+    const node = transitionNode = el("div", { class: `screen-wipe wipe-${kind === "襖" ? "fusuma" : "sumi"}`, "aria-hidden": "true" },
+      kind === "襖" ? [el("span", { class: "fu fu-l" }), el("span", { class: "fu fu-r" })] : [el("span", { class: "ink" })]);
+    document.body.appendChild(node);
+    SND.play(kind === "襖" ? "fusuma" : "swish", 0, true);
+    setTimeout(() => { node.remove(); if (transitionNode === node) transitionNode = null; }, 700);
+  }
+
+  // ---- ホームの背景(F2): 薄く傾けた盤で、駒がゆっくり動き続ける(2.4秒に1手。画面が見えないときは止める) ----
+  let backdrop = null;
+  function homeBackdrop(show) {
+    if (!show) { if (backdrop) { clearInterval(backdrop.timer); backdrop.node.remove(); backdrop = null; } return; }
+    if (backdrop) return;
+    const N = 7;
+    const board = el("div", { class: "home-backdrop-board" });
+    const node = el("div", { class: "home-backdrop", "aria-hidden": "true" }, [board]);
+    const pieces = [[5, 1, "a"], [4, 3, "a"], [5, 5, "a"], [3, 2, "a"], [1, 2, "b"], [2, 4, "b"], [1, 5, "b"], [2, 1, "b"]]
+      .map(([r, c, p]) => { const n = el("span", { class: `bd-piece ${p}` }, [el("i")]); board.appendChild(n); return { r, c, p, n }; });
+    const place = () => pieces.forEach((q) => { q.n.style.transform = `translate(${q.c * 100}%, ${q.r * 100}%)`; });
+    place();
+    let turn = 0;
+    const step = () => {
+      if (document.hidden || fxLevel() === "off") return;
+      const side = turn++ % 2 ? "b" : "a";
+      const occ = new Set(pieces.map((q) => q.r + "," + q.c));
+      const opts = [];
+      pieces.forEach((q) => {
+        if (q.p !== side) return;
+        [[1, 0], [-1, 0], [0, 1], [0, -1]].forEach(([dr, dc]) => {
+          for (let s = 1; s <= 2; s++) {
+            const r = q.r + dr * s, c = q.c + dc * s;
+            if (r < 0 || r >= N || c < 0 || c >= N || occ.has(r + "," + c)) break;
+            opts.push([q, r, c]);
+          }
+        });
+      });
+      if (!opts.length) return;
+      const [q, r, c] = opts[Math.floor(Math.random() * opts.length)];
+      q.r = r; q.c = c;
+      place();
+    };
+    document.body.appendChild(node);
+    backdrop = { node, timer: setInterval(step, 2400) };
   }
 
   // 画面の見出し(戻る導線・タイトル・説明)。crumbs: [[ラベル, 画面名], ...] は上の階層へのリンク
@@ -1185,19 +1416,22 @@
     const targetEngine = m.engine;
     requestTsume("defend", m.engine, m.humanPlayer, tsumeQuietLeft(m), tsumeBudget(m), (res) => {
       if (App.match !== m || m.engine !== targetEngine) return; // やり直し・解答再生で破棄された
-      m.aiThinking = false;
-      m.busyText = null;
-      if (!res) { updateGameUI(); toast("受けの計算に失敗しました。「やり直す」を押してください。"); return; }
-      pushHistory(defender);
-      const fromPos = res.move[0] === "move" ? m.engine.pieces.get(res.move[1]).position.slice() : null;
-      applyLocalAction(defender, res.move, fromPos);
-      m.lastAction = res.move[0] === "move" ? { from: fromPos, to: res.move[2] } : { from: null, to: res.move[1] };
-      if (!res.proven && !m.engine.isOver()) {
-        m.tsumeFailed = tsumeBudget(m) <= 1
-          ? `手数切れです。最短${m.puzzle.par}手の問題なので、${m.puzzle.par + TSUME_SLACK}手以内に詰ませましょう。`
-          : `詰みを逃しました。相手は ${res.label.replace("-", "→")} と受けて逃れました。`;
-      }
-      afterPlayerAction();
+      if (!res) { m.aiThinking = false; m.busyText = null; updateGameUI(); toast("受けの計算に失敗しました。「やり直す」を押してください。"); return; }
+      aiCue(m, res.move, () => {
+        if (m.tsumeReplay) return; // 合図の間に解答の再生が始まった
+        m.aiThinking = false;
+        m.busyText = null;
+        pushHistory(defender);
+        const fromPos = res.move[0] === "move" ? m.engine.pieces.get(res.move[1]).position.slice() : null;
+        applyLocalAction(defender, res.move, fromPos);
+        m.lastAction = res.move[0] === "move" ? { from: fromPos, to: res.move[2] } : { from: null, to: res.move[1] };
+        if (!res.proven && !m.engine.isOver()) {
+          m.tsumeFailed = tsumeBudget(m) <= 1
+            ? `手数切れです。最短${m.puzzle.par}手の問題なので、${m.puzzle.par + TSUME_SLACK}手以内に詰ませましょう。`
+            : `詰みを逃しました。相手は ${res.label.replace("-", "→")} と受けて逃れました。`;
+        }
+        afterPlayerAction();
+      });
     });
   }
 
@@ -1537,7 +1771,11 @@
 
   function applyLocalAction(player, action, fromPos) {
     const m = App.match;
+    const movingId = action[0] === "move" ? action[1] : null;
+    const oblCount = (id) => (id == null ? 0 : m.engine.obligated[player].filter((pid) => pid === id).length);
+    const oblBefore = oblCount(movingId);
     const result = AI.applyAction(m.engine, player, action);
+    m.lastFx = describeActionFx(m.engine, player, action, fromPos, result, oblBefore > oblCount(movingId));
     const extra = logAction(player, action, result, fromPos);
     if (m.clock) {
       clockCommit(m.clock, player);
@@ -1551,6 +1789,47 @@
     }
     return { result, extra };
   }
+
+  // 盤の演出に渡す「いま指した手」の情報: 挟んだ駒とその向き・向こう側が駒か壁か・
+  // 自分から挟まれる形に入ったか・移動義務が解けたか(escaped)
+  let fxSeq = 0;
+  function describeActionFx(engine, player, action, fromPos, result, escaped) {
+    const to = action[0] === "place" ? action[1] : action[2];
+    const mover = engine.pieceAt(to);
+    const opponent = otherPlayer(player);
+    const sandwiches = [];
+    for (const pid of result.newlySandwiched) {
+      const p = engine.pieces.get(pid);
+      if (!p) continue;
+      const d = [p.position[0] - to[0], p.position[1] - to[1]];
+      const far = [to[0] + 2 * d[0], to[1] + 2 * d[1]];
+      const wall = engine._flank(far, player) === "wall";
+      const farPiece = wall ? null : engine.pieceAt(far);
+      sandwiches.push({ pid, pos: p.position.slice(), d, wall, farId: farPiece ? farPiece.id : null });
+    }
+    let self = null;
+    if (result.selfSandwiched && mover) {
+      for (const [d1, d2] of [[[0, 1], [0, -1]], [[1, 0], [-1, 0]]]) {
+        const side = (d) => {
+          const q = [to[0] + d[0], to[1] + d[1]], f = engine._flank(q, opponent);
+          if (f === "wall") return { wall: true, d };
+          return f ? { id: engine.pieceAt(q).id, d } : null;
+        };
+        const f1 = side(d1), f2 = side(d2);
+        if (f1 && f2 && !(f1.wall && f2.wall)) { self = { horiz: d1[0] === 0, flanks: [f1, f2] }; break; }
+      }
+    }
+    const fx = { id: ++fxSeq, player, kind: action[0], from: fromPos ? fromPos.slice() : null, to: to.slice(), moverId: mover ? mover.id : null, sandwiches, self, escaped };
+    // 挟まれた駒の朱い輪は、駒が着いて「挟む」演出をする瞬間に付ける(それまでは描かない)
+    if (sandwiches.length || self) {
+      const ids = new Set(sandwiches.map((s) => s.pid));
+      if (self) ids.add(fx.moverId);
+      fx.sealIds = ids;
+      fx.sealUntil = performance.now() + captureDelay(fx) + 120;
+    }
+    return fx;
+  }
+  function captureDelay(fx) { return fx.kind === "place" ? 520 : 360; }
 
   function aiOptsFor(player) {
     const m = App.match;
@@ -1582,16 +1861,28 @@
     const targetEngine = m.engine;
     requestAIMove(m.engine, player, aiOptsFor(player), (action) => {
       if (App.match !== m || m.engine !== targetEngine) return; // 対局がリセットされていた
-      m.aiThinking = false;
-      if (action) {
-        pushHistory(player);
-        let fromPos = null;
-        if (action[0] === "move") fromPos = m.engine.pieces.get(action[1]).position.slice();
-        applyLocalAction(player, action, fromPos);
-        m.lastAction = action[0] === "move" ? { from: fromPos, to: action[2] } : { from: null, to: action[1] };
-      }
-      afterPlayerAction();
+      aiCue(m, action, () => {
+        m.aiThinking = false;
+        if (action) {
+          pushHistory(player);
+          let fromPos = null;
+          if (action[0] === "move") fromPos = m.engine.pieces.get(action[1]).position.slice();
+          applyLocalAction(player, action, fromPos);
+          m.lastAction = action[0] === "move" ? { from: fromPos, to: action[2] } : { from: null, to: action[1] };
+        }
+        afterPlayerAction();
+      });
     });
+  }
+
+  // AIが指す直前の合図(D2): 動かす駒に金の輪が一瞬重なってから動く(0.42秒)。
+  // その間は思考中のまま(待った・クリックは受け付けない)。配置の手・動きなしの設定ではすぐ指す
+  function aiCue(m, action, apply) {
+    const node = action && action[0] === "move" && App.gameDom && m.pieceNodes.get(action[1]);
+    if (!node || fxLevel() === "off") { apply(); return; }
+    const engine = m.engine;
+    tempClass(node, "is-cue", 600);
+    setTimeout(() => { if (App.match === m && m.engine === engine) apply(); }, 420);
   }
 
   function afterPlayerAction() {
@@ -1682,16 +1973,32 @@
   function clockTick(m) {
     const ck = m.clock;
     if (!ck || ck.stopped || ck.paused) return;
-    if (m.engine.isOver()) { stopClock(ck); drawClocks(); return; }
+    if (m.engine.isOver()) {
+      stopClock(ck);
+      m.clockUrgent = false;
+      if (App.gameDom && App.gameDom.boardFrame) App.gameDom.boardFrame.classList.remove("is-urgent");
+      drawClocks();
+      return;
+    }
     const v = clockView(ck, ck.side);
     if (v.out) { onClockFlag(m, ck.side); return; }
-    if (m.clockSound && App.screen === "game") {
-      const sec = Math.ceil(v.counting / 1000);
-      if (sec <= clockLowSeconds(ck, v) && sec >= 1 && sec !== ck.lastBeep) {
-        ck.lastBeep = sec;
-        beep(sec <= 3 ? 1046 : 784, sec <= 5 ? 0.12 : 0.06);
+    // 秒読み(E): 残りわずかで毎秒、木の小さな「コッ」。最後の5秒は裏拍にも小さく打って刻みを倍にし
+    // (歌舞伎の幕切れの拍子木の「キザミ」にならう)、表拍の音を1秒ごとに半音ずつ上げる。盤の縁も秒に合わせて赤く脈打つ
+    const sec = Math.ceil(v.counting / 1000);
+    const low = sec <= clockLowSeconds(ck, v);
+    if (low !== !!m.clockUrgent) { m.clockUrgent = low; updateBgm(); }
+    if (m.clockSound && App.screen === "game" && low && sec >= 1 && sec !== ck.lastBeep) {
+      ck.lastBeep = sec;
+      if (sec > 5) SND.play("tick", 0, { f: 1760, v: 0.5 });
+      else {
+        const f = 440 * Math.pow(2, (86 + (5 - sec) - 69) / 12); // 高いレから半音ずつ上へ
+        SND.play("tick", 0, { f, v: 0.85 });
+        SND.play("tick", 0.5, { f, v: 0.38 });
+        SND.vibrate(15);
       }
     }
+    const dom = App.gameDom;
+    if (dom && dom.boardFrame) dom.boardFrame.classList.toggle("is-urgent", low && sec <= 5 && fxLevel() === "full");
     drawClocks();
   }
 
@@ -1709,31 +2016,12 @@
     m.timeoutLoser = loser;
     m.selected = null;
     m.logMessages.push(`${playerDisplayName(loser)}の時間切れ`);
-    if (m.clockSound) beep(523, 0.6);
+    m.clockUrgent = false;
+    if (App.gameDom && App.gameDom.boardFrame) App.gameDom.boardFrame.classList.remove("is-urgent");
+    if (m.clockSound) SND.play("flag");
     recordIfFinished();
     updateGameUI();
     refreshEval();
-  }
-
-  let audioCtx = null;
-  function beep(freq, seconds) {
-    try {
-      const Ctx = window.AudioContext || window.webkitAudioContext;
-      if (!Ctx) return;
-      audioCtx = audioCtx || new Ctx();
-      if (audioCtx.state === "suspended") audioCtx.resume();
-      const osc = audioCtx.createOscillator();
-      const gain = audioCtx.createGain();
-      osc.type = "sine";
-      osc.frequency.value = freq;
-      const t = audioCtx.currentTime;
-      gain.gain.setValueAtTime(0.0001, t);
-      gain.gain.exponentialRampToValueAtTime(0.18, t + 0.01);
-      gain.gain.exponentialRampToValueAtTime(0.0001, t + seconds);
-      osc.connect(gain).connect(audioCtx.destination);
-      osc.start(t);
-      osc.stop(t + seconds + 0.02);
-    } catch (e) { /* 音が出せない環境でも時計は動く */ }
   }
 
   function formatClock(ms) {
@@ -1920,15 +2208,15 @@
     // ---- 盤面 ----
     const boardWrap = el("div", { class: "board-wrap" });
     const size = m.engine.config.rows;
-    const { boardFrame, board, grid, cellNodes, piecesLayer, fxLayer } =
-      buildBoardShell(size, { onCellClick, fx: true });
+    const { boardFrame, board, grid, cellNodes, piecesLayer, fxLayer, trailLayer, fxUnder } =
+      buildBoardShell(size, { onCellClick, fx: true, trail: true });
     boardWrap.appendChild(boardFrame);
 
     const legend = el("div", { class: "legend-row" });
     const legA = el("span", {}, [el("span", { class: "legend-dot", style: { background: C.PLAYER_COLORS.A.legend } }), document.createTextNode(playerDisplayName("A"))]);
     const legB = el("span", {}, [el("span", { class: "legend-dot", style: { background: C.PLAYER_COLORS.B.legend } }), document.createTextNode(playerDisplayName("B"))]);
     legend.appendChild(legA); legend.appendChild(legB);
-    legend.appendChild(el("span", { style: { color: "var(--warning)" }, text: "┅ 直前の手" }));
+    legend.appendChild(el("span", { style: { color: "var(--warning)" }, text: "┅ 直前の手(○—は動いた跡)" }));
     boardWrap.appendChild(legend);
     boardCol.appendChild(boardWrap);
 
@@ -1972,8 +2260,19 @@
       modeText, turnText, obligationText, bannerHost, undoBtn, restartBtn, stepBtn, pauseBtn, hintBtn, tsumePanel,
       clockBtn, clocks, evalMeter,
       board, grid, cellNodes, piecesLayer, fxLayer, size, sideA, sideB, logList,
+      boardFrame, trailLayer, fxUnder,
     };
     m.pieceNodes = new Map();
+    // 対局開始(C1): 盤が少し奥からふっと現れ、拍子木「カン……カン」。詰めピンチは問題ごとに鳴ると煩いので除く
+    showSoundPrompt(); // 初めての対局でだけ「音を出しますか?」
+    if (m.mode !== "tsume" && !m.startFxDone && !m.kifuRecords.length) {
+      m.startFxDone = true;
+      SND.play("start");
+      if (!reducedMotion()) {
+        boardFrame.classList.add("is-entering");
+        setTimeout(() => boardFrame.classList.remove("is-entering"), 900);
+      }
+    }
     updateGameUI();
   }
 
@@ -2004,9 +2303,17 @@
     const piece = engine.pieceAt([r, c]);
     const rules = humanMoveRules(m);
     const trySelect = () => {
-      if (rules.canSelect(piece)) { m.selected = [r, c]; updateGameUI(); return; }
+      if (rules.canSelect(piece)) {
+        const again = m.selected && m.selected[0] === r && m.selected[1] === c;
+        m.selected = [r, c];
+        if (!again) SND.play("kotsu");
+        updateGameUI();
+        return;
+      }
       if (rules.allowed && (!engine.obligated[player].length || engine.obligated[player].includes(piece.id))) {
-        toast("この駒では相手を挟めません(詰めピンチでは毎手、相手の駒を挟みます)");
+        illegalFeedback("この駒では相手を挟めません(詰めピンチでは毎手、相手の駒を挟みます)");
+      } else if (engine.obligated[player].length) {
+        illegalFeedback("移動義務のある駒(赤い輪)を先に動かしてください。");
       }
     };
 
@@ -2027,7 +2334,14 @@
         afterPlayerAction();
         return;
       }
-      if (piece && piece.player === player) trySelect();
+      if (piece && piece.player === player) { trySelect(); return; }
+      // 指せないマス(A4): 盤がわずかに揺れ、低い「コン」と理由
+      if (piece) illegalFeedback("相手の駒のマスには動けません。");
+      else if (selPiece) {
+        illegalFeedback(rules.allowed && !TU.moveBlockReason(engine, selPiece, [r, c])
+          ? "この手では相手を挟めません(詰めピンチでは毎手、相手の駒を挟みます)"
+          : (TU.moveBlockReason(engine, selPiece, [r, c]) || "選んだ駒はそこへは動けません。"));
+      }
       return;
     }
 
@@ -2041,9 +2355,27 @@
         m.lastAction = { from: null, to: [r, c] };
         afterPlayerAction();
       } else if (rules.allowed && !engine.obligated[player].length) {
-        toast("詰めピンチでは配置できません(配置では相手を挟めないため)");
+        illegalFeedback("詰めピンチでは配置できません(配置では相手を挟めないため)");
+      } else {
+        illegalFeedback(TU.placementBlockReason(engine, player, [r, c]) || "そこには置けません。");
       }
+    } else {
+      illegalFeedback("相手の駒は動かせません。");
     }
+  }
+
+  // 指せない手を押したとき(A4)。理由は チュートリアルと同じ文言(tutorial.js)
+  function illegalFeedback(msg) {
+    const dom = App.gameDom;
+    SND.play("kon");
+    if (msg) toast(msg);
+    if (!dom || !dom.boardFrame || reducedMotion()) return;
+    const f = dom.boardFrame;
+    f.classList.remove("is-shaking", "is-entering");
+    void f.offsetWidth; // アニメーションを最初からやり直す
+    f.classList.add("is-shaking");
+    clearTimeout(f._shakeTimer);
+    f._shakeTimer = setTimeout(() => f.classList.remove("is-shaking"), 400);
   }
 
   // 「待った」で戻る先(historyStack の添字)。AI戦はあなたの手番の局面まで戻す
@@ -2147,11 +2479,17 @@
     }
 
     drawBoard();
+    drawTrails();
+    runActionFx();
     drawStatus();
     drawClocks();
     drawEvalMeter();
     drawLog();
     drawBanner();
+    drawVerdict();
+    // AIの思考中(D1): 盤の縁を金の光がゆっくり一周し続ける
+    if (dom.boardFrame) dom.boardFrame.classList.toggle("is-thinking", !!m.aiThinking && !m.tsumeReplay && fxLevel() !== "off");
+    updateBgm();
     if (m.mode === "tsume") updateTsumePanel();
 
     if (thinkTimer) { clearInterval(thinkTimer); thinkTimer = null; }
@@ -2247,10 +2585,13 @@
       node.style.width = (100 / dom.size) + "%";
       node.style.height = (100 / dom.size) + "%";
       node.style.transform = `translate(${piece.position[1] * 100}%, ${piece.position[0] * 100}%)`;
-      const isObligated = engine.obligated[piece.player].includes(piece.id);
+      const oblCount = engine.obligated[piece.player].filter((pid) => pid === piece.id).length;
+      const sealHeld = m.lastFx && m.lastFx.sealIds && m.lastFx.sealIds.has(piece.id) && performance.now() < m.lastFx.sealUntil;
+      const isObligated = oblCount > 0 && !sealHeld;
       const isSelected = m.selected && m.selected[0] === piece.position[0] && m.selected[1] === piece.position[1];
       const isLast = m.lastAction && m.lastAction.to && m.lastAction.to[0] === piece.position[0] && m.lastAction.to[1] === piece.position[1];
       node.classList.toggle("is-obligated", isObligated);
+      node.classList.toggle("is-obligated-2", isObligated && oblCount > 1); // 2方向から挟まれた駒は輪を二重に(B3)
       node.classList.toggle("is-selected", !!isSelected);
       node.classList.toggle("is-last", !!isLast);
       if (isNew) {
@@ -2260,6 +2601,198 @@
     }
     for (const [id, node] of Array.from(m.pieceNodes)) {
       if (!seen.has(id)) { node.remove(); m.pieceNodes.delete(id); }
+    }
+  }
+
+  // ============================================================ 盤の演出(第1弾)
+  // 動いた跡(A3): 両者の直前の手を、出発点の輪 + 墨の線で次の手まで残す。自分(先手)=青墨、後手=墨。
+  // 直前に指した側を濃く。配置はマスを薄く色づける。棋譜から作るので「待った」にもそのまま追従する
+  function lastMovesBySide(m) {
+    const out = { latest: null };
+    const recs = m.kifuRecords;
+    for (let i = recs.length - 1; i >= Math.max(0, recs.length - 2); i--) {
+      const k = recs[i];
+      if (!k.mover || out[k.mover] || !k.to) continue;
+      out[k.mover] = { turn: k.turn, from: k.from ? H.posFromLabel(k.from) : null, to: H.posFromLabel(k.to) };
+      if (!out.latest) out.latest = k.mover;
+    }
+    return out;
+  }
+
+  function drawTrails() {
+    const m = App.match, dom = App.gameDom;
+    if (!dom.trailLayer) return;
+    const t = lastMovesBySide(m);
+    const key = ["A", "B"].map((p) => (t[p] ? `${p}${t[p].turn}` : "")).join("|") + ":" + t.latest;
+    if (dom.trailKey === key) return;
+    const prevTurn = dom.trailTurn || 0;
+    dom.trailKey = key;
+    clearNode(dom.trailLayer);
+    const NS = "http://www.w3.org/2000/svg";
+    const add = (parent, tag, attrs) => {
+      const n = document.createElementNS(NS, tag);
+      for (const a in attrs) n.setAttribute(a, attrs[a]);
+      parent.appendChild(n);
+      return n;
+    };
+    let maxTurn = 0;
+    for (const p of (t.latest === "A" ? ["B", "A"] : ["A", "B"])) { // 直前の手を上に重ねる
+      const tr = t[p];
+      if (!tr) continue;
+      maxTurn = Math.max(maxTurn, tr.turn);
+      const g = add(dom.trailLayer, "g", { class: `trail side-${p.toLowerCase()}${p === t.latest ? "" : " is-old"}${tr.turn > prevTurn ? " is-new" : ""}` });
+      if (tr.from) {
+        add(g, "line", { class: "trail-line", x1: tr.from[1] + 0.5, y1: tr.from[0] + 0.5, x2: tr.to[1] + 0.5, y2: tr.to[0] + 0.5, pathLength: 1 });
+        add(g, "circle", { class: "trail-from", cx: tr.from[1] + 0.5, cy: tr.from[0] + 0.5, r: 0.17 });
+      } else {
+        add(g, "rect", { class: "trail-drop", x: tr.to[1] + 0.04, y: tr.to[0] + 0.04, width: 0.92, height: 0.92, rx: 0.06 });
+      }
+    }
+    dom.trailTurn = maxTurn;
+  }
+
+  // 相手側(AI・後手)の手の音は少し低く小さく
+  function isFarSide(m, player) {
+    return (m.mode === "pvai" || m.mode === "tsume") ? player !== m.humanPlayer : player === "B";
+  }
+  function fxSpawn(parent, cls, css, ms, children) {
+    const n = el("span", { class: cls }, children);
+    n.style.cssText = css;
+    parent.appendChild(n);
+    setTimeout(() => n.remove(), ms);
+    return n;
+  }
+  function tempClass(node, cls, ms) {
+    if (!node) return;
+    node.classList.remove(cls);
+    void node.offsetWidth;
+    node.classList.add(cls);
+    setTimeout(() => node.classList.remove(cls), ms);
+  }
+  function nudgeClass(d) { return d[1] === 1 ? "nd-r" : d[1] === -1 ? "nd-l" : d[0] === 1 ? "nd-d" : "nd-u"; }
+  function cellCenterCss(dom, pos) { return `left:${(pos[1] + 0.5) * 100 / dom.size}%;top:${(pos[0] + 0.5) * 100 / dom.size}%`; }
+
+  // いま指した手の演出(A2・A3・B0・B4)。手ごとに1回だけ(m.lastFx.id で見分ける)
+  function runActionFx() {
+    const m = App.match, dom = App.gameDom, fx = m.lastFx;
+    if (!fx || !dom.fxUnder || m.fxShown === fx.id) return;
+    m.fxShown = fx.id;
+    const calm = reducedMotion();
+    const alive = () => App.match === m && App.gameDom === dom;
+    const land = fx.kind === "place" ? 330 : 300; // 置く: 落ちてきて着地する瞬間 / 動かす: すべり終わる瞬間
+    if (fx.kind === "move") SND.play("swish");
+    const far = isFarSide(m, fx.player);
+    SND.play(far ? "pachiFar" : "pachi", land / 1000);
+    if (!far) setTimeout(() => SND.vibrate(12), land);
+    if (!calm) {
+      setTimeout(() => {
+        if (!alive()) return;
+        const css = cellCenterCss(dom, fx.to);
+        fxSpawn(dom.fxUnder, "fx-ripple", css, 1100);
+        if (fxLevel() === "full") fxSpawn(dom.fxUnder, "fx-ripple r2", css, 1250); // 控えめでは波紋を1重に
+      }, land);
+    }
+    if (fx.escaped && fx.from) {
+      SND.play("crack");
+      if (!calm) {
+        const k = dom.fxUnder.clientWidth / dom.size / 74; // 欠片の飛ぶ距離はマスの大きさに合わせる
+        const shards = [el("span", { class: "burst" })];
+        for (let i = 0; i < 8; i++) shards.push(el("span", { class: `shard s${i}` }));
+        fxSpawn(dom.fxUnder, "fx-shatter", `${cellCenterCss(dom, fx.from)};transform:scale(${k.toFixed(3)})`, 900, shards);
+      }
+    }
+    if (fx.sealIds) setTimeout(() => { if (alive()) captureFx(m, dom, fx, calm); }, captureDelay(fx));
+  }
+
+  // 挟んだ瞬間(B0「押される」): 挟まれた駒が挟まれた向きに一瞬つぶれ、挟んだ2駒が内へ寄り、朱い輪が付く。
+  // 壁で挟んだときは盤の縁のその部分が赤く光る。音は石が触れ合う「カチッ」(壁だけなら1打)
+  function captureFx(m, dom, fx, calm) {
+    fx.sealUntil = 0;
+    drawBoard(); // 待たせていた朱い輪をここで付ける
+    const nodeOf = (id) => m.pieceNodes.get(id);
+    let wallOnly = true;
+    const wallHit = (pos, d) => {
+      const s = 100 / dom.size;
+      const css = d[1] === 1 ? `right:0;width:4px;top:${pos[0] * s}%;height:${s}%`
+        : d[1] === -1 ? `left:0;width:4px;top:${pos[0] * s}%;height:${s}%`
+        : d[0] === 1 ? `bottom:0;height:4px;left:${pos[1] * s}%;width:${s}%`
+        : `top:0;height:4px;left:${pos[1] * s}%;width:${s}%`;
+      fxSpawn(dom.fxUnder, "fx-wallhit", css, 800);
+    };
+    for (const s of fx.sandwiches) {
+      if (!calm) {
+        tempClass(nodeOf(s.pid), s.d[0] === 0 ? "sq-h" : "sq-v", 520);
+        tempClass(nodeOf(fx.moverId), nudgeClass(s.d), 520);
+        if (s.farId != null) tempClass(nodeOf(s.farId), nudgeClass([-s.d[0], -s.d[1]]), 520);
+      }
+      if (s.wall) wallHit(s.pos, s.d); else wallOnly = false;
+    }
+    if (fx.self) {
+      if (!calm) tempClass(nodeOf(fx.moverId), fx.self.horiz ? "sq-h" : "sq-v", 520);
+      for (const f of fx.self.flanks) {
+        if (f.wall) wallHit(fx.to, f.d);
+        else { wallOnly = false; if (!calm) tempClass(nodeOf(f.id), nudgeClass([-f.d[0], -f.d[1]]), 520); }
+      }
+    }
+    SND.play("kachi", 0, wallOnly);
+  }
+
+  // 終局(C2〜C4・控えめ): 薄い幕に縦書きで結果。勝ちは金粉10粒、負けは四隅から墨、引き分けは円相。
+  // 盤は隠しきらず、結果の帯(バナー)はそのまま。同じ終局を描き直すときは動き・音なし
+  function verdictInfo(m) {
+    const e = m.engine;
+    if (!e.winner) return e.isDraw ? { kind: "draw", title: "引き分け", sub: "同じ局面が繰り返されました" } : null;
+    const loser = otherPlayer(e.winner);
+    if (m.mode === "tsume") return e.winner === m.humanPlayer && !m.tsumeReplay ? { kind: "win", title: "詰み", sub: "", loser } : null;
+    if (m.mode === "pvai") {
+      const won = e.winner === m.humanPlayer;
+      return { kind: won ? "win" : "lose", title: won ? "勝ち" : "負け", sub: won ? "相手の駒を動けなくしました" : "あなたの駒が挟まれて動けなくなりました", loser };
+    }
+    return {
+      kind: "win", title: `${e.winner === "A" ? "先手" : "後手"}の勝ち`, loser,
+      sub: m.timeoutLoser ? `${playerDisplayName(m.timeoutLoser)}の時間切れ` : "相手の駒を動けなくしました",
+    };
+  }
+  function ensoSvg() {
+    const NS = "http://www.w3.org/2000/svg";
+    const svg = document.createElementNS(NS, "svg");
+    svg.setAttribute("class", "vd-enso");
+    svg.setAttribute("viewBox", "0 0 230 230");
+    [["e1", "M150 36 C 205 62, 214 140, 168 184 C 124 224, 52 206, 30 150 C 10 98, 44 40, 104 30 C 118 28, 128 29, 136 31"],
+      ["e2", "M146 42 C 198 68, 204 140, 162 178 C 122 214, 58 200, 38 148"]].forEach(([cls, d]) => {
+      const p = document.createElementNS(NS, "path");
+      p.setAttribute("class", cls); p.setAttribute("d", d); p.setAttribute("pathLength", "1");
+      svg.appendChild(p);
+    });
+    return svg;
+  }
+  function drawVerdict() {
+    const m = App.match, dom = App.gameDom;
+    const v = m.engine.isOver() ? verdictInfo(m) : null;
+    const key = v ? `${v.kind}:${m.kifuRecords.length}` : null;
+    if (dom.verdictKey === key) return;
+    dom.verdictKey = key;
+    if (dom.verdictNode) { dom.verdictNode.remove(); dom.verdictNode = null; }
+    if (!v) return;
+    const fresh = m.verdictShown !== key;
+    m.verdictShown = key;
+    const veil = el("div", { class: `vd-layer vd-${v.kind}${fresh && !reducedMotion() ? "" : " is-static"}`, "aria-hidden": "true" });
+    if (v.kind === "lose") veil.appendChild(el("div", { class: "vd-ink" }));
+    const shade = el("div", { class: "vd-shade" });
+    if (v.kind === "draw") shade.appendChild(ensoSvg());
+    shade.appendChild(el("div", { class: "vd-text" }, [
+      v.sub ? el("span", { class: "vd-sub", text: v.sub }) : null,
+      el("span", { class: `vd-title${v.title.length > 2 ? " is-long" : ""}`, text: v.title }),
+    ]));
+    veil.appendChild(shade);
+    if (v.kind === "win" && fxLevel() === "full") for (let i = 0; i < 10; i++) veil.appendChild(el("span", { class: `vd-dust d${i}` }));
+    dom.board.appendChild(veil);
+    dom.verdictNode = veil;
+    if (!fresh) return;
+    if (m.mode !== "tsume") SND.play(v.kind, 0.6); // 詰めピンチは星の音(drawTsumeBanner)で締める
+    if (v.loser && !reducedMotion()) {
+      const ids = m.engine.obligated[v.loser].slice();
+      setTimeout(() => { if (App.gameDom === dom) ids.forEach((pid) => tempClass(m.pieceNodes.get(pid), "is-trapped", 1400)); }, 450);
     }
   }
 
@@ -2300,6 +2833,35 @@
     em.bar.setAttribute("aria-label", r ? `形勢 先手${pctA}% 後手${100 - pctA}%` : "形勢 未計算");
     em.root.classList.toggle("is-stale", v.status !== "ready");
     em.note.textContent = evalNoteText(m, v);
+    // 詰みを読み切った(D4): バーが金色になり、光がゆっくり流れ続ける。初めて見えたときに笙の和音とりん
+    const mate = r && r.mate && !r.final ? r.mate : null;
+    em.root.classList.toggle("is-mate", !!mate);
+    if (v.status === "ready" && mate !== (m.mateSeen || null)) {
+      m.mateSeen = mate;
+      if (mate && (m.mode !== "pvai" || mate === m.humanPlayer)) SND.play("mate");
+    }
+    // 形勢が大きく動いた(D3): 前の手の読みから20%以上動いたら、バーを光が走り「形勢逆転」など。
+    // 音は小鼓(良くなれば澄んだ「ポン」、悪くなればこもった「プ」)。待ったで戻ったときは反応しない
+    if (v.status === "ready" && r && !r.final && v.plies != null && v.plies !== m.evalFxPlies) {
+      const prevPlies = m.evalFxPlies, prevWin = m.evalFxWin;
+      m.evalFxPlies = v.plies; m.evalFxWin = winA;
+      if (prevWin != null && v.plies > prevPlies && Math.abs(winA - prevWin) >= 0.2) evalSwingFx(m, em, prevWin, winA);
+    }
+    updateBgm();
+  }
+
+  function evalSwingFx(m, em, from, to) {
+    const me = m.mode === "pvai" ? m.humanPlayer : "A";
+    const f = me === "A" ? from : 1 - from, t = me === "A" ? to : 1 - to;
+    const good = t > f, crossed = (from - 0.5) * (to - 0.5) < 0;
+    const text = crossed ? "形勢逆転" : m.mode !== "pvai" ? "形勢が大きく動きました" : good ? "形勢が良くなりました" : "形勢が苦しくなりました";
+    SND.play(good ? "pon" : "pu");
+    if (em.swing) em.swing.remove();
+    em.swing = el("span", { class: `eval-swing${good ? "" : " is-bad"}`, text, "aria-hidden": "true" });
+    em.root.appendChild(em.swing);
+    const node = em.swing;
+    setTimeout(() => { node.remove(); if (em.swing === node) em.swing = null; }, 2100);
+    if (fxLevel() !== "off") fxSpawn(em.bar, "eval-flash", "", 800);
   }
 
   function evalNoteText(m, v) {
@@ -2354,7 +2916,13 @@
     dom.bannerHost.appendChild(banner);
     const note = ratingNoteFor(m.finishedRecord);
     if (note) {
-      dom.bannerHost.appendChild(el("div", { class: `rating-note ${note.cls}` }, [
+      // レートが出た瞬間(F5): 上がっていれば金色に光らせ、民謡音階を駆け上がる音
+      const up = note.cls === "ok" && note.diff > 0;
+      if (note.cls === "ok" && m.ratingFxShown !== m.finishedRecord.id) {
+        m.ratingFxShown = m.finishedRecord.id;
+        if (up) SND.play("rise");
+      }
+      dom.bannerHost.appendChild(el("div", { class: `rating-note ${note.cls}${up ? " is-up" : ""}` }, [
         el("span", { text: note.text }),
         el("button", { class: "btn btn-compact", text: "レートの推移", onclick: () => goto("rating") }),
       ]));
@@ -2365,7 +2933,7 @@
     const m = App.match, dom = App.gameDom;
     const engine = m.engine;
     const pz = m.puzzle;
-    let cls = null, text = "";
+    let cls = null, text = "", stars = null;
     const buttons = [];
     const btn = (label, fn) => buttons.push(el("button", { class: "btn btn-compact", text: label, onclick: fn }));
     const next = () => startTsumePuzzle(nextTsumePuzzle(pz));
@@ -2381,6 +2949,7 @@
       const how = plies <= pz.par ? "最短手順" : `最短は${pz.par}手`;
       const note = m.tsumeStars === 3 ? "" : (m.tsumeHintUsed || m.tsumeUndoUsed ? " ※ヒント・待ったを使うと★2つまで" : "");
       text = `詰み! ${starText(m.tsumeStars)} ${plies}手(${how})${note}`;
+      stars = { n: m.tsumeStars || 0, rest: ` ${plies}手(${how})${note}` };
       btn("次の問題へ", next);
       btn("解答を見る", startTsumeReplay);
     } else if (m.tsumeFailed || engine.winner || engine.isDraw) {
@@ -2392,7 +2961,22 @@
     }
     if (!cls) return;
     const banner = el("div", { class: `banner ${cls}` });
-    banner.appendChild(el("span", { text }));
+    if (stars) {
+      // 詰めピンチの星(F3): 判のように1つずつ押す。★3は レ→ソ→高いレ(主音に帰って「完成」)、★2は レ→ソ で止める
+      const key = `${pz.id || pz.no}:${m.kifuRecords.length}`;
+      const fresh = m.starFxShown !== key && fxLevel() !== "off";
+      m.starFxShown = key;
+      const starNodes = [1, 2, 3].map((i) => el("span", {
+        class: `tsume-star${i <= stars.n ? " is-got" : ""}${fresh && i <= stars.n ? " is-stamp" : ""}`,
+        style: fresh ? { animationDelay: `${0.25 + (i - 1) * 0.42}s` } : {},
+        text: i <= stars.n ? "★" : "☆",
+      }));
+      banner.appendChild(el("span", {}, ["詰み! ", ...starNodes, stars.rest]));
+      if (fresh) {
+        const notes = [62, 67, 74];
+        for (let i = 0; i < stars.n; i++) SND.play("star", 0.27 + i * 0.42, { m: notes[i], last: i === stars.n - 1 });
+      }
+    } else banner.appendChild(el("span", { text }));
     banner.appendChild(el("div", { style: { display: "flex", gap: "8px", flexWrap: "wrap" } }, buttons));
     dom.bannerHost.appendChild(banner);
   }
@@ -2776,7 +3360,7 @@
       S.hint = null;
       const step = stepObj();
       const lastStep = S.step === lessonObj().steps.length - 1;
-      if (lastStep && !step.reply) markLessonDone();
+      if (lastStep && !step.reply) { markLessonDone(); stampYoshi(); }
       setFeedback("success", ...lines);
       drawAll();
       if (step.reply && !S.engine.isOver()) {
@@ -2788,11 +3372,20 @@
           S.last = { from: act.from || null, to: act.to };
           S.lines = TU.sandwichLines(S.engine, act, result);
           S.status = "done";
-          if (lastStep) markLessonDone();
+          if (lastStep) { markLessonDone(); stampYoshi(); }
           setFeedback("success", ...lines, step.replyText);
           drawAll();
         });
       }
+    }
+
+    // レッスンをやり遂げたら(F4): 盤に朱の判子「よし」を押す。音は判子の「トン」+ 箏のラ→レ
+    function stampYoshi() {
+      SND.play("hanko");
+      if (!S.dom || !S.dom.board || fxLevel() === "off") return;
+      const node = el("div", { class: "yoshi", "aria-hidden": "true" }, [el("span", { class: "yoshi-blot" }), el("span", { class: "yoshi-seal", text: "よし" })]);
+      S.dom.board.appendChild(node);
+      setTimeout(() => node.remove(), 2400);
     }
 
     // ---- 盤のクリック ----
@@ -3386,11 +3979,37 @@
       const diff = entry.before == null ? null : entry.after - entry.before;
       const sign = diff == null ? "" : diff >= 0 ? `(+${diff})` : `(${diff})`;
       const from = entry.before == null ? "" : `${entry.before} → `;
-      return { cls: "ok", text: `レート ${from}${entry.after}${sign}${entry.provisional ? " 暫定" : ""}  内容 ${entry.qualityPerf} / 結果 ${entry.resultPerf}` };
+      return { cls: "ok", diff, text: `レート ${from}${entry.after}${sign}${entry.provisional ? " 暫定" : ""}  内容 ${entry.qualityPerf} / 結果 ${entry.resultPerf}` };
     }
     const latest = loadHistory().find((r) => r.id === record.id);
     if (latest && latest.ratingExcluded) return { cls: "muted", text: `レート対象外(${latest.ratingExcluded})` };
     return { cls: "muted", text: "レートの計算を待っています…" };
+  }
+
+  // レートの更新(F5): 前に見たときから変わっていたら、数字を1.2秒でカウントし差分を添える。
+  // 最高記録なら金色に。上がったときだけ民謡音階を駆け上がる音(下がったときは鳴らさない)
+  const LS_RATING_SEEN = "hasami:rating:seen:v1";
+  function animateRating(valueNode, deltaNode, cur, games) {
+    let seen = null;
+    try { seen = JSON.parse(localStorage.getItem(LS_RATING_SEEN)); } catch (e) { /* 初めて */ }
+    try { localStorage.setItem(LS_RATING_SEEN, JSON.stringify(cur)); } catch (e) { /* 保存できなくても表示はする */ }
+    if (seen == null || seen === cur) return;
+    const up = cur > seen;
+    const best = up && games.every((g) => g.after <= cur);
+    deltaNode.textContent = `${up ? "+" : "−"}${Math.abs(cur - seen)}`;
+    deltaNode.classList.add(up ? "is-up" : "is-down");
+    if (best) deltaNode.textContent += " 自己最高";
+    if (up) SND.play("rise");
+    if (fxLevel() === "off") { valueNode.classList.toggle("is-best", best); return; }
+    const t0 = performance.now(), D = 1200;
+    const tick = () => {
+      const p = Math.min(1, (performance.now() - t0) / D), e = 1 - Math.pow(1 - p, 3);
+      valueNode.textContent = String(Math.round(seen + (cur - seen) * e));
+      if (p < 1 && valueNode.isConnected) requestAnimationFrame(tick);
+      else valueNode.classList.toggle("is-best", best);
+    };
+    valueNode.textContent = String(seen);
+    requestAnimationFrame(tick);
   }
 
   // ============================================================ レート画面
@@ -3411,9 +4030,12 @@
       const cur = currentRating(store);
 
       const head = el("div", { class: "card rating-head" });
+      const valueNode = el("b", { class: "rating-value", text: cur == null ? "----" : String(cur) });
+      const deltaNode = el("span", { class: "rating-delta" });
+      if (cur != null) animateRating(valueNode, deltaNode, cur, games);
       head.appendChild(el("div", { class: "rating-now" }, [
         el("span", { class: "rating-label", text: "現在のレート" }),
-        el("b", { class: "rating-value", text: cur == null ? "----" : String(cur) }),
+        valueNode, deltaNode,
         el("span", { class: "rating-sub", text: cur == null ? "AI戦を1局終えると表示されます"
           : games.length < RT.PROVISIONAL_GAMES ? `暫定(あと${RT.PROVISIONAL_GAMES - games.length}局で確定) / ${games.length}局`
             : `${games.length}局` }),

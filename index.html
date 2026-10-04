@@ -7,7 +7,7 @@
 <meta name="description" content="盤上で駒を配置・移動し、相手の駒を挟んで動けなくしたら勝ち。8段階のAI(+専用最強AI「奥義」)、持ち時間つきの対人戦、チュートリアル、戦略コラム・AIのレベル解説を収録したブラウザ版「挟みゲーム」。">
 <meta name="theme-color" content="#241012">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='16' fill='%23241012'/%3E%3Ctext x='50' y='68' font-size='58' text-anchor='middle' fill='%23C9A227' font-family='serif'%3E%E6%8C%9F%3C/text%3E%3C/svg%3E">
-<link rel="stylesheet" href="styles.css?v=10">
+<link rel="stylesheet" href="styles.css?v=13">
 </head>
 <body>
 <header class="site-header" id="navbar">
@@ -16,6 +16,20 @@
       <span class="glyph">挟みゲーム</span>
       <span class="sub">IN A PINCH</span>
     </a>
+    <!-- 効果音のオン・オフ(どの画面からでも1回で切り替えられるよう、ヘッダーに常に出す) -->
+    <button class="sound-toggle" id="sound-toggle" type="button" aria-pressed="true" aria-label="効果音" title="効果音のオン・オフ">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M4 9v6h4l5 4V5L8 9H4z"></path>
+        <path class="snd-on" d="M16.5 8.5a5 5 0 0 1 0 7M19 6a8.5 8.5 0 0 1 0 12"></path>
+        <path class="snd-off" d="M17 9l5 6M22 9l-5 6"></path>
+      </svg>
+    </button>
+    <!-- 音と演出の設定(効果音・BGMの音量、演出の強さ、画面の切り替え、振動) -->
+    <button class="sound-toggle settings-btn" id="settings-btn" type="button" aria-label="音と演出の設定" title="音と演出の設定" aria-haspopup="dialog">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M4 7h10M18 7h2M4 17h4M12 17h8"></path><circle cx="16" cy="7" r="2"></circle><circle cx="10" cy="17" r="2"></circle>
+      </svg>
+    </button>
     <!-- 広い画面(PC・iPad横)では横一列、狭い画面(スマホ・iPad縦)では「メニュー」ボタンで開く一覧 -->
     <button class="nav-toggle" id="nav-toggle" type="button" aria-expanded="false" aria-controls="nav-links">
       <span class="nav-toggle-icon" aria-hidden="true"></span><span class="nav-toggle-text">メニュー</span>
@@ -58,6 +72,7 @@
 <script src="content.js?v=7"></script>
 <script src="tutorial.js?v=1"></script>
 <script src="rating.js?v=1"></script>
-<script src="app.js?v=12"></script>
+<script src="sound.js?v=2"></script>
+<script src="app.js?v=15"></script>
 </body>
 </html>
