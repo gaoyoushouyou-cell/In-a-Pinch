@@ -1667,6 +1667,328 @@
     }
   }
 
+  // ---- 感想戦の採点: 局面の指せる手をすべて読んで並べ、選んだ手に点数を付ける ----
+  // 読むのは形勢表示・感想戦の解析と同じ評価役(学習型探索。『神』と同じ汎用の重み、特化テンプレートなら
+  // 奥義と同じ重み)。『神』の持ち時間(1手30秒)で全部の手を読むと数十分かかるので2段階にする:
+  //   1段目 全部の手を短く読む → 2段目 上位の手と採点する手(focus)だけを読み直す。
+  // 読み直した手より短い読みの手が上に来たら、それも読み直す(最善手は必ず2段目の読み)。
+  const SCORE_QUICK_TOTAL = 15000; // 1段目の合計の目安(ms)。手が多い局面は1手あたりを短くする
+  const SCORE_QUICK_MAX = 400;     // 1段目の1手あたりの上限・下限(ms)
+  const SCORE_QUICK_MIN = 120;
+  const SCORE_DEEP_BUDGET = 3000;  // 2段目の1手あたり(ms)
+  const SCORE_DEEP_TOP = 5;        // 2段目で読み直す上位の手の数
+  const SCORE_VERIFY_MAX = 4;      // 読み直した手より上に来た短い読みの手を、追加で読み直す上限
+
+  function sameLabel(a, b) { return !!a && !!b && a[0] === b[0] && a[1] === b[1]; }
+
+  function scoreQuickBudget(n) {
+    return Math.max(SCORE_QUICK_MIN, Math.min(SCORE_QUICK_MAX, Math.floor(SCORE_QUICK_TOTAL / Math.max(1, n))));
+  }
+
+  // 採点にかかる時間の目安 { n: 指せる手の数, sec: 秒(5秒単位) }
+  function scoreEstimate(engine) {
+    const n = generateActions(engine, engine.currentPlayer).length;
+    const ms = n <= 1 ? SCORE_DEEP_BUDGET : n * scoreQuickBudget(n) + Math.min(n, SCORE_DEEP_TOP + 1) * SCORE_DEEP_BUDGET;
+    return { n, sec: Math.max(5, Math.round(ms / 5000) * 5) };
+  }
+
+  // ラベル [from, to] を engine の手に直す(指せない手なら null)
+  function labelToAction(engine, label) {
+    const player = engine.currentPlayer;
+    return generateActions(engine, player).find((a) => sameLabel(actionLabels(engine, a), label)) || null;
+  }
+
+  // 並べる順の値(大きいほど良い)。詰みは手数まで比べる(早く勝つ・長く粘るほうが上)
+  function scoreRankValue(e, mover) {
+    if (e.mate === mover) return 2 - e.matePlies * 0.001;
+    if (e.mate) return -1 + e.matePlies * 0.001;
+    return e.win;
+  }
+
+  // 1手を指した局面を読み、指した側から見た結果を e に書き込む
+  function readScoredMove(engine, e, ai, budget, deep) {
+    const mover = engine.currentPlayer;
+    const child = engine.clone();
+    applyAction(child, mover, e.action);
+    e.depth = 0; e.mate = null; e.matePlies = null; e.final = null;
+    if (child.winner) {
+      e.final = "win";
+      e.win = child.winner === mover ? 1 : 0;
+      e.mate = child.winner; e.matePlies = 1;
+      e.deep = true;
+      return;
+    }
+    if (child.isDraw) { e.final = "draw"; e.win = 0.5; e.deep = true; return; }
+    ai.level.timeBudget = budget;
+    // 深く読むときは置換表を空にしてから読む(読みの途中で上限に達して消えると、読み筋が途切れるため)
+    if (deep) ai.tt.clear();
+    const s = ai.evaluate(child); // 相手(child の手番側)から見た値
+    if (!Number.isFinite(s)) { e.win = 0.5; return; }
+    e.win = winRateFromScore(-s);
+    e.depth = ai.lastDepth + 1;
+    if (Math.abs(s) >= MATE_BOUND) {
+      e.mate = s < 0 ? mover : otherPlayer(mover);
+      e.matePlies = Math.round(WIN_SCORE - Math.abs(s)) + 1;
+      e.win = e.mate === mover ? 1 : 0;
+    }
+    if (deep) {
+      e.deep = true;
+      e.pv = [e.label].concat(ai.principalVariation(child, 10));
+    }
+  }
+
+  // 相手の次の1手で挟まれる自分の駒(位置ラベル)。挟めるのは移動の手だけ(配置で挟む手は反則)
+  function threatenedPieces(engine, attacker) {
+    const out = new Set();
+    for (const a of generateActions(engine, attacker)) {
+      if (a[0] !== "move") continue;
+      const c = engine.clone();
+      c.currentPlayer = attacker; // 指す前の局面で「いま相手の番なら」を調べるときは手番を入れ替える
+      const r = c.movePiece(attacker, a[1], a[2]);
+      for (const pid of r.newlySandwiched) out.add(H.posLabel(engine.pieces.get(pid).position));
+    }
+    return Array.from(out).sort();
+  }
+
+  // 説明文の材料: その手を指すと盤面がどう変わるか(指した側 mover から見て)
+  function scoredMoveFeatures(engine, action, ctx) {
+    const mover = engine.currentPlayer, opp = otherPlayer(mover);
+    const child = engine.clone();
+    const res = applyAction(child, mover, action);
+    const over = child.isOver();
+    return {
+      kind: action[0],
+      captures: res.newlySandwiched.map((pid) => H.posLabel(child.pieces.get(pid).position)),
+      self: !!res.selfSandwiched,
+      escaped: action[0] === "move" && ctx.oblBefore.includes(action[1]),
+      oblLeft: child.obligated[mover].length,
+      winNow: child.winner === mover,
+      draw: child.isDraw,
+      oppActsBefore: ctx.oppActsBefore,
+      oppActsAfter: over ? 0 : generateActions(child, opp).length,
+      oppObl: child.obligated[opp].length,
+      threat: over ? [] : threatenedPieces(child, opp),
+      threatBefore: ctx.threatBefore,
+      stock: child.stock[mover],
+    };
+  }
+
+  function scoreContext(engine) {
+    const mover = engine.currentPlayer, opp = otherPlayer(mover);
+    return {
+      oblBefore: engine.obligated[mover].slice(),
+      oppActsBefore: generateActions(engine, opp).length,
+      threatBefore: threatenedPieces(engine, opp),
+    };
+  }
+
+  // 局面の指せる手をすべて採点する。opts: { focus: 必ず読み直す手のラベルの配列, onProgress(stage, done, total),
+  // quickBudget, deepBudget, deepTop }。戻り値 { mover, entries(良い順), quickBudget, deepBudget }。
+  // entries の各要素 { label, win(指した側の勝率), mate, matePlies, depth, deep, final, pv, feat }
+  function scoreAllMoves(engine, template, opts) {
+    opts = opts || {};
+    if (engine.isOver()) return null;
+    const mover = engine.currentPlayer;
+    const acts = generateActions(engine, mover);
+    const n = acts.length;
+    if (!n) return null;
+    const quick = opts.quickBudget || scoreQuickBudget(n);
+    const deepBudget = opts.deepBudget || SCORE_DEEP_BUDGET;
+    const progress = opts.onProgress || (() => {});
+    const ai = makePositionEvaluator(template, quick);
+    const entries = acts.map((a) => ({ label: actionLabels(engine, a), action: a, deep: false, pv: null }));
+    const rank = (e) => scoreRankValue(e, mover);
+    const sorted = () => entries.slice().sort((a, b) => rank(b) - rank(a));
+
+    // 1段目: 全部の手を短く読む(指せる手が1つなら最初から読み直しの時間で読む)
+    entries.forEach((e, i) => {
+      readScoredMove(engine, e, ai, n === 1 ? deepBudget : quick, n === 1);
+      progress("quick", i + 1, n);
+    });
+
+    // 2段目: 上位の手と focus の手を読み直す
+    const focus = (opts.focus || []).filter(Boolean);
+    const targets = [];
+    const want = (e) => { if (e && !e.deep && !targets.includes(e)) targets.push(e); };
+    const first = sorted();
+    if (!(first[0].final === "win")) first.slice(0, opts.deepTop || SCORE_DEEP_TOP).forEach(want);
+    focus.forEach((lb) => want(entries.find((e) => sameLabel(e.label, lb))));
+    let done = 0;
+    let total = targets.length;
+    for (const e of targets) {
+      progress("deep", done, total);
+      readScoredMove(engine, e, ai, deepBudget, true);
+      done++;
+    }
+    // 短い読みの手が読み直した手より上に来たら、それも読み直す
+    for (let k = 0; k < SCORE_VERIFY_MAX; k++) {
+      const top = sorted()[0];
+      if (top.deep) break;
+      total++;
+      progress("deep", done, total);
+      readScoredMove(engine, top, ai, deepBudget, true);
+      done++;
+    }
+    progress("deep", done, total);
+
+    const ctx = scoreContext(engine);
+    for (const e of entries) {
+      e.feat = scoredMoveFeatures(engine, e.action, ctx);
+      delete e.action;
+    }
+    return { mover, entries: sorted(), quickBudget: quick, deepBudget };
+  }
+
+  // 採点済みの局面で、1手だけを読み直す(短い読みのまま採点した手を試したとき)。読み直した要素を返す
+  function rescoreMove(engine, template, label, deepBudget) {
+    const action = labelToAction(engine, label);
+    if (!action) return null;
+    const e = { label: actionLabels(engine, action), action, deep: false, pv: null };
+    readScoredMove(engine, e, makePositionEvaluator(template, deepBudget || SCORE_DEEP_BUDGET), deepBudget || SCORE_DEEP_BUDGET, true);
+    e.feat = scoredMoveFeatures(engine, action, scoreContext(engine));
+    delete e.action;
+    return e;
+  }
+
+  // 読み直した1手を採点結果に差し込み、並べ直す(scored をその場で書き換える)
+  function mergeScoredMove(scored, e) {
+    const i = scored.entries.findIndex((x) => sameLabel(x.label, e.label));
+    if (i >= 0) scored.entries[i] = e; else scored.entries.push(e);
+    scored.entries.sort((a, b) => scoreRankValue(b, scored.mover) - scoreRankValue(a, scored.mover));
+    return scored;
+  }
+
+  // 1手の採点。点数は最善手との勝率の差(損失)から: 損失0で100点、損失50%以上で0点。
+  // 疑問手(8%)≒84点・悪手(15%)=70点・大悪手(30%)=40点。指せる手が1つなら100点
+  function gradeScoredMove(scored, label) {
+    const entries = scored.entries;
+    const e = entries.find((x) => sameLabel(x.label, label));
+    if (!e) return null;
+    const best = entries[0];
+    const n = entries.length;
+    const v = scoreRankValue(e, scored.mover);
+    const rank = 1 + entries.filter((x) => scoreRankValue(x, scored.mover) > v + 1e-9).length;
+    const forced = n === 1;
+    // 0.70 - 0.62 = 0.0799… のような端数で境目の判定がずれないよう、損失は 1e-6 単位に丸める
+    const loss = forced ? 0 : Math.round(Math.max(0, best.win - e.win) * 1e6) / 1e6;
+    const points = forced ? 100 : Math.round(100 * Math.max(0, 1 - loss / 0.5));
+    const level = forced ? null : MOVE_JUDGE_LEVELS.find((lv) => loss >= lv.min) || null;
+    return {
+      entry: e, best, rank, n, loss, points, forced, isBest: rank === 1,
+      label: level ? level.label : null, mark: level ? level.mark : "",
+    };
+  }
+
+  function scoreMoveText(label) { return label[0] ? `${label[0]}→${label[1]}` : `${label[1]}に配置`; }
+
+  // 勝率・詰みの見込みを短い文にする(指した側から見て)
+  function scoreWinText(e, mover) {
+    if (e.final === "win") return e.win === 1 ? "その場で勝ち" : "その場で負け";
+    if (e.final === "draw") return "千日手で引き分け";
+    if (e.mate === mover) return `${e.matePlies}手で勝ちを読み切り`;
+    if (e.mate) return `${e.matePlies - 1}手後に負けを読み切り`;
+    return `勝率${Math.round(e.win * 100)}%`;
+  }
+
+  // その手のよい点・気になる点を文にする(盤面の変化から)
+  function scoreReasons(e, mover) {
+    const f = e.feat;
+    const out = [];
+    if (!f) return out;
+    if (f.winNow) { out.push("この手で相手の駒が動けなくなり、その場で勝ちです。"); return out; }
+    if (e.mate === mover) out.push(`ここから${e.matePlies}手で相手を動けなくする(詰ませる)手順があります。`);
+    if (f.escaped) {
+      out.push(f.oblLeft ? "挟まれていた駒を1つ逃がします(移動義務はまだ残ります)。" : "挟まれていた駒を逃がして、移動義務を解きます。");
+    }
+    if (f.captures.length) {
+      let s = `相手の駒${f.captures.join("・")}を挟み、移動義務を負わせます。`;
+      if (f.oppActsAfter && f.oppActsAfter <= 3) s += `相手はその駒を動かす手しか指せず、候補は${f.oppActsAfter}手だけです。`;
+      out.push(s);
+    } else if (f.oppActsBefore >= 6 && f.oppActsAfter <= f.oppActsBefore * 0.7) {
+      out.push(`相手の指せる手を${f.oppActsBefore}手から${f.oppActsAfter}手に減らします。`);
+    }
+    if (f.self) out.push("自分から相手の駒の間に入るので、この駒に移動義務が付きます。");
+    if (f.draw) out.push("同じ局面の3回目になり、千日手で引き分けになります。");
+    if (f.threat.length) out.push(`次の相手の手で${f.threat.join("・")}を挟まれる形が残ります。`);
+    else if (f.threatBefore.length) out.push(`${f.threatBefore.join("・")}が挟まれる心配を消します。`);
+    if (e.mate && e.mate !== mover) out.push(`このあと相手に${e.matePlies - 1}手で動けなくされる(詰まされる)手順があります。`);
+    return out;
+  }
+
+  // 最善手とこの手の違い(最善手のほうが良い理由)を文にする
+  function scoreContrast(best, e, mover) {
+    const b = best.feat, f = e.feat;
+    const out = [];
+    if (!b || !f) return out;
+    if (best.mate === mover && e.mate !== mover) {
+      out.push(`最善手なら${best.matePlies}手で勝ちまで読み切れますが、この手ではその詰みが消えます。`);
+    }
+    if (e.mate && e.mate !== mover && best.mate !== e.mate) {
+      out.push(`この手のあと相手に${e.matePlies - 1}手で詰まされますが、最善手ならその手順を防げます。`);
+    }
+    if (b.captures.length > f.captures.length) {
+      out.push(f.captures.length
+        ? `最善手は相手の駒を${b.captures.length}個挟みますが、この手は${f.captures.length}個です。`
+        : `最善手は相手の駒(${b.captures.join("・")})を挟みますが、この手は挟みません。`);
+    }
+    if (f.threat.length > b.threat.length) {
+      const extra = f.threat.filter((p) => !b.threat.includes(p));
+      out.push(b.threat.length
+        ? `この手では次に${(extra.length ? extra : f.threat).join("・")}を挟まれる形になります(最善手のほうが危険な駒が少ない)。`
+        : `この手では次に${f.threat.join("・")}を挟まれますが、最善手ならその心配がありません。`);
+    }
+    if (f.self && !b.self) out.push("この手は自分の駒が挟まれる形に入ってしまいます。");
+    if (b.escaped && !f.escaped) out.push("最善手は挟まれていた駒を逃がしますが、この手は逃がしません。");
+    if (!b.captures.length && !f.captures.length && b.oppActsAfter + 3 <= f.oppActsAfter && b.oppActsAfter <= f.oppActsAfter * 0.8) {
+      out.push(`最善手のほうが相手の指せる手が少なくなります(${b.oppActsAfter}手 対 ${f.oppActsAfter}手)。`);
+    }
+    if (b.kind === "move" && f.kind === "place" && !out.length) out.push("最善手は持ち駒を使わずに盤上の駒を動かし、持ち駒を温存します。");
+    if (b.kind === "place" && f.kind === "move" && !out.length) out.push("最善手は持ち駒を打って、盤上の駒を増やします。");
+    if (b.draw && !f.draw) out.push("最善手は千日手で引き分けにする手です(この局面では引き分けが最善と読んでいます)。");
+    if (f.draw && !b.draw) out.push("この手は千日手で引き分けになりますが、最善手なら勝負を続けられます。");
+    return out;
+  }
+
+  // 採点した手の説明。戻り値 { grade, head, good: 最善手(またはこの手)のよい点, diff: 最善手との違い, note, pv }
+  function explainScoredMove(scored, label) {
+    const g = gradeScoredMove(scored, label);
+    if (!g) return null;
+    const mover = scored.mover;
+    const e = g.entry, best = g.best;
+    const out = { grade: g, head: "", good: [], diff: [], note: "", pv: null };
+    if (g.forced) {
+      out.head = "この局面で指せる手はこれだけでした。";
+      out.good = scoreReasons(e, mover);
+      out.pv = e.pv;
+      return out;
+    }
+    if (g.isBest) {
+      out.head = `この局面の最善手です(${g.n}手中1位・${scoreWinText(e, mover)})。`;
+      out.good = scoreReasons(e, mover);
+      const second = scored.entries.find((x) => scoreRankValue(x, mover) < scoreRankValue(e, mover) - 1e-9);
+      if (second) {
+        const gap = Math.round(Math.max(0, e.win - second.win) * 100);
+        out.note = gap >= 1
+          ? `次に良い手は${scoreMoveText(second.label)}(${scoreWinText(second, mover)})で、${gap}%の差があります。`
+          : `次に良い${scoreMoveText(second.label)}(${scoreWinText(second, mover)})もほぼ同じくらい良い手です。`;
+      }
+      out.pv = e.pv;
+      return out;
+    }
+    const lossPct = Math.round(g.loss * 100);
+    out.head = `最善手は${scoreMoveText(best.label)}(${scoreWinText(best, mover)})。この手(${scoreWinText(e, mover)})`
+      + (lossPct >= 1 ? `より勝率が${lossPct}%高いと読んでいます。` : "とほぼ同じ評価です。");
+    out.good = scoreReasons(best, mover).filter((s) => !/挟まれる形が残ります|動けなくされる/.test(s));
+    out.diff = scoreContrast(best, e, mover);
+    if (!out.diff.length) {
+      out.note = lossPct >= 3
+        ? "1手目の盤面の違いは小さく、差は数手先の読みで生まれます。下の読み筋で確かめてみてください。"
+        : "どちらも大きな差のない手です。";
+    }
+    out.pv = best.pv;
+    return out;
+  }
+
   const AI = {
     LEVELS, LEVEL_ORDER, SPECIALIST_AI_NAME, SPECIALIST_AI_DESC,
     generateActions, applyAction, actionEquals,
@@ -1677,6 +1999,8 @@
     EVAL_TIME_BUDGET, winRateFromScore, makePositionEvaluator, evaluatePosition,
     actionLabels, analyzePosition, MOVE_JUDGE_LEVELS, judgeMove,
     DEEP_TIME_BUDGET, deepAnalyze, buildMateTree, MateSearch,
+    SCORE_DEEP_BUDGET, SCORE_DEEP_TOP, scoreAllMoves, rescoreMove, mergeScoredMove, gradeScoredMove, explainScoredMove,
+    scoreMoveText, scoreWinText, scoreEstimate, labelToAction,
   };
 
   if (typeof module !== "undefined" && module.exports) {

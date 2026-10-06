@@ -807,6 +807,17 @@ details.adv[open] > summary::after { transform: rotate(-135deg); margin-top: -2p
 .game-actions .btn { flex: 1 1 auto; min-width: 7.5em; }
 .turn-row { display: grid; gap: 0; width: min(var(--col-w), 100%); }
 .turn-text { font-family: var(--f-disp); font-size: 16px; color: var(--accent); min-height: 1.5em; }
+/* 手数: 手番の前に「12手目」。終局・中止したら「全N手で終局/中止」 */
+.turn-line { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 10px; }
+.ply-badge {
+  flex-shrink: 0; font-family: var(--f-mono); font-size: 12.5px; font-variant-numeric: tabular-nums; line-height: 1;
+  padding: 5px 9px; border-radius: 999px; color: var(--warning); background: var(--accent-light); border: 1px solid rgba(201,162,39,.45);
+}
+.ply-badge.is-final { color: var(--text-secondary); background: transparent; border-color: rgba(181,164,137,.4); }
+.ply-badge[hidden] { display: none; }
+/* 確認の窓の「保存して移動」 */
+.btn-save { border-color: rgba(201,162,39,.6); color: var(--warning); }
+.btn-save:hover { border-color: var(--warning); background: rgba(201,162,39,.12); }
 .obligation-text { color: var(--danger); font-size: 12.5px; min-height: 1.4em; }
 .banner-host { width: min(var(--col-w), 100%); display: grid; }
 .banner-host:empty { display: none; }
@@ -1147,6 +1158,50 @@ details.adv[open] > summary::after { transform: rotate(-135deg); margin-top: -2p
   width: min(var(--col-w), 100%); display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px 10px;
   padding: 6px 10px; border-radius: 6px; background: var(--warning-bg); border: 1px solid var(--warning); color: var(--warning); font-size: 12.5px;
 }
+/* 盤で試した手を出している間の帯(変化手順の帯と同じ形で、色だけ変える) */
+.var-banner.is-trial { background: rgba(47,111,214,.12); border-color: rgba(120,160,230,.7); color: #BFD3F5; }
+
+/* ---------- 感想戦: 指し手の採点 ---------- */
+.score-intro { color: var(--text-secondary); }
+.score-progress { height: 6px; border-radius: 3px; background: rgba(0,0,0,.35); overflow: hidden; }
+.score-progress-fill { height: 100%; background: var(--accent); transition: width .3s; }
+.score-block {
+  display: grid; gap: 4px; padding: 8px 10px; border-radius: 6px; background: rgba(0,0,0,.22);
+  border-left: 3px solid var(--text-muted);
+}
+.score-block.is-best { border-left-color: var(--success); }
+.score-block.is-ok { border-left-color: var(--accent); }
+.score-block.is-dubious { border-left-color: var(--warning); }
+.score-block.is-bad { border-left-color: var(--danger); }
+.score-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 10px; }
+.score-what { color: var(--text-muted); font-size: 11.5px; }
+.score-move { font-family: var(--f-mono); font-size: 14px; color: var(--text-primary); }
+.score-points { font-family: var(--f-disp); font-size: 22px; font-weight: 600; color: var(--warning); font-variant-numeric: tabular-nums; }
+.score-block.is-best .score-points { color: var(--success); }
+.score-block.is-bad .score-points { color: var(--danger); }
+.score-rank { font-family: var(--f-mono); font-size: 12px; color: var(--text-secondary); }
+.score-mark { font-size: 12px; padding: 0 7px; border-radius: 10px; border: 1px solid currentColor; color: var(--text-secondary); }
+.score-block.is-best .score-mark { color: var(--success); }
+.score-block.is-dubious .score-mark { color: var(--warning); }
+.score-block.is-bad .score-mark { color: var(--danger); }
+.score-text { margin: 0; color: var(--text-primary); }
+.score-sub { margin-top: 2px; font-size: 11.5px; color: var(--accent); letter-spacing: .04em; }
+.score-list { margin: 0; padding-left: 1.3em; display: grid; gap: 2px; }
+.score-cands { display: grid; gap: 6px; }
+.score-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.score-table th { text-align: left; font-weight: 500; color: var(--text-muted); font-size: 11px; padding: 2px 6px; border-bottom: 1px solid rgba(201,162,39,.2); }
+.score-table td { padding: 4px 6px; border-bottom: 1px solid rgba(201,162,39,.08); vertical-align: baseline; }
+.score-table tbody tr { cursor: pointer; }
+.score-table tbody tr:hover, .score-table tbody tr:focus-visible { background: rgba(201,162,39,.1); outline: none; }
+.score-table tr.is-played { background: rgba(201,162,39,.14); }
+.score-table tr.is-tried { box-shadow: inset 3px 0 0 #6E9BE6; }
+.score-table .sc-rank, .score-table .sc-pts { font-family: var(--f-mono); text-align: right; width: 3em; font-variant-numeric: tabular-nums; }
+.score-table .sc-move { font-family: var(--f-mono); color: var(--text-primary); }
+.score-table .sc-tag { margin-left: 6px; font-family: var(--f-body); font-size: 10.5px; color: var(--warning); }
+.score-table tr.is-dubious .sc-pts { color: var(--warning); }
+.score-table tr.is-bad .sc-pts { color: var(--danger); }
+.score-foot { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px; }
+
 /* 盤の矢印(最善手・変化手順の次の手)。駒の色と紛れないよう青で描く */
 .best-arrow { --arrow: #2F6FD6; opacity: .88; }
 .best-arrow .arrow-shaft { stroke: var(--arrow); stroke-linecap: round; }
@@ -1249,6 +1304,7 @@ details.adv[open] > summary::after { transform: rotate(-135deg); margin-top: -2p
 .review-layout .review-toolbar { order: 6; }
 .review-layout .review-jumps { order: 7; }
 .review-layout .study-card { order: 8; }
+.review-layout .score-card { order: 8; }
 .review-layout .review-resume { order: 9; }
 .review-layout .review-list { order: 10; }
 .review-screen .board-frame { --board-w: 600px; }

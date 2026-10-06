@@ -96,7 +96,7 @@
   function initWorker() {
     if (!Worker_) { workerOk = false; return; }
     try {
-      worker = new Worker_("ai-worker.js?v=8");
+      worker = new Worker_("ai-worker.js?v=10");
       worker.onmessage = (e) => {
         if (e.data.reqId !== pendingReqId || e.data.progress != null) return; // 破棄済み(リスタート等)の応答
         if (onWorkerResult) onWorkerResult(e.data);
@@ -209,7 +209,7 @@
     if (evalWorker || !evalWorkerOk) return;
     if (!Worker_) { evalWorkerOk = false; return; }
     try {
-      evalWorker = new Worker_("ai-worker.js?v=8");
+      evalWorker = new Worker_("ai-worker.js?v=10");
       evalWorker.onmessage = (e) => {
         if (!evalReq || e.data.reqId !== evalReq.reqId) return;
         const cb = evalReq.callback;
@@ -268,7 +268,7 @@
     const payload = Object.assign({ kind: "study", op, reqId: req.reqId, config: engine.config, state: engineSnapshot(engine) }, extra);
     if (!studyWorker && studyWorkerOk && Worker_) {
       try {
-        studyWorker = new Worker_("ai-worker.js?v=8");
+        studyWorker = new Worker_("ai-worker.js?v=10");
         studyWorker.onmessage = (e) => {
           if (!studyReq || e.data.reqId !== studyReq.reqId) return;
           const cb = studyReq.callback;
@@ -304,6 +304,61 @@
     if (!old) return;
     studyReq = null;
     if (studyWorker) { studyWorker.terminate(); studyWorker = null; }
+    old.callback(null, true);
+  }
+
+  // ============================================================ 感想戦の採点(専用 Worker)
+  // 局面の指せる手をすべて読む(op: "all")・1手だけ読み直す(op: "rescore")。数十秒かかるので、
+  // 解析(evalWorker)・検討(studyWorker)とは別の Worker で並行して動かす。新しい要求が来たら
+  // 読みかけの Worker は止めて作り直す。onProgress({ stage, done, total }) で途中経過を受け取る。
+  let scoreWorker = null;
+  let scoreWorkerOk = true;
+  let scoreReq = null; // { reqId, callback, onProgress }。callback(result, cancelled)
+
+  function requestScore(op, engine, extra, onProgress, callback) {
+    cancelScore();
+    const req = { reqId: reqSeq++, callback, onProgress };
+    scoreReq = req;
+    const payload = Object.assign({ kind: "score", op, reqId: req.reqId, config: engine.config, state: engineSnapshot(engine) }, extra);
+    if (!scoreWorker && scoreWorkerOk && Worker_) {
+      try {
+        scoreWorker = new Worker_("ai-worker.js?v=10");
+        scoreWorker.onmessage = (e) => {
+          if (!scoreReq || e.data.reqId !== scoreReq.reqId) return;
+          if (e.data.progress) { if (scoreReq.onProgress) scoreReq.onProgress(e.data.progress); return; }
+          const cb = scoreReq.callback;
+          scoreReq = null;
+          cb(e.data.ok ? e.data.result : null);
+        };
+        scoreWorker.onerror = () => {
+          scoreWorkerOk = false;
+          scoreWorker = null;
+          if (scoreReq) { const cb = scoreReq.callback; scoreReq = null; cb(null); }
+        };
+      } catch (e) {
+        scoreWorkerOk = false;
+      }
+    }
+    if (scoreWorker) { scoreWorker.postMessage(payload); return; }
+    // Worker が使えない環境では、メインスレッドで短めに読む(その間は画面が止まる)
+    setTimeout(() => {
+      let result = null;
+      try {
+        const eng = rebuildEngineFromState(payload.config, payload.state);
+        result = op === "rescore"
+          ? AI.rescoreMove(eng, extra.template, extra.label, 500)
+          : AI.scoreAllMoves(eng, extra.template, { focus: extra.focus, quickBudget: 40, deepBudget: 300, deepTop: 3 });
+      } catch (e) { result = null; }
+      if (scoreReq === req) { scoreReq = null; callback(result); }
+    }, 30);
+  }
+
+  // 読みかけの採点を取り消す(呼び出し側の後片づけのため callback(null, true) を呼ぶ)
+  function cancelScore() {
+    const old = scoreReq;
+    if (!old) return;
+    scoreReq = null;
+    if (scoreWorker) { scoreWorker.terminate(); scoreWorker = null; }
     old.callback(null, true);
   }
 
@@ -384,8 +439,9 @@
     return { boardFrame, board, grid, cellNodes, piecesLayer, fxLayer, trailLayer, fxUnder };
   }
 
-  // 確認の窓。title を渡すと見出しを付ける。最初は取り消し側にフォーカスし、Esc・外側のクリックでも取り消す
-  function confirmModal(message, okLabel, cancelLabel, title) {
+  // 確認の窓。title を渡すと見出しを付ける。最初は取り消し側にフォーカスし、Esc・外側のクリックでも取り消す。
+  // extra = [{ label, value, cls }] を渡すと、取り消しと OK の間にボタンを足す(押すと value で解決する)
+  function confirmModal(message, okLabel, cancelLabel, title, extra) {
     return new Promise((resolve) => {
       const veil = el("div", { class: "veil" });
       const done = (ok) => { veil.remove(); document.removeEventListener("keydown", onKey); resolve(ok); };
@@ -396,6 +452,7 @@
         el("p", { text: message }),
         el("div", { class: "modal-actions" }, [
           cancelBtn,
+          ...(extra || []).map((x) => el("button", { class: `btn ${x.cls || ""}`, type: "button", text: x.label, onclick: () => done(x.value) })),
           el("button", { class: "btn btn-danger", type: "button", text: okLabel || "OK", onclick: () => done(true) }),
         ]),
       ]);
@@ -437,13 +494,18 @@
       // 終わっていない対局から別の画面へ抜けようとしたら、対局が破棄されることを伝えて確認する
       // (AIの思考中・AI同士の観戦中も同じ。以前は AI の思考中だけ確認を飛ばしていたため、観戦中はほぼ出なかった)
       const m = App.match;
-      if (m.engine && !m.engine.isOver()) {
+      if (m.engine && !matchFinished(m)) {
         const what = m.mode === "ai_vs_ai" ? "観戦中の対局" : "対戦中の対局";
+        const canSave = canAbortMatch(m);
         const note = m.mode === "online"
           ? "オンライン対戦は、最後に送り合った手番リンクを開けばその局面から続けられます。"
-          : "途中の対局は対戦履歴・棋譜に残りません。";
-        confirmModal(`ほかの画面へ移ると、${what}は破棄されます。${note}`, "破棄して移動する", "対局に戻る", "対局を破棄しますか?").then((ok) => {
+          : canSave
+            ? "破棄すると対戦履歴・棋譜に残りません。「保存して移動」なら、ここまでの棋譜を対戦履歴に残せます(中止扱い・勝敗なし)。"
+            : "途中の対局は対戦履歴・棋譜に残りません。";
+        const extra = canSave ? [{ label: "保存して移動", value: "save", cls: "btn-save" }] : null;
+        confirmModal(`ほかの画面へ移ると、${what}は破棄されます。${note}`, "破棄して移動する", "対局に戻る", "対局を破棄しますか?", extra).then((ok) => {
           if (!ok || App.match !== m) return;
+          if (ok === "save") abortMatch(m);
           if (thinkTimer) { clearInterval(thinkTimer); thinkTimer = null; } // 思考中の「…」の更新も止める
           App.match = null; App.screen = screen; render(payload);
         });
@@ -600,7 +662,7 @@
       case "game": {
         if (!m) return "home";
         if (m.mode === "tsume") return m.engine.isOver() || m.tsumeFailed ? null : "tsume";
-        if (m.engine.isOver()) return null; // 終局の音を聞かせるため止める
+        if (matchFinished(m)) return null; // 終局の音を聞かせるため止める(中止した対局も止める)
         if (m.clockUrgent) return "byoyomi";
         const r = m.evalDisplay && m.mode === "pvai" && m.evalView && m.evalView.result;
         if (r) {
@@ -639,6 +701,7 @@
     clearNode(root);
     App.onlineRefreshLink = null; // 前の画面の手番リンク更新フックは無効化する
     cancelStudy(); // 感想戦の検討(じっくり読む・詰み手順)の読みかけは画面を作り直したら捨てる
+    cancelScore(); // 感想戦の採点の読みかけも同じ
     const renderers = {
       menu: renderMenu, game: renderGame, tutorial: renderTutorial, strategy: renderStrategy,
       report: renderReport, history: renderHistory, review: renderReview, online: renderOnline,
@@ -1297,7 +1360,7 @@
 
   // 次がAIの手番か(AI戦の相手AI・観戦中のAI同士。一時停止中は含めない)
   function nextActorIsAI(m) {
-    if (m.engine.isOver()) return false;
+    if (matchFinished(m)) return false;
     if (m.mode === "pvai") return m.engine.currentPlayer === otherPlayer(m.humanPlayer);
     return m.mode === "ai_vs_ai" && !m.aiVsAiPaused;
   }
@@ -1675,7 +1738,7 @@
     const board = TSUME_GEN_BOARDS.find((b) => b.key === App.tsumeGen.board);
     const len = TSUME_GEN_LENGTHS.find((l) => l.key === App.tsumeGen.length);
     let w;
-    try { w = new Worker_("ai-worker.js?v=8"); } catch (e) { toast("自動作問を開始できませんでした(ローカルサーバー経由で開いてください)"); return; }
+    try { w = new Worker_("ai-worker.js?v=10"); } catch (e) { toast("自動作問を開始できませんでした(ローカルサーバー経由で開いてください)"); return; }
     tsumeGenWorker = w;
     btn.disabled = true;
     status.textContent = "作問中…(AI同士の対局から詰み局面を探しています)";
@@ -1839,7 +1902,7 @@
 
   function maybeTriggerAI() {
     const m = App.match;
-    if (!m || m.engine.isOver()) return;
+    if (!m || matchFinished(m)) return;
     const current = m.engine.currentPlayer;
     if (m.mode === "tsume") {
       if (current !== m.humanPlayer && !m.tsumeFailed && !m.tsumeReplay) startTsumeDefense();
@@ -1860,7 +1923,7 @@
     updateGameUI();
     const targetEngine = m.engine;
     requestAIMove(m.engine, player, aiOptsFor(player), (action) => {
-      if (App.match !== m || m.engine !== targetEngine) return; // 対局がリセットされていた
+      if (App.match !== m || m.engine !== targetEngine || m.aborted) return; // 対局がリセット・中止されていた
       aiCue(m, action, () => {
         m.aiThinking = false;
         if (action) {
@@ -1882,7 +1945,7 @@
     if (!node || fxLevel() === "off") { apply(); return; }
     const engine = m.engine;
     tempClass(node, "is-cue", 600);
-    setTimeout(() => { if (App.match === m && m.engine === engine) apply(); }, 420);
+    setTimeout(() => { if (App.match === m && m.engine === engine && !m.aborted) apply(); }, 420);
   }
 
   function afterPlayerAction() {
@@ -2070,19 +2133,66 @@
       }
       return;
     }
-    if ((m.engine.winner || m.engine.isDraw) && !m.kifuSaved) {
-      m.kifuSaved = true;
-      const record = buildMatchRecord(m);
-      const list = loadHistory();
-      list.push(record);
-      saveHistoryList(list);
-      m.finishedRecord = record;
-      if (record.ratingPending) processPendingRatings(); // 裏で指し手を解析してレートを更新する
-    }
+    if ((m.engine.winner || m.engine.isDraw) && !m.kifuSaved) saveMatchToHistory(m);
+  }
+
+  function saveMatchToHistory(m) {
+    m.kifuSaved = true;
+    const record = buildMatchRecord(m);
+    const list = loadHistory();
+    list.push(record);
+    saveHistoryList(list);
+    m.finishedRecord = record;
+    if (record.ratingPending) processPendingRatings(); // 裏で指し手を解析してレートを更新する
+  }
+
+  // これまでに指された手数(オンライン対戦はリンクから並べ直した手も数える)
+  function matchPlies(m) {
+    return m.mode === "online" && m.onlineActions ? m.onlineActions.length : m.kifuRecords.length;
+  }
+
+  // 終局したか、途中で中止した対局か
+  function matchFinished(m) { return m.engine.isOver() || !!m.aborted; }
+
+  // 対局を途中で中止して保存できるか(詰めピンチは問題ごとの記録、オンライン対戦は手番リンクで続けられるので対象外)
+  function canAbortMatch(m) {
+    return !!m && ["pvai", "pvp", "ai_vs_ai"].includes(m.mode) && !matchFinished(m) && !m.kifuSaved && matchPlies(m) > 0;
+  }
+
+  // 長引いた対局を中止し、そこまでの棋譜を対戦履歴に保存する。AIの思考・形勢の読み・時計は止める
+  function abortMatch(m) {
+    if (!canAbortMatch(m)) return false;
+    if (m.aiThinking && worker) { worker.terminate(); worker = null; initWorker(); } // 読みかけの手は捨てる
+    pendingReqId = null; onWorkerResult = null;
+    m.aiThinking = false;
+    m.evalGate = false;
+    cancelEval();
+    if (m.clock) { stopClock(m.clock); m.clockUrgent = false; }
+    if (App.gameDom && App.gameDom.boardFrame) App.gameDom.boardFrame.classList.remove("is-urgent");
+    m.selected = null;
+    m.aborted = { plies: matchPlies(m) };
+    m.logMessages.push(`${m.aborted.plies}手で対局を中止しました(棋譜を保存しました)`);
+    saveMatchToHistory(m);
+    return true;
+  }
+
+  function onAbort() {
+    const m = App.match;
+    if (!canAbortMatch(m)) return;
+    const n = matchPlies(m);
+    const what = m.mode === "ai_vs_ai" ? "観戦中の対局" : "対局";
+    const rating = m.mode === "pvai" ? "中止した対局はレートの計算に入りません。" : "";
+    confirmModal(`${n}手で${what}を中止し、ここまでの棋譜を対戦履歴に保存します。勝敗は付きません。${rating}`
+      + "保存した棋譜は感想戦で見られ、「この局面から対局を再開する」で続きを指すこともできます。",
+    "中止して保存", "対局を続ける", "対局を中止しますか?").then((ok) => {
+      if (!ok || App.match !== m) return;
+      if (abortMatch(m)) { updateGameUI(); toast("対局を中止し、棋譜を対戦履歴に保存しました"); }
+    });
   }
 
   function resultText() {
     const m = App.match;
+    if (m.aborted) return `中止(${m.aborted.plies}手)`;
     if (m.engine.winner && m.timeoutLoser) return `${playerDisplayName(m.engine.winner)}の勝ち(${playerDisplayName(m.timeoutLoser)}の時間切れ)`;
     if (m.engine.winner) return `${playerDisplayName(m.engine.winner)}の勝ち`;
     if (m.engine.isDraw) return "引き分け(千日手)";
@@ -2102,6 +2212,7 @@
       stockA: m.stockA, stockB: m.stockB,
       playerALabel: playerDisplayName("A"), playerBLabel: playerDisplayName("B"),
       resultText: resultText(),
+      aborted: !!m.aborted, // 途中で中止した対局(勝敗なし)
       evalDisplay: !!m.evalDisplay, // 形勢表示ありの対局(レートなどの集計で区別する)
       resumedFrom: m.resumedFrom || null, // 感想戦の途中から再開した対局(元の記録の id と再開した手数)
       undoUsed: !!m.undoUsed,
@@ -2133,6 +2244,9 @@
     const undoBtn = el("button", { class: "btn btn-compact", text: "待った(1手戻す)", onclick: onUndo });
     const restartBtn = el("button", { class: "btn btn-compact", text: m.mode === "tsume" ? "やり直す" : "新しく対戦", onclick: onRestart });
     const clockBtn = m.clock ? el("button", { class: "btn btn-compact", text: "時計を止める", onclick: toggleClockPause }) : null;
+    const abortBtn = ["pvai", "pvp", "ai_vs_ai"].includes(m.mode)
+      ? el("button", { class: "btn btn-compact btn-abort", text: "中止して保存", title: "長引いた対局を中止し、ここまでの棋譜を対戦履歴に保存します", onclick: onAbort })
+      : null;
     if (m.mode === "ai_vs_ai") { actionsBar.appendChild(pauseBtn); actionsBar.appendChild(stepBtn); }
     else if (clockBtn) actionsBar.appendChild(clockBtn); // 持ち時間ありの対局は待ったなし
     else actionsBar.appendChild(undoBtn);
@@ -2142,6 +2256,7 @@
       actionsBar.appendChild(hintBtn);
       actionsBar.appendChild(el("button", { class: "btn btn-compact", text: "解答を見る", onclick: startTsumeReplay }));
     }
+    if (abortBtn) actionsBar.appendChild(abortBtn);
     actionsBar.appendChild(restartBtn);
 
     // 盤の列(boardCol)と情報の列(sideCol)。狭い画面では2つの列を解いて、
@@ -2159,8 +2274,9 @@
     if (tsumePanel) sideCol.appendChild(tsumePanel);
 
     const turnRow = el("div", { class: "turn-row" });
+    const plyBadge = el("span", { class: "ply-badge" }); // いま何手目か(詰めピンチは専用の表示があるので出さない)
     const turnText = el("div", { class: "turn-text", "aria-live": "polite" });
-    turnRow.appendChild(turnText);
+    turnRow.appendChild(el("div", { class: "turn-line" }, [plyBadge, turnText]));
     const obligationText = el("div", { class: "obligation-text" });
     turnRow.appendChild(obligationText);
     sideCol.appendChild(turnRow);
@@ -2257,7 +2373,7 @@
 
     // ---- 保存しておいて updateGameUI から参照する ----
     App.gameDom = {
-      modeText, turnText, obligationText, bannerHost, undoBtn, restartBtn, stepBtn, pauseBtn, hintBtn, tsumePanel,
+      modeText, plyBadge, turnText, obligationText, bannerHost, undoBtn, restartBtn, stepBtn, pauseBtn, hintBtn, tsumePanel, abortBtn,
       clockBtn, clocks, evalMeter,
       board, grid, cellNodes, piecesLayer, fxLayer, size, sideA, sideB, logList,
       boardFrame, trailLayer, fxUnder,
@@ -2292,7 +2408,7 @@
   function onCellClick(r, c) {
     const m = App.match;
     if (m && m.clock) clockTick(m); // 時間切れ後の着手は受け付けない
-    if (!m || m.engine.isOver() || m.aiThinking) return;
+    if (!m || matchFinished(m) || m.aiThinking) return;
     if (m.clock && m.clock.paused) { toast("時計が止まっています。「時計を再開」を押してください"); return; }
     const engine = m.engine;
     const player = engine.currentPlayer;
@@ -2388,7 +2504,7 @@
 
   function onUndo() {
     const m = App.match;
-    if (m.aiThinking || !m.historyStack.length || m.clock) return;
+    if (m.aiThinking || !m.historyStack.length || m.clock || m.aborted) return;
     if (m.mode === "tsume" && m.tsumeReplay) return;
     let snap = null;
     if (m.mode === "tsume") {
@@ -2431,12 +2547,12 @@
 
   function onStepOnce() {
     const m = App.match;
-    if (m.mode !== "ai_vs_ai" || m.engine.isOver() || m.aiThinking) return;
+    if (m.mode !== "ai_vs_ai" || matchFinished(m) || m.aiThinking) return;
     startAIMove(m.engine.currentPlayer);
   }
   function onTogglePause() {
     const m = App.match;
-    if (m.mode !== "ai_vs_ai") return;
+    if (m.mode !== "ai_vs_ai" || m.aborted) return;
     m.aiVsAiPaused = !m.aiVsAiPaused;
     updateGameUI();
     if (!m.aiVsAiPaused && !m.engine.isOver() && !m.aiThinking) startAIMove(m.engine.currentPlayer);
@@ -2445,7 +2561,7 @@
   let thinkTimer = null;
   function currentActorIsHuman() {
     const m = App.match;
-    if (!m || m.engine.isOver() || m.aiThinking) return false;
+    if (!m || matchFinished(m) || m.aiThinking) return false;
     if (m.mode === "ai_vs_ai") return false;
     if ((m.mode === "pvai" || m.mode === "tsume") && m.engine.currentPlayer === otherPlayer(m.humanPlayer)) return false;
     if (m.mode === "tsume" && (m.tsumeFailed || m.tsumeReplay)) return false;
@@ -2462,10 +2578,21 @@
     dom.modeText.textContent = modeLabelText() + (m.ruleTemplate ? " / 特化テンプレート" : "") + ` / 接触制限 ${engine.config.contactLimit}`
       + (m.evalDisplay ? " / 形勢表示あり" : "");
     dom.restartBtn.disabled = false;
-    dom.undoBtn.disabled = m.aiThinking || !m.historyStack.length || !!m.tsumeReplay || !!m.clock
+    dom.undoBtn.disabled = m.aiThinking || !m.historyStack.length || !!m.tsumeReplay || !!m.clock || !!m.aborted
       || (m.mode !== "tsume" && undoTargetIndex(m) == null);
+    if (dom.abortBtn) {
+      dom.abortBtn.disabled = !canAbortMatch(m);
+      dom.abortBtn.textContent = m.aborted ? "中止しました" : "中止して保存";
+    }
+    if (dom.plyBadge) {
+      const n = matchPlies(m);
+      dom.plyBadge.hidden = m.mode === "tsume";
+      dom.plyBadge.textContent = m.aborted ? `全${n}手で中止` : engine.isOver() ? `全${n}手で終局` : `${n + 1}手目`;
+      dom.plyBadge.classList.toggle("is-final", matchFinished(m));
+      dom.plyBadge.setAttribute("title", matchFinished(m) ? `${n}手指して対局が終わりました` : `これから指すのは${n + 1}手目です(${n}手指しました)`);
+    }
     if (dom.clockBtn) {
-      dom.clockBtn.disabled = engine.isOver();
+      dom.clockBtn.disabled = matchFinished(m);
       dom.clockBtn.textContent = m.clock.paused ? "時計を再開" : "時計を止める";
     }
     if (dom.hintBtn) {
@@ -2475,7 +2602,8 @@
     }
     if (m.mode === "ai_vs_ai") {
       dom.pauseBtn.textContent = m.aiVsAiPaused ? "再開" : "一時停止";
-      dom.stepBtn.disabled = !(m.aiVsAiPaused && !engine.isOver());
+      dom.pauseBtn.disabled = !!m.aborted;
+      dom.stepBtn.disabled = !(m.aiVsAiPaused && !matchFinished(m));
     }
 
     drawBoard();
@@ -2501,6 +2629,8 @@
       };
       tick();
       thinkTimer = setInterval(tick, 400);
+    } else if (m.aborted) {
+      dom.turnText.textContent = "対局を中止しました";
     } else if (m.mode === "tsume" && m.tsumeReplay && !engine.isOver()) {
       dom.turnText.textContent = `解答を再生しています(${m.tsumeReplay.step} / ${m.puzzle.line.length}手)`;
     } else if (m.mode === "tsume" && m.tsumeFailed) {
@@ -2889,9 +3019,11 @@
     const engine = m.engine;
     clearNode(dom.bannerHost);
     if (m.mode === "tsume") { drawTsumeBanner(); return; }
-    if (!engine.winner && !engine.isDraw) return;
+    if (!engine.winner && !engine.isDraw && !m.aborted) return;
     let cls = "neutral", text = "";
-    if (engine.winner) {
+    if (m.aborted) {
+      text = `${m.aborted.plies}手で対局を中止しました。ここまでの棋譜を対戦履歴に保存しました(勝敗なし)。`;
+    } else if (engine.winner) {
       const winnerName = playerDisplayName(engine.winner);
       if (m.mode === "pvai") {
         if (engine.winner === m.humanPlayer) { cls = "success"; text = `${winnerName}の勝ちです。相手の駒を挟んで動けなくしました。`; }
@@ -3855,9 +3987,10 @@
   function ratingInfoFor(m) {
     if (m.mode !== "pvai") return null;
     const human = m.humanPlayer;
-    const result = m.engine.winner ? (m.engine.winner === human ? "win" : "loss") : "draw";
+    const result = m.aborted ? "aborted" : m.engine.winner ? (m.engine.winner === human ? "win" : "loss") : "draw";
     let reason = null;
-    if (m.resumedFrom) reason = "感想戦の途中から再開した対局";
+    if (m.aborted) reason = "途中で中止した対局";
+    else if (m.resumedFrom) reason = "感想戦の途中から再開した対局";
     else if (m.evalDisplay) reason = "形勢表示ありの対局";
     else if (m.undoUsed) reason = "待ったを使った対局";
     return { side: human, level: ratingLevelKey(m.aiLevel, m.aiSpecialist), result, eligible: !reason, reason };
@@ -3892,7 +4025,7 @@
     return new Promise((resolve) => {
       if (!bgWorker && bgWorkerOk && Worker_) {
         try {
-          bgWorker = new Worker_("ai-worker.js?v=8");
+          bgWorker = new Worker_("ai-worker.js?v=10");
           bgWorker.onmessage = (e) => {
             const cb = bgPending.get(e.data.reqId);
             if (cb) { bgPending.delete(e.data.reqId); cb(e.data.ok ? e.data.result : null); }
@@ -4470,7 +4603,7 @@
     mainCol.appendChild(varBanner);
     const boardWrap = el("div", { class: "board-wrap" });
     const size = record.rows;
-    const { boardFrame, cellNodes, piecesLayer, fxLayer } = buildBoardShell(size, { fx: true });
+    const { boardFrame, cellNodes, piecesLayer, fxLayer } = buildBoardShell(size, { fx: true, onCellClick: onReviewCellClick });
     boardWrap.appendChild(boardFrame);
     mainCol.appendChild(boardWrap);
 
@@ -4496,6 +4629,9 @@
     // AIの検討: 最善手・読み筋・詰み手順の樹形図
     const studyCard = el("div", { class: "study-card" });
     sideCol.appendChild(studyCard);
+    // 指し手の採点: 局面の指せる手をすべて読み、実際に指した手・盤で試した手に点数を付けて説明する
+    const scoreCard = el("div", { class: "study-card score-card" });
+    sideCol.appendChild(scoreCard);
 
     const resumeBtn = el("button", { class: "btn btn-compact review-resume", text: "この局面から対局を再開する", onclick: () => openResumeSetup(record, frames, index) });
     mainCol.appendChild(resumeBtn);
@@ -4658,6 +4794,13 @@
     let showBest = loadReviewPrefs().showBest !== false;
     let treeDisp = new Map();    // 樹形図のノード → 表示用ノード(まとめた受けの手の一覧を引くため)
 
+    // ---- 指し手の採点・盤で手を試す ----
+    const scoreCache = new Map(); // 局面番号 → { status: "loading" | "ready" | "failed", data, progress, rev, rescoring }
+    let trial = null;             // 盤で試した手 { index, label }(本譜とは別に盤に出す)
+    let trySel = null;            // 試す手を選んでいる駒のマス [r, c]
+    let showAllMoves = false;     // 採点した手を全部並べる
+    let scoreSig = "";
+
     // i手目の局面の解析結果(じっくり読んだ結果があればそちら)
     function posInfo(i) { return deepCache.get(i) || results[i] || null; }
     function winAAt(i) { const r = posInfo(i); return r ? r.winA : 0.5; }
@@ -4725,8 +4868,8 @@
         if (next && !variation.frame.winner) { move = [next.from, next.to]; side = next.side; }
       } else if (showBest) {
         const frame = frames[index];
-        const r = posInfo(index);
-        if (r && r.best && !frame.winner && !frame.isDraw) { move = r.best; side = frame.currentPlayer; }
+        const best = bestAt(index);
+        if (best && !frame.winner && !frame.isDraw) { move = best; side = frame.currentPlayer; }
       }
       if (!move) return;
       const NS = "http://www.w3.org/2000/svg";
@@ -4758,8 +4901,23 @@
       }
     }
 
-    function drawVarBanner(variation) {
+    function drawVarBanner(variation, tried) {
       clearNode(varBanner);
+      varBanner.classList.toggle("is-trial", !!tried);
+      if (tried) {
+        varBanner.style.display = "";
+        let text = `盤で試した手: ${bestMoveText(trial.label)}(本譜の${index + 1}手目の代わり)`;
+        if (tried.sand.length) text += `、${tried.sand.join("・")}を挟む`;
+        if (tried.frame.winner) text += ` ― ${nameOf(tried.frame.winner)}の勝ち`;
+        else if (tried.frame.isDraw) text += " ― 千日手で引き分け";
+        const sc = scoreCache.get(index);
+        const g = sc && sc.status === "ready" ? AI.gradeScoredMove(sc.data, trial.label) : null;
+        if (g) text += ` ― ${g.points}点(${g.n}手中${g.rank}位${g.label ? `・${g.mark} ${g.label}` : g.isBest ? "・最善手" : ""})`;
+        else if (sc && sc.status === "loading") text += " ― 採点しています…";
+        varBanner.appendChild(el("span", { text }));
+        varBanner.appendChild(el("button", { class: "btn btn-compact", text: "本譜に戻る", onclick: () => { trial = null; trySel = null; renderFrame(); } }));
+        return;
+      }
       if (!variation) { varBanner.style.display = "none"; return; }
       varBanner.style.display = "";
       let text = `検討中の変化: ${index}手目の局面から${varPath.length}手進めた局面`;
@@ -4822,7 +4980,9 @@
       const r = posInfo(index);
       if (treeOpen && r && r.mate && !frame.winner && deepLoading == null) ensureTree(index); // じっくり読んでいる間は待つ
       const tree = treeCache.get(index);
+      const scored = scoreAt(index);
       const sig = [index, r ? [r.best && r.best.join(), r.mate, r.matePlies, r.deep, r.depth].join() : "-", deepLoading, treeOpen,
+        scored ? scored.entries[0].label.join(">") : "-",
         tree ? `${tree.status}${tree.rev}` : "-", showBest, varPath ? varPath.map((n) => n.from + n.to).join(",") : ""].join("|");
       if (sig === studySig) return;
       studySig = sig;
@@ -4843,7 +5003,11 @@
       }
 
       const bestRow = el("div", { class: "study-best" });
-      if (!r) {
+      if (scored) {
+        bestRow.appendChild(document.createTextNode(`最善手(${nameOf(frame.currentPlayer)}の番): `));
+        bestRow.appendChild(el("b", { text: bestMoveText(scored.entries[0].label) }));
+        bestRow.appendChild(el("span", { class: "study-muted", text: `  全${scored.entries.length}手の採点で1位` }));
+      } else if (!r) {
         bestRow.appendChild(el("span", { class: "study-muted", text: "この局面はまだ解析中です(「じっくり読む」ですぐに読むこともできます)。" }));
       } else if (r.best) {
         bestRow.appendChild(document.createTextNode(`最善手(${nameOf(frame.currentPlayer)}の番): `));
@@ -5072,14 +5236,270 @@
       }
     }
 
+    // ---- 指し手の採点 ----
+    // i手目の局面で実際に指した手のラベル [from, to](最後の局面なら null)
+    function playedLabel(i) {
+      const mv = record.moves[i];
+      return i < frames.length - 1 && mv ? [mv.from || "", mv.to] : null;
+    }
+    function sameMove(a, b) { return !!a && !!b && a[0] === b[0] && a[1] === b[1]; }
+    function scoreAt(i) { const sc = scoreCache.get(i); return sc && sc.status === "ready" ? sc.data : null; }
+    // 盤の矢印・検討に出す最善手(全部の手を採点した局面はその結果を優先する)
+    function bestAt(i) {
+      const sc = scoreAt(i);
+      if (sc) return sc.entries[0].label;
+      const r = posInfo(i);
+      return r ? r.best : null;
+    }
+
+    // i手目の局面の手をすべて採点する。実際に指した手と、盤で試した手は必ず深く読み直す
+    function startScore(i) {
+      const focus = [playedLabel(i)];
+      if (trial && trial.index === i) focus.push(trial.label);
+      const entry = { status: "loading", progress: null, rev: 0, rescoring: null };
+      scoreCache.set(i, entry);
+      requestScore("all", frames[i].engineClone, { template: recordUsesTemplate(record), focus: focus.filter(Boolean) },
+        (pr) => { entry.progress = pr; if (index === i) drawScore(); },
+        (res, cancelled) => {
+          if (scoreCache.get(i) !== entry) return;
+          if (cancelled) { scoreCache.delete(i); if (index === i) renderFrame(); return; }
+          entry.status = res ? "ready" : "failed";
+          entry.data = res;
+          entry.rev++;
+          renderFrame();
+          rescoreTrialIfNeeded();
+        });
+      renderFrame();
+    }
+
+    // 短い読みのまま採点した手を盤で試したら、その手だけ深く読み直す(ほかの採点を読んでいる間は待たない)
+    function rescoreTrialIfNeeded() {
+      if (!trial) return;
+      const i = trial.index, label = trial.label;
+      const sc = scoreCache.get(i);
+      if (!sc || sc.status !== "ready" || sc.rescoring || scoreReq) return;
+      const e = sc.data.entries.find((x) => sameMove(x.label, label));
+      if (!e || e.deep) return;
+      sc.rescoring = label;
+      sc.rev++;
+      requestScore("rescore", frames[i].engineClone, { template: recordUsesTemplate(record), label, deepBudget: AI.SCORE_DEEP_BUDGET }, null, (res, cancelled) => {
+        sc.rescoring = null;
+        if (res) AI.mergeScoredMove(sc.data, res);
+        sc.rev++;
+        if (!cancelled) renderFrame();
+      });
+      drawScore();
+    }
+
+    // 盤で手を試す(本譜の局面から1手。採点していなければ採点を始める)
+    function tryMove(label) {
+      trySel = null;
+      varPath = null;
+      trial = { index, label };
+      if (!scoreCache.has(index) || scoreCache.get(index).status === "failed") { startScore(index); return; }
+      renderFrame();
+      rescoreTrialIfNeeded();
+    }
+
+    function onReviewCellClick(r, c) {
+      if (varPath || trial) return; // 変化手順・試した手を盤に出している間は動かさない(「本譜に戻る」で戻る)
+      const frame = frames[index];
+      if (frame.winner || frame.isDraw) return;
+      const engine = frame.engineClone;
+      const player = engine.currentPlayer;
+      const obl = engine.obligated[player];
+      const piece = engine.pieceAt([r, c]);
+      if (trySel) {
+        const sel = engine.pieceAt(trySel);
+        if (sel && engine.legalMoves(sel.id).some((q) => q[0] === r && q[1] === c)) { tryMove([posLabel(trySel), posLabel([r, c])]); return; }
+      }
+      if (piece && piece.player === player && (!obl.length || obl.includes(piece.id)) && engine.legalMoves(piece.id).length) {
+        trySel = trySel && trySel[0] === r && trySel[1] === c ? null : [r, c];
+        renderFrame();
+        return;
+      }
+      if (!piece && !trySel && engine.legalPlacements(player).some((q) => q[0] === r && q[1] === c)) { tryMove(["", posLabel([r, c])]); return; }
+      if (trySel) { trySel = null; renderFrame(); }
+    }
+
+    // 試せる駒・行き先・配置先のマスを光らせる(本譜の局面を出しているときだけ)
+    function markTryCells(active) {
+      const frame = frames[index];
+      const hot = new Set(), dest = new Set();
+      if (active && !frame.winner && !frame.isDraw) {
+        const engine = frame.engineClone, player = engine.currentPlayer, obl = engine.obligated[player];
+        for (const p of engine.pieces.values()) {
+          if (p.player === player && (!obl.length || obl.includes(p.id)) && engine.legalMoves(p.id).length) hot.add(H.posKey(p.position));
+        }
+        const sel = trySel && engine.pieceAt(trySel);
+        if (sel) engine.legalMoves(sel.id).forEach((q) => { dest.add(H.posKey(q)); hot.add(H.posKey(q)); });
+        else engine.legalPlacements(player).forEach((q) => hot.add(H.posKey(q)));
+      }
+      for (let r = 0; r < size; r++) {
+        for (let c = 0; c < size; c++) {
+          const key = r + "," + c;
+          cellNodes[r][c].classList.toggle("is-hot", hot.has(key));
+          cellNodes[r][c].classList.toggle("is-dest", dest.has(key));
+        }
+      }
+    }
+
+    // 試した手を指した局面
+    function trialFrame() {
+      if (!trial || trial.index !== index) return null;
+      const engine = frames[index].engineClone.clone();
+      const action = AI.labelToAction(engine, trial.label);
+      if (!action) return null;
+      const from = action[0] === "move" ? engine.pieces.get(action[1]).position.slice() : null;
+      const res = AI.applyAction(engine, engine.currentPlayer, action);
+      const to = action[0] === "move" ? action[2] : action[1];
+      const sand = res.newlySandwiched.map((pid) => posLabel(engine.pieces.get(pid).position));
+      return { frame: frameSnapshot(engine, "", { from, to }), sand };
+    }
+
+    function drawScore() {
+      const frame = frames[index];
+      const sc = scoreCache.get(index);
+      const played = playedLabel(index);
+      const tried = trial && trial.index === index ? trial.label : null;
+      const pr = sc && sc.progress;
+      const sig = [index, sc ? `${sc.status}${sc.rev}${pr ? `${pr.stage}${pr.done}/${pr.total}` : ""}` : "-",
+        tried ? tried.join(">") : "", showAllMoves].join("|");
+      if (sig === scoreSig) return;
+      scoreSig = sig;
+      clearNode(scoreCard);
+      const muted = (text) => el("div", { class: "study-muted", text });
+      scoreCard.appendChild(el("div", { class: "study-head" }, [
+        el("span", { class: "study-title", text: "指し手の採点" }),
+        el("span", { class: "study-muted", text: "指せる手をすべて『神』の読みで評価" }),
+      ]));
+      if (frame.winner || frame.isDraw) {
+        scoreCard.appendChild(muted("対局が終わった局面です。前の局面に戻ると、その局面の手を採点できます。"));
+        return;
+      }
+      const who = nameOf(frame.currentPlayer);
+      if (!sc || sc.status === "failed") {
+        const est = AI.scoreEstimate(frame.engineClone);
+        if (sc) scoreCard.appendChild(muted("採点できませんでした。もう一度試してください。"));
+        scoreCard.appendChild(el("div", { class: "score-intro", text: `${index + 1}手目(${who}の番)で指せる${est.n}手をすべて読んで並べ、`
+          + (played ? `実際に指した手(${bestMoveText(played)})に点数を付けます。最善手でなければ、最善手がなぜ良いのかも説明します。` : "最善手とその理由を示します。") }));
+        scoreCard.appendChild(muted("盤の駒やマスをクリック(タップ)すると、ほかの手を試して、その手も採点できます。"));
+        scoreCard.appendChild(el("div", { class: "study-actions" }, [
+          el("button", { class: "btn btn-compact btn-score", text: `この局面の手をすべて採点する(約${est.sec}秒)`, onclick: () => startScore(index) }),
+        ]));
+        return;
+      }
+      if (sc.status === "loading") {
+        let text = "読みの準備をしています…", ratio = 0;
+        if (pr && pr.stage === "quick") { text = `全${pr.total}手を短く読んでいます… ${pr.done} / ${pr.total}`; ratio = 0.5 * pr.done / Math.max(1, pr.total); }
+        else if (pr) { text = `上位の手と採点する手を深く読み直しています… ${pr.done} / ${pr.total}`; ratio = 0.5 + 0.5 * pr.done / Math.max(1, pr.total); }
+        scoreCard.appendChild(el("div", {
+          class: "score-progress", role: "progressbar", "aria-label": "採点の進み具合",
+          "aria-valuemin": "0", "aria-valuemax": "100", "aria-valuenow": String(Math.round(ratio * 100)),
+        }, [el("div", { class: "score-progress-fill", style: { width: `${ratio * 100}%` } })]));
+        scoreCard.appendChild(muted(text));
+        if (tried) scoreCard.appendChild(muted(`盤で試した手(${bestMoveText(tried)})も、読み終えたら採点します。`));
+        return;
+      }
+      const data = sc.data;
+      if (played) scoreCard.appendChild(gradeBlock(data, played, "実際に指した手", sc));
+      if (tried && !sameMove(tried, played)) scoreCard.appendChild(gradeBlock(data, tried, "盤で試した手", sc));
+      if (!played && !tried) scoreCard.appendChild(gradeBlock(data, data.entries[0].label, "最善手", sc));
+      scoreCard.appendChild(candidateList(data, played, tried));
+      const how = recordUsesTemplate(record) ? "特化テンプレートの対局なので奥義と同じ評価" : "『神』と同じ評価";
+      scoreCard.appendChild(muted(`読み方: 全${data.entries.length}手を1手${(data.quickBudget / 1000).toFixed(2)}秒で読み、`
+        + `上位の手と採点した手を${data.deepBudget / 1000}秒ずつ深く読み直しました(${how})。点数は最善手との勝率の差から付けています(差0で100点、差50%以上で0点)。`));
+      if (!tried) scoreCard.appendChild(muted("盤の駒やマスをクリック(タップ)するか、表の手を選ぶと、その手を試して採点できます。"));
+    }
+
+    // 1手ぶんの採点と説明
+    function gradeBlock(data, label, title, sc) {
+      const box = el("div", { class: "score-block" });
+      const ex = AI.explainScoredMove(data, label);
+      if (!ex) { box.appendChild(el("div", { class: "study-muted", text: `${title}(${bestMoveText(label)})は採点できませんでした。` })); return box; }
+      const g = ex.grade;
+      box.classList.add(g.mark ? (g.mark === "?!" ? "is-dubious" : "is-bad") : g.isBest || g.forced ? "is-best" : "is-ok");
+      box.appendChild(el("div", { class: "score-head" }, [
+        el("span", { class: "score-what", text: title }),
+        el("b", { class: "score-move", text: bestMoveText(label) }),
+        el("span", { class: "score-points", text: `${g.points}点` }),
+        el("span", { class: "score-rank", text: g.forced ? "指せる手は1つだけ" : `${g.n}手中${g.rank}位` }),
+        g.label ? el("span", { class: "score-mark", text: `${g.mark} ${g.label}` }) : g.isBest && !g.forced ? el("span", { class: "score-mark", text: "最善手" }) : null,
+      ]));
+      if (!g.entry.deep && !g.forced) {
+        box.appendChild(el("div", { class: "study-muted", text: sc.rescoring && sameMove(sc.rescoring, label)
+          ? "短い読みでの採点です。この手を深く読み直しています…"
+          : "短い読みでの採点です(深く読み直したのは上位の手と採点した手だけです)。" }));
+      }
+      box.appendChild(el("p", { class: "score-text", text: ex.head }));
+      const list = (head, items) => {
+        box.appendChild(el("div", { class: "score-sub", text: head }));
+        box.appendChild(el("ul", { class: "score-list" }, items.map((t) => el("li", { text: t }))));
+      };
+      if (ex.good.length) list(g.isBest || g.forced ? "この手の特徴" : `最善手(${bestMoveText(g.best.label)})のよい点`, ex.good);
+      if (ex.diff.length) list("この手との違い", ex.diff);
+      if (ex.note) box.appendChild(el("p", { class: "score-text study-muted", text: ex.note }));
+      if (ex.pv && ex.pv.length > 1) {
+        const pv = el("div", { class: "study-pv" }, [el("span", { class: "study-muted", text: g.isBest || g.forced ? "読み筋:" : "最善手の読み筋:" })]);
+        let side = data.mover;
+        ex.pv.forEach((mv) => {
+          pv.appendChild(el("span", { class: `pv-chip side-${side.toLowerCase()}`, text: bestMoveText(mv), title: nameOf(side) }));
+          side = otherPlayer(side);
+        });
+        box.appendChild(pv);
+      }
+      return box;
+    }
+
+    // 採点した手の一覧(良い順)。行を選ぶとその手を盤で試す
+    function candidateList(data, played, tried) {
+      const wrap = el("div", { class: "score-cands" });
+      const LIMIT = 8;
+      let rows = showAllMoves ? data.entries : data.entries.slice(0, LIMIT);
+      const extra = data.entries.filter((e) => !rows.includes(e) && (sameMove(e.label, played) || sameMove(e.label, tried)));
+      rows = rows.concat(extra);
+      const tbody = el("tbody");
+      rows.forEach((e) => {
+        const g = AI.gradeScoredMove(data, e.label);
+        const isPlayed = sameMove(e.label, played), isTried = sameMove(e.label, tried);
+        const tags = [isPlayed ? "本譜" : null, isTried ? "試した手" : null].filter(Boolean).join("・");
+        const tr = el("tr", {
+          class: `${isPlayed ? "is-played" : ""}${isTried ? " is-tried" : ""}${g.mark ? (g.mark === "?!" ? " is-dubious" : " is-bad") : ""}`,
+          tabindex: "0", title: isPlayed ? "本譜の手(クリックで本譜の局面に戻る)" : "クリックでこの手を盤で試す",
+          onclick: () => { if (isPlayed) { trial = null; trySel = null; renderFrame(); } else tryMove(e.label); },
+        }, [
+          el("td", { class: "sc-rank", text: String(g.rank) }),
+          el("td", { class: "sc-move" }, [el("span", { text: bestMoveText(e.label) }), tags ? el("span", { class: "sc-tag", text: tags }) : null]),
+          el("td", { class: "sc-win", text: AI.scoreWinText(e, data.mover) + (e.deep ? "" : "*") }),
+          el("td", { class: "sc-pts", text: `${g.points}` }),
+        ]);
+        tr.addEventListener("keydown", (ev) => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); tr.click(); } });
+        tbody.appendChild(tr);
+      });
+      wrap.appendChild(el("table", { class: "score-table" }, [
+        el("thead", {}, [el("tr", {}, [el("th", { text: "順位" }), el("th", { text: "手" }), el("th", { text: "見込み" }), el("th", { text: "点" })])]),
+        tbody,
+      ]));
+      const foot = el("div", { class: "score-foot" }, [el("span", { class: "study-muted", text: "* は短い読みの結果" })]);
+      if (data.entries.length > LIMIT) {
+        foot.appendChild(el("button", {
+          class: "btn btn-compact", text: showAllMoves ? "上位だけ表示" : `すべての手を表示(${data.entries.length}手)`,
+          onclick: () => { showAllMoves = !showAllMoves; drawScore(); },
+        }));
+      }
+      wrap.appendChild(foot);
+      return wrap;
+    }
+
     function badIndices() {
       const out = [];
       judgedMoves().forEach((j, k) => { if (j && j.mark) out.push(k + 1); });
       return out;
     }
 
-    function paintBoard(frame) {
+    function paintBoard(frame, sel) {
       clearNode(piecesLayer);
+      const selKey = sel ? sel[0] + "," + sel[1] : null;
       for (let r = 0; r < size; r++) for (let c = 0; c < size; c++) cellNodes[r][c].classList.remove("is-last");
       const obligatedPositions = new Set();
       for (const p of ["A", "B"]) for (const pos of frame.obligated[p]) obligatedPositions.add(pos[0] + "," + pos[1]);
@@ -5090,6 +5510,7 @@
         node.style.transform = `translate(${c * 100}%, ${r * 100}%)`;
         node.appendChild(el("div", { class: "disc" }, [el("span", { class: "label", text: player })]));
         if (obligatedPositions.has(pos)) node.classList.add("is-obligated");
+        if (pos === selKey) node.classList.add("is-selected");
         piecesLayer.appendChild(node);
       }
       if (frame.lastAction) {
@@ -5100,13 +5521,18 @@
 
     function renderFrame() {
       index = Math.max(0, Math.min(frames.length - 1, index));
-      if (index !== shownIndex) { varPath = null; shownIndex = index; } // 本譜の手を移ったら変化手順の表示はやめる
+      // 本譜の手を移ったら変化手順・試した手の表示はやめる
+      if (index !== shownIndex) { varPath = null; trial = null; trySel = null; shownIndex = index; }
       const frame = frames[index];
       const variation = varPath ? variationFrame(varPath) : null;
       if (!variation) varPath = null;
-      paintBoard(variation ? variation.frame : frame);
-      drawArrow(variation);
-      drawVarBanner(variation);
+      else { trial = null; trySel = null; } // 樹形図の手を選んだら試した手はやめる
+      const tried = variation ? null : trialFrame();
+      if (!tried) trial = null;
+      paintBoard(variation ? variation.frame : tried ? tried.frame : frame, tried || variation ? null : trySel);
+      markTryCells(!variation && !tried);
+      if (tried) clearNode(fxLayer); else drawArrow(variation);
+      drawVarBanner(variation, tried);
       desc.textContent = frame.desc;
       step.textContent = `${index} / ${frames.length - 1} 手`;
       first.disabled = prev.disabled = index === 0;
@@ -5120,6 +5546,7 @@
       drawVerdict();
       drawGraph();
       drawStudy();
+      drawScore();
     }
     first.addEventListener("click", () => { index = 0; renderFrame(); });
     prev.addEventListener("click", () => { index--; renderFrame(); });

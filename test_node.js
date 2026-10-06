@@ -647,6 +647,75 @@ function refDistance(engine, solver, maxPlies, quiet) {
   let pvLegal = !!d0 && d0.pv.length >= 2;
   if (pvLegal) { const x = e0.clone(); try { for (const [fr, to] of d0.pv) play(x, fr, to); } catch (err) { pvLegal = false; } }
   check("deep analyze: opening PV is a legal sequence starting with the best move", pvLegal && d0.pv[0].join() === d0.best.join(), JSON.stringify(d0 && d0.pv));
+
+  // ---- 16c. 感想戦の採点: 指せる手をすべて読んで並べ、点数と説明を付ける ----
+  const acts = AI.generateActions(e, e.currentPlayer);
+  const someLabel = AI.actionLabels(e, acts[acts.length - 1]);
+  const progress = [];
+  const sc = AI.scoreAllMoves(e, true, { quickBudget: 40, deepBudget: 250, deepTop: 3, focus: [someLabel], onProgress: (st, d1, t1) => progress.push(st) });
+  const labels = sc.entries.map((x) => x.label.join("-"));
+  check("score: every legal move is scored once", sc.entries.length === acts.length && new Set(labels).size === labels.length
+    && acts.every((a) => labels.includes(AI.actionLabels(e, a).join("-"))));
+  check("score: the mover is the side to move and progress covers both stages", sc.mover === "B" && progress.includes("quick") && progress.includes("deep"));
+  check("score: the best move is B4-C4, mate in 3, read deeply", labels[0] === "B4-C4" && sc.entries[0].mate === "B" && sc.entries[0].matePlies === 3 && sc.entries[0].deep,
+    JSON.stringify(sc.entries[0]));
+  check("score: the focus move is read deeply", sc.entries.find((x) => x.label.join("-") === someLabel.join("-")).deep);
+  check("score: scoring leaves the position unchanged", e._stateKey() === key0 && !e.isOver());
+  const gBest = AI.gradeScoredMove(sc, ["B4", "C4"]);
+  check("score: the best move gets 100 points and rank 1", gBest.points === 100 && gBest.rank === 1 && gBest.isBest && !gBest.label);
+  const worse = sc.entries.find((x) => x.mate !== "B");
+  const exW = worse && AI.explainScoredMove(sc, worse.label);
+  check("score: a move that misses the mate is explained against the best move", !!exW && !exW.grade.isBest && /最善手はB4→C4/.test(exW.head)
+    && exW.diff.some((t) => /3手で勝ちまで読み切れますが/.test(t)) && exW.pv[0].join("-") === "B4-C4", JSON.stringify(exW && { head: exW.head, diff: exW.diff }));
+  const shallow = sc.entries.find((x) => !x.deep);
+  if (shallow) {
+    const re = AI.rescoreMove(e, true, shallow.label, 250);
+    const n0 = sc.entries.length;
+    AI.mergeScoredMove(sc, re);
+    check("score: re-reading one move replaces it and keeps the order", re.deep && sc.entries.length === n0
+      && sc.entries.find((x) => x.label.join() === shallow.label.join()) === re && sc.entries[0].label.join("-") === "B4-C4");
+  }
+})();
+
+// ---- 16d. 感想戦の採点: 点数の付け方・説明の材料(挟む手) ----
+(function () {
+  const fake = { mover: "A", entries: [
+    { label: ["", "A1"], win: 0.70, mate: null }, { label: ["", "A2"], win: 0.70, mate: null },
+    { label: ["", "A3"], win: 0.62, mate: null }, { label: ["", "A4"], win: 0.40, mate: null },
+  ] };
+  const g = (lb) => AI.gradeScoredMove(fake, ["", lb]);
+  check("grade: 0 loss = 100 points, ties share rank 1", g("A1").points === 100 && g("A2").points === 100 && g("A2").rank === 1);
+  check("grade: an 8% loss is 疑問手 with 84 points", g("A3").points === 84 && g("A3").label === "疑問手" && g("A3").rank === 3);
+  check("grade: a 30% loss is 大悪手 with 40 points", g("A4").points === 40 && g("A4").label === "大悪手");
+  check("grade: the only legal move scores 100 as forced", (() => {
+    const one = AI.gradeScoredMove({ mover: "A", entries: [{ label: ["", "B2"], win: 0.2, mate: null }] }, ["", "B2"]);
+    return one.points === 100 && one.forced && !one.label;
+  })());
+  check("grade: unknown move is null", AI.gradeScoredMove(fake, ["", "E5"]) === null);
+
+  // 1. と同じ壁挟みの局面: C4→B4 で A4 の駒を挟む
+  const cfg = H.makeConfig({ rows: 7, cols: 7, moveRange: 3, stockPerPlayer: 5, wallSandwich: true });
+  const e = new H.GameEngine(cfg);
+  e.pieces.set(100, { id: 100, player: "B", position: [3, 0] }); e.board.set("3,0", 100);
+  e.pieces.set(101, { id: 101, player: "A", position: [3, 2] }); e.board.set("3,2", 101);
+  e._nextPieceId = 102;
+  e.currentPlayer = "A";
+  const sc = AI.scoreAllMoves(e, false, { quickBudget: 30, deepBudget: 150, deepTop: 2, focus: [["C4", "B4"]] });
+  const cap = sc.entries.find((x) => x.label.join("-") === "C4-B4");
+  check("score features: the capture lists the sandwiched piece", cap && cap.feat.captures.join() === "A4" && cap.feat.oppObl === 1, JSON.stringify(cap && cap.feat));
+  // 読みの揺れで順位が入れ替わらないよう、挟む手を最善にした採点結果で説明文を確かめる
+  const other = sc.entries.find((x) => x !== cap && !x.feat.captures.length);
+  const fixed = { mover: "A", entries: [Object.assign({}, cap, { win: 0.8 }), Object.assign({}, other, { win: 0.5 })] };
+  const exBest = AI.explainScoredMove(fixed, cap.label);
+  check("score explanation: the best move's capture is a reason", exBest.grade.isBest && exBest.good.some((t) => /A4を挟み、移動義務を負わせます/.test(t)), JSON.stringify(exBest.good));
+  const exOther = AI.explainScoredMove(fixed, other.label);
+  check("score explanation: a non-capturing move is contrasted with the capture", !exOther.grade.isBest && exOther.grade.label === "大悪手"
+    && /最善手はC4→B4/.test(exOther.head) && exOther.diff.some((t) => /最善手は相手の駒\(A4\)を挟みますが、この手は挟みません/.test(t)),
+  JSON.stringify(exOther));
+  check("score estimate: counts legal moves and gives seconds", (() => {
+    const est = AI.scoreEstimate(e);
+    return est.n === AI.generateActions(e, "A").length && est.sec >= 5 && est.sec % 5 === 0;
+  })());
 })();
 
 // ---- 17. チュートリアル: 全レッスンの模範手順で課題を達成でき、✕のマスは本当に置けない ----

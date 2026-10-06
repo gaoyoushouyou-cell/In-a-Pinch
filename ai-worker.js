@@ -10,12 +10,13 @@
  * postMessage は構造化複製(structured clone)アルゴリズムを使うため、
  * Map や配列はそのまま送受信できる(JSON化は不要)。
  */
-importScripts("engine.js?v=3", "ai.js?v=8", "tsume.js?v=1");
+importScripts("engine.js?v=3", "ai.js?v=10", "tsume.js?v=1");
 
 self.onmessage = function (e) {
   if (e.data.kind === "tsume") { handleTsume(e.data); return; }
   if (e.data.kind === "eval" || e.data.kind === "analyze") { handleEval(e.data); return; }
   if (e.data.kind === "study") { handleStudy(e.data); return; }
+  if (e.data.kind === "score") { handleScore(e.data); return; }
   const { reqId, config, state, player, level, specialist, seed, timeBudget } = e.data;
   try {
     const engine = rebuildEngine(config, state);
@@ -75,6 +76,24 @@ function handleStudy(d) {
     const result = d.op === "deep"
       ? A.deepAnalyze(engine, d.template, d.timeBudget)
       : A.buildMateTree(engine, d.winner, d.plies, d.path);
+    postMessage({ reqId: d.reqId, ok: true, result });
+  } catch (err) {
+    postMessage({ reqId: d.reqId, ok: false, error: String((err && err.message) || err) });
+  }
+}
+
+// 感想戦の採点(kind: "score")。op "all" = 局面の指せる手をすべて読んで並べる(途中経過を progress で送る)、
+// "rescore" = 1手だけを読み直す。採点専用の Worker で動かす(app.js の requestScore)
+function handleScore(d) {
+  try {
+    const engine = rebuildEngine(d.config, d.state);
+    const A = self.HasamiAI;
+    const result = d.op === "rescore"
+      ? A.rescoreMove(engine, d.template, d.label, d.deepBudget)
+      : A.scoreAllMoves(engine, d.template, {
+        focus: d.focus,
+        onProgress: (stage, done, total) => postMessage({ reqId: d.reqId, progress: { stage, done, total } }),
+      });
     postMessage({ reqId: d.reqId, ok: true, result });
   } catch (err) {
     postMessage({ reqId: d.reqId, ok: false, error: String((err && err.message) || err) });
