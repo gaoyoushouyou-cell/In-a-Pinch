@@ -30,7 +30,11 @@
         comp.threshold.value = -14; comp.knee.value = 10; comp.ratio.value = 3; comp.attack.value = 0.003; comp.release.value = 0.25;
         comp.connect(ctx.destination);
         const se = ctx.createGain(); se.gain.value = prefs.volume; se.connect(comp);
-        const bgm = ctx.createGain(); bgm.gain.value = 0; bgm.connect(comp);
+        // BGM の出口に 4次のハイパス(240Hz、バターワース)を置き、低い音を一切通さない
+        const bgm = ctx.createGain(); bgm.gain.value = 0;
+        const hp1 = ctx.createBiquadFilter(), hp2 = ctx.createBiquadFilter();
+        hp1.type = hp2.type = "highpass"; hp1.frequency.value = hp2.frequency.value = 240; hp1.Q.value = 0.541; hp2.Q.value = 1.307;
+        bgm.connect(hp1); hp1.connect(hp2); hp2.connect(comp);
         const rev = ctx.createConvolver(); rev.buffer = makeIR(ctx, 2.8); rev.connect(se);
         const bgmRev = ctx.createConvolver(); bgmRev.buffer = makeIR(ctx, 3.4); bgmRev.connect(bgm);
         const noise = ctx.createBuffer(1, ctx.sampleRate * 2, ctx.sampleRate), nd = noise.getChannelData(0);
@@ -163,9 +167,9 @@
     tone(k, o, "sine", 2450, t, 0.0006, 0.42 * v, 0.10); tone(k, o, "sine", 3720, t, 0.0006, 0.2 * v, 0.06); tone(k, o, "sine", 1180, t, 0.0006, 0.12 * v, 0.05);
     hit(k, o, t, "bandpass", 3000, 1, 0.0004, 0.5 * v, 0.014);
   }
-  // 太鼓(BGM 用): 重低音を避け、胴鳴りを 120Hz 付近に上げて軽く
+  // 太鼓(BGM 用): 低い音は一切使わない。胴鳴りは 300Hz 以上の締太鼓ふうの高い「トン」
   const PERC = {
-    don(k, o, t, v) { tone(k, o, "sine", 128, t, 0.003, 0.6 * v, 0.32, 82); tone(k, o, "sine", 230, t, 0.003, 0.2 * v, 0.12, 140); hit(k, o, t, "lowpass", 650, 0.7, 0.001, 0.4 * v, 0.05); },
+    don(k, o, t, v) { tone(k, o, "sine", 380, t, 0.003, 0.5 * v, 0.2, 320); tone(k, o, "sine", 690, t, 0.003, 0.16 * v, 0.08, 600); hit(k, o, t, "bandpass", 1300, 1.2, 0.001, 0.32 * v, 0.04); },
     ka(k, o, t, v) { hit(k, o, t, "bandpass", 2000, 2, 0.001, 0.3 * v, 0.03); tone(k, o, "sine", 1250, t, 0.001, 0.12 * v, 0.03); },
     ten(k, o, t, v) { tone(k, o, "sine", 520, t, 0.002, 0.32 * v, 0.1, 470); hit(k, o, t, "bandpass", 2400, 1.2, 0.001, 0.22 * v, 0.025); },
     suzu(k, o, t, v) { for (let i = 0; i < 5; i++) tone(k, o, "sine", 4200 + Math.random() * 2600, t + Math.random() * 0.06, 0.001, 0.06 * v, 0.3); },
@@ -288,7 +292,8 @@
   //    都節では核音の半音上(ミ♭・シ♭)から下りて終わる
   //  - 序破急: 詰みが見えたら小節ごとに少しだけテンポを上げる。詰まされそうなときは遅くし、太鼓を心拍に。
   //    秒読みは ♩=60 にして時計の1秒と拍をそろえる
-  //  - 間: フレーズのあとに必ず休みを置く。低音(ベース)は置かず、箏・尺八・笙の中音域だけで響きを作る
+  //  - 間: フレーズのあとに必ず休みを置く。低い音は一切使わない(どの音も主音レ D4 以上、太鼓も 300Hz 以上、
+  //    出口にもハイパスを置く)。箏・尺八・笙の中高音域だけで響きを作る
   //  - 場面の切り替えは、今のフレーズの切れ目で行う
   const TONIC = 62; // レ(D4)
   const SC = {
@@ -300,9 +305,9 @@
     home: { scale: "ritsu", bpm: 56, rub: 0.18, lead: "koto", reg: 0, range: [2, 9], len: [3, 5], rest: [3, 6], rhythm: [1, 1, 1.5, 2, 0.5], sho: true, shoVel: 0.18, perc: "none", rin: 24, wet: 0.45 },
     even: { scale: "ritsu", bpm: 72, rub: 0.05, lead: "koto", reg: 0, range: [2, 9], len: [4, 6], rest: [2, 4], rhythm: [1, 0.5, 0.5, 1, 1.5], perc: "sparse", rin: 0, wet: 0.3 },
     ahead: { scale: "minyo", bpm: 78, rub: 0.03, lead: "koto", answer: true, reg: 0, range: [3, 10], len: [4, 6], rest: [2, 3], rhythm: [0.5, 0.5, 1, 0.5, 1], perc: "shime", rin: 0, wet: 0.28 },
-    behind: { scale: "miyako", bpm: 60, rub: 0.1, lead: "koto", answer: true, reg: -12, range: [4, 9], len: [3, 5], rest: [2, 5], rhythm: [1, 1.5, 1, 2], oshide: 0.45, sho: true, shoVel: 0.12, perc: "none", rin: 0, wet: 0.38 },
+    behind: { scale: "miyako", bpm: 60, rub: 0.1, lead: "koto", answer: true, reg: 0, range: [0, 5], len: [3, 5], rest: [2, 5], rhythm: [1, 1.5, 1, 2], oshide: 0.45, sho: true, shoVel: 0.12, perc: "none", rin: 0, wet: 0.38 },
     mateWin: { scale: "minyo", bpm: 80, bpmEnd: 92, accel: 1, rub: 0, lead: "koto", reg: 0, range: [4, 11], len: [4, 6], rest: [1, 3], rhythm: [0.5, 0.5, 1, 0.5, 1], sararin: true, perc: "jiuchi", rin: 16, wet: 0.25 },
-    mateLose: { scale: "miyako", bpm: 54, bpmEnd: 46, accel: -0.6, rub: 0.08, lead: "shaku", reg: -12, range: [5, 9], len: [2, 4], rest: [3, 5], rhythm: [2, 1.5, 3], sho: true, shoVel: 0.09, perc: "heart", rin: 0, wet: 0.4 },
+    mateLose: { scale: "miyako", bpm: 54, bpmEnd: 46, accel: -0.6, rub: 0.08, lead: "shaku", reg: 0, range: [0, 4], len: [2, 4], rest: [3, 5], rhythm: [2, 1.5, 3], sho: true, shoVel: 0.09, perc: "heart", rin: 0, wet: 0.4 },
     byoyomi: { scale: "ritsu", bpm: 60, rub: 0, lead: null, sho: true, shoVel: 0.1, shoChord: [69, 74, 81], perc: "clock", rin: 0, wet: 0.2, duck: 0.6 },
     review: { scale: "ritsu", bpm: 48, rub: 0.15, lead: "koto", reg: 0, range: [1, 8], len: [3, 5], rest: [4, 8], rhythm: [1, 1.5, 2, 1], sho: true, shoVel: 0.09, perc: "none", rin: 32, wet: 0.55 },
     tsume: { scale: "miyako", bpm: 50, rub: 0.3, lead: "shaku", reg: 0, range: [2, 8], len: [2, 4], rest: [3, 6], rhythm: [2, 3, 1.5, 4], perc: "none", rin: 0, wet: 0.5 },
