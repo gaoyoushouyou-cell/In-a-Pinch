@@ -898,7 +898,7 @@
         class: "field-hint",
         text: "持ち時間を使い切ると秒読み(1手ごとにその秒数以内)に入り、秒読みも尽きると時間切れ負けです。"
           + "秒読みなしは持ち時間が尽きた時点で負け(切れ負け)、加算ありは指すたびに持ち時間が増えます(フィッシャー)。"
-          + "持ち時間ありの対局では「待った」はできません。",
+          + "持ち時間ありの対局でも「待った」ができ、持ち時間もその手を指す前に戻ります(時間切れの後は戻せません)。",
       }),
     ]);
     card.appendChild(timeExtra);
@@ -1771,6 +1771,7 @@
     m.historyStack.push({
       engine: m.engine.clone(), mover, logLen: m.logMessages.length, kifuLen: m.kifuRecords.length,
       onlineLen: m.onlineActions ? m.onlineActions.length : 0,
+      clock: m.clock ? clockSnapshot(m.clock) : null, // 待ったで持ち時間も指す直前に戻す
     });
     if (m.historyStack.length > 60) m.historyStack.shift();
   }
@@ -1798,7 +1799,10 @@
       return `AI戦 - ${aiStrengthName(m.aiLevel, m.aiSpecialist)}(あなたは${m.humanPlayer === "A" ? "先手" : "後手"}${resumed})`;
     }
     if (m.mode === "tsume") return `詰めピンチ ${tsumeTitle(m.puzzle)}`;
-    if (m.mode === "pvp") return m.timeControl ? `対人戦(同画面) - ${timeControlLabel(m.timeControl)}` : "対人戦(同画面)";
+    if (m.mode === "pvp") {
+      const resumed = m.resumedFrom ? `(感想戦の${m.resumedFrom.ply}手目から再開)` : "";
+      return (m.timeControl ? `対人戦(同画面) - ${timeControlLabel(m.timeControl)}` : "対人戦(同画面)") + resumed;
+    }
     if (m.mode === "online") return "オンライン対戦(手番リンク)";
     if (m.mode === "ai_vs_ai") return `AI同士の対戦 - 先手:${aiStrengthName(m.aiLevel, m.aiSpecialist)} / 後手:${aiStrengthName(m.aiLevelB, m.aiSpecialistB)}`;
     return m.mode;
@@ -1958,11 +1962,12 @@
   // 将棋の対局時計と同じく、手番側の時間だけが減る。持ち時間(main)を使い切ると秒読み(byo)に
   // 入り、1手ごとに byo 秒以内に指せば秒読みは元に戻る。秒読みなしなら持ち時間切れで負け、
   // inc>0 なら指すたびに持ち時間へ inc 秒を足す(フィッシャー)。時間は ms で持つ。
-  function createClock(spec) {
+  // side: 時計が動き出す側(感想戦の途中から再開するときは、その局面の手番)
+  function createClock(spec, side) {
     return {
       spec,
       main: { A: spec.main * 1000, B: spec.main * 1000 },
-      side: "A",
+      side: side || "A",
       turnStart: performance.now(),
       paused: false, pausedElapsed: 0, stopped: false,
       flagged: null,
@@ -1998,6 +2003,24 @@
     ck.turnStart = performance.now();
     ck.pausedElapsed = 0;
     ck.lastBeep = null;
+  }
+
+  // 待ったで戻すための時計の状態。指す直前(pushHistory の時点)に、両者の持ち時間と、
+  // 手番側がその手に使った時間を覚えておく
+  function clockSnapshot(ck) {
+    return { main: { A: ck.main.A, B: ck.main.B }, side: ck.side, elapsed: clockElapsed(ck) };
+  }
+
+  // 待った: 時計を指す直前の状態に戻す。戻した手番側の時計は、その手を指した瞬間の残りから動き出す
+  // (相手がその後に使った時間も戻る)。終局で止まっていた時計も動かし直す。止めている間は止めたまま
+  function restoreClock(ck, snap) {
+    ck.main = { A: snap.main.A, B: snap.main.B };
+    ck.side = snap.side;
+    ck.stopped = false;
+    ck.flagged = null;
+    ck.lastBeep = null;
+    ck.pausedElapsed = snap.elapsed;
+    ck.turnStart = performance.now() - snap.elapsed;
   }
 
   function stopClock(ck) {
@@ -2133,6 +2156,7 @@
       }
       return;
     }
+    if (m.discardKifu) return; // 棋譜を破棄する設定で再開した対局(終局後の「棋譜を保存する」でだけ残す)
     if ((m.engine.winner || m.engine.isDraw) && !m.kifuSaved) saveMatchToHistory(m);
   }
 
@@ -2155,8 +2179,9 @@
   function matchFinished(m) { return m.engine.isOver() || !!m.aborted; }
 
   // 対局を途中で中止して保存できるか(詰めピンチは問題ごとの記録、オンライン対戦は手番リンクで続けられるので対象外)
+  // 棋譜を破棄する設定で再開した対局も、保存しないので対象外
   function canAbortMatch(m) {
-    return !!m && ["pvai", "pvp", "ai_vs_ai"].includes(m.mode) && !matchFinished(m) && !m.kifuSaved && matchPlies(m) > 0;
+    return !!m && ["pvai", "pvp", "ai_vs_ai"].includes(m.mode) && !matchFinished(m) && !m.kifuSaved && !m.discardKifu && matchPlies(m) > 0;
   }
 
   // 長引いた対局を中止し、そこまでの棋譜を対戦履歴に保存する。AIの思考・形勢の読み・時計は止める
@@ -2244,12 +2269,14 @@
     const undoBtn = el("button", { class: "btn btn-compact", text: "待った(1手戻す)", onclick: onUndo });
     const restartBtn = el("button", { class: "btn btn-compact", text: m.mode === "tsume" ? "やり直す" : "新しく対戦", onclick: onRestart });
     const clockBtn = m.clock ? el("button", { class: "btn btn-compact", text: "時計を止める", onclick: toggleClockPause }) : null;
-    const abortBtn = ["pvai", "pvp", "ai_vs_ai"].includes(m.mode)
+    const abortBtn = ["pvai", "pvp", "ai_vs_ai"].includes(m.mode) && !m.discardKifu
       ? el("button", { class: "btn btn-compact btn-abort", text: "中止して保存", title: "長引いた対局を中止し、ここまでの棋譜を対戦履歴に保存します", onclick: onAbort })
       : null;
     if (m.mode === "ai_vs_ai") { actionsBar.appendChild(pauseBtn); actionsBar.appendChild(stepBtn); }
-    else if (clockBtn) actionsBar.appendChild(clockBtn); // 持ち時間ありの対局は待ったなし
-    else actionsBar.appendChild(undoBtn);
+    else {
+      actionsBar.appendChild(undoBtn); // 持ち時間ありの対局でも待ったができる(時計も指す前に戻す)
+      if (clockBtn) actionsBar.appendChild(clockBtn);
+    }
     let hintBtn = null;
     if (m.mode === "tsume") {
       hintBtn = el("button", { class: "btn btn-compact", text: "ヒント", onclick: requestTsumeHint });
@@ -2502,9 +2529,12 @@
     return null;
   }
 
+  // 時間切れで負けた対局は待ったできない(待ったは指した手を戻すもので、時間切れは手ではないため)
+  function clockBlocksUndo(m) { return !!(m.clock && m.clock.flagged); }
+
   function onUndo() {
     const m = App.match;
-    if (m.aiThinking || !m.historyStack.length || m.clock || m.aborted) return;
+    if (m.aiThinking || !m.historyStack.length || clockBlocksUndo(m) || m.aborted) return;
     if (m.mode === "tsume" && m.tsumeReplay) return;
     let snap = null;
     if (m.mode === "tsume") {
@@ -2520,6 +2550,12 @@
       m.undoUsed = true; // 待ったを使った対局はレートの対象外
     }
     m.engine = snap.engine;
+    if (m.clock && snap.clock) {
+      restoreClock(m.clock, snap.clock);
+      m.clockUrgent = false;
+      if (App.gameDom && App.gameDom.boardFrame) App.gameDom.boardFrame.classList.remove("is-urgent");
+      startClockTicker(); // 終局で止まっていた時計の刻みも動かし直す
+    }
     m.evalGate = false; // 形勢を読んでからAIが考える途中だった場合も、その読みは捨てる
     m.logMessages.length = snap.logLen;
     m.kifuRecords.length = snap.kifuLen;
@@ -2578,7 +2614,7 @@
     dom.modeText.textContent = modeLabelText() + (m.ruleTemplate ? " / 特化テンプレート" : "") + ` / 接触制限 ${engine.config.contactLimit}`
       + (m.evalDisplay ? " / 形勢表示あり" : "");
     dom.restartBtn.disabled = false;
-    dom.undoBtn.disabled = m.aiThinking || !m.historyStack.length || !!m.tsumeReplay || !!m.clock || !!m.aborted
+    dom.undoBtn.disabled = m.aiThinking || !m.historyStack.length || !!m.tsumeReplay || clockBlocksUndo(m) || !!m.aborted
       || (m.mode !== "tsume" && undoTargetIndex(m) == null);
     if (dom.abortBtn) {
       dom.abortBtn.disabled = !canAbortMatch(m);
@@ -3043,6 +3079,15 @@
     if (m.finishedRecord) {
       actions.appendChild(el("button", { class: "btn btn-compact", text: "感想戦を見る", onclick: () => openReview(m.finishedRecord) }));
       actions.appendChild(el("button", { class: "btn btn-compact", text: "棋譜をダウンロード", onclick: () => downloadKifuCsv(m.finishedRecord) }));
+    } else if (m.discardKifu && !m.kifuSaved) {
+      // 棋譜を破棄する設定で再開した対局: 終局後に気が変わったら、ここで新しい記録として残せる
+      banner.firstChild.textContent += "(棋譜は保存していません)";
+      actions.appendChild(el("button", { class: "btn btn-compact", text: "棋譜を保存する", onclick: () => {
+        if (App.match !== m || m.kifuSaved) return;
+        saveMatchToHistory(m);
+        drawBanner();
+        toast("棋譜を新しい記録として対戦履歴に保存しました");
+      } }));
     }
     banner.appendChild(actions);
     dom.bannerHost.appendChild(banner);
@@ -4451,28 +4496,67 @@
     return frames;
   }
 
-  // 感想戦のある局面から、実際に対局を再開する(追加仕様3)。
+  // 感想戦のある局面から、実際に対局を再開する(追加仕様3)。AIと指すか、二人で同じ画面で指すかを選べる。
+  // 再開した対局の棋譜は、新しい記録として対戦履歴に保存するか、保存せず破棄するかを選ぶ。
   // frames[ply] が再開する局面(ply = それまでに指された手数)
   function openResumeSetup(record, frames, ply) {
     const veil = el("div", { class: "veil" });
     const engine0 = frames[ply].engineClone;
-    const sideSelect = el("select", { class: "field-select" }, [
+    const row = (label, control) => el("div", { class: "field-row" }, [el("div", { class: "field-label", text: label }), control]);
+    const modeSelect = el("select", { class: "field-select", "aria-label": "対戦の形" }, [
+      el("option", { value: "pvai", text: "AIと対戦" }),
+      el("option", { value: "pvp", text: "二人で対戦(同じ画面)" }),
+    ]);
+    modeSelect.value = record.mode === "pvp" ? "pvp" : "pvai";
+    const sideSelect = el("select", { class: "field-select", "aria-label": "担当する側" }, [
       el("option", { value: "A", text: "先手(A)" }),
       el("option", { value: "B", text: "後手(B)" }),
     ]);
     sideSelect.value = engine0.currentPlayer;
-    const levelSelect = el("select", { class: "field-select" });
+    const levelSelect = el("select", { class: "field-select", "aria-label": "相手AIの強さ" });
     AI.LEVEL_ORDER.forEach((i) => levelSelect.appendChild(el("option", { value: String(i), text: AI.LEVELS[i].name })));
     levelSelect.value = "5";
+    // 二人で指すときの持ち時間(メニューのプリセットと同じ。カスタムはメニューから)
+    const timeSelect = el("select", { class: "field-select", "aria-label": "持ち時間" });
+    TIME_PRESETS.filter((p) => p.id !== "custom").forEach((p) => timeSelect.appendChild(el("option", { value: p.id, text: p.label })));
+    const kifuSelect = el("select", { class: "field-select", "aria-label": "棋譜の保存" }, [
+      el("option", { value: "save", text: "新しい記録として保存する" }),
+      el("option", { value: "discard", text: "保存しない(破棄する)" }),
+    ]);
+    const sideRow = row("担当する側", sideSelect);
+    const levelRow = row("相手AIの強さ", levelSelect);
+    const timeRow = row("持ち時間", timeSelect);
+    const kifuHint = el("div", { class: "field-hint" });
+    const sync = () => {
+      const pvp = modeSelect.value === "pvp";
+      sideRow.style.display = pvp ? "none" : "";
+      levelRow.style.display = pvp ? "none" : "";
+      timeRow.style.display = pvp ? "" : "none";
+      kifuHint.textContent = kifuSelect.value === "save"
+        ? `終局すると、再開までの${ply}手も含めた棋譜を新しい記録として対戦履歴に保存します(元の記録はそのまま残ります)。`
+        : "再開した対局の棋譜は対戦履歴に残しません(終局後に「棋譜を保存する」で残すこともできます)。";
+    };
+    modeSelect.addEventListener("change", sync);
+    kifuSelect.addEventListener("change", sync);
+    sync();
     const modal = el("div", { class: "modal" }, [
-      el("p", { text: "この局面から、実際に対局を再開します。どちらのプレイヤーを担当しますか?" }),
-      el("div", { class: "field-row" }, [el("div", { class: "field-label", text: "担当する側" }), sideSelect]),
-      el("div", { class: "field-row" }, [el("div", { class: "field-label", text: "相手AIの強さ" }), levelSelect]),
+      el("p", { text: "この局面から、実際に対局を再開します。AIと指すか、二人で指すかを選んでください。" }),
+      row("対戦の形", modeSelect),
+      sideRow, levelRow, timeRow,
+      row("棋譜の保存", kifuSelect),
+      kifuHint,
       el("div", { class: "modal-actions" }, [
         el("button", { class: "btn", text: "キャンセル", onclick: () => veil.remove() }),
         el("button", { class: "btn btn-primary", text: "再開する", style: { width: "auto", fontSize: "14px", padding: "10px 16px" }, onclick: () => {
           veil.remove();
-          resumeMatchFromEngine(engine0.clone(), sideSelect.value, parseInt(levelSelect.value, 10), { record, frames, ply });
+          const preset = TIME_PRESETS.find((p) => p.id === timeSelect.value);
+          resumeMatchFromEngine(engine0.clone(), {
+            mode: modeSelect.value,
+            humanPlayer: sideSelect.value,
+            aiLevel: parseInt(levelSelect.value, 10),
+            timeControl: preset && preset.spec ? Object.assign({}, preset.spec) : null,
+            saveKifu: kifuSelect.value === "save",
+          }, { record, frames, ply });
         } }),
       ]),
     ]);
@@ -4482,20 +4566,30 @@
 
   // 対戦履歴に残す記録が感想戦の局面だけで途切れないよう、元の対局の持ち駒(初期値)と
   // 再開までの手を引き継ぐ(engine.stock は「残りの」持ち駒なので記録には使えない)。
-  function resumeMatchFromEngine(engine, humanPlayer, aiLevel, source) {
+  // opts = { mode: "pvai" | "pvp", humanPlayer, aiLevel, timeControl(二人のときのみ), saveKifu }
+  function resumeMatchFromEngine(engine, opts, source) {
     const { record, frames, ply } = source;
+    const pvp = opts.mode === "pvp";
+    const timeControl = pvp && opts.timeControl ? opts.timeControl : null;
+    const saveKifu = opts.saveKifu !== false;
+    const settings = loadMenuSettings();
     App.match = {
-      mode: "pvai",
+      mode: pvp ? "pvp" : "pvai",
       boardSize: engine.config.rows, moveRange: engine.config.moveRange, contactLimit: engine.config.contactLimit,
-      aiLevel, aiLevelB: null, aiSpecialist: false, aiSpecialistB: false,
+      aiLevel: pvp ? null : opts.aiLevel, aiLevelB: null, aiSpecialist: false, aiSpecialistB: false,
       stockA: record.stockA, stockB: record.stockB,
       ruleTemplate: recordUsesTemplate(record) ? C.TEMPLATE_ID : null,
       engine,
-      humanPlayer,
+      humanPlayer: pvp ? "A" : opts.humanPlayer,
+      timeControl, clockSound: true,
+      clock: timeControl ? createClock(timeControl, engine.currentPlayer) : null,
       resumedFrom: { id: record.id, ply },
+      discardKifu: !saveKifu, // 再開した対局の棋譜を対戦履歴に残さない(終局後に保存し直すこともできる)
       selected: null,
       lastAction: frames[ply].lastAction,
-      logMessages: [`(感想戦の${ply}手目の局面から再開: それまでの${ply}手も棋譜に含めて保存します)`],
+      logMessages: [saveKifu
+        ? `(感想戦の${ply}手目の局面から再開: それまでの${ply}手も棋譜に含めて新しい記録として保存します)`
+        : `(感想戦の${ply}手目の局面から再開: この対局の棋譜は保存しません)`],
       kifuRecords: [],
       historyStack: [],
       aiThinking: false,
@@ -4504,17 +4598,20 @@
       pieceNodes: new Map(),
       startedAt: Date.now(),
       onlineActions: [],
-      // 形勢表示はメニューの設定(持ち時間なしの対局の既定)に従う
-      evalDisplay: !(loadMenuSettings() && loadMenuSettings().evalCasual === false),
+      // 形勢表示はメニューの設定に従う(持ち時間ありの対人戦はその既定、それ以外は持ち時間なしの既定)
+      evalDisplay: timeControl
+        ? !!(settings && settings.evalClock === true)
+        : !(settings && settings.evalCasual === false),
       evalView: null,
     };
-    // 再開までの手。指し手の名前(あなた/AI)はこの対局の担当に合わせて付け直す
+    // 再開までの手。指し手の名前(あなた/AI・プレイヤー1/2)はこの対局の担当に合わせて付け直す
     App.match.kifuRecords = record.moves.slice(0, ply).map((mv, i) => {
       const mover = mv.mover || frames[i].currentPlayer;
       return Object.assign({}, mv, { turn: i + 1, mover, player: playerDisplayName(mover) });
     });
     App.screen = "game";
     render();
+    startClockTicker();
     proceedTurn();
   }
 
