@@ -462,6 +462,23 @@ function refDistance(engine, solver, maxPlies, quiet) {
     else if (pz.par >= 3 && !info.unique) why.push("not unique");
     if (pz.quiet && T.analyze(e, solver, pz.par, { quiet: 0 })) why.push("solvable without quiet move");
     if (!pz.quiet && info && info.rootChecks < 2) why.push("only one check at root");
+    // 実際の対局の局面そのまま: 駒を取り除いておらず、盤上の駒+持ち駒がその対局の初期の持ち駒数に一致する
+    if (pz.removed) why.push("pieces removed");
+    const st = pz.source && pz.source.stock;
+    if (!st) why.push("no source stock");
+    else {
+      const onA = pz.position.pieces.filter((p) => p[0] === "A").length;
+      const onB = pz.position.pieces.length - onA;
+      if (onA + pz.position.stockA !== st[0] || onB + pz.position.stockB !== st[1]) why.push("stock does not add up");
+    }
+    // 遠回りなし: 挟まない手を1〜2回余分に許しても par より早くは勝てない
+    if (pz.par >= 3) {
+      const fw = T.fasterWin(e, solver, pz.par, pz.quiet);
+      if (fw.faster != null) why.push(`faster win in ${fw.faster} with a quiet move`);
+      if (fw.unknown) why.push("faster-win check did not finish");
+    }
+    // 詰め上がり: 隅に追い込むだけの詰みは採らない(芸術点 5 以上)
+    if (T.artScore(T.finalNet(pz.position, pz.line)) < 5) why.push("corner mate");
     // 主手順を素のエンジンで並べ直す: 攻めは挟む手(静かな手は quiet 回まで)、最後は攻め方の勝ち
     const r = e.clone();
     let quietUsed = 0;
@@ -481,6 +498,24 @@ function refDistance(engine, solver, maxPlies, quiet) {
   check(`all ${TD.PUZZLES.length} puzzles re-verified (par, uniqueness, legal mating line)`, bad.length === 0, bad.join(" / "));
   const cats = new Set(TD.CATEGORIES.map((c) => c.key));
   check("every puzzle belongs to a known category", TD.PUZZLES.every((p) => cats.has(p.category)));
+  // 盤の端に追い込むより、盤の内側で取り囲んで詰ますほうを優先して選んでいる
+  const surround = TD.PUZZLES.filter((p) => p.tags.includes("包囲詰め")).length;
+  check(`most puzzles end in a surround mate (${surround}/${TD.PUZZLES.length})`, surround >= TD.PUZZLES.length * 0.85);
+})();
+
+// ---- 12b. 詰めピンチ: 自動作問は局面をいじらず、遠回りの局面を採らない ----
+(function () {
+  const t0 = Date.now();
+  const pz = T.generatePuzzle({ config: { rows: 5, cols: 5, moveRange: 3, contactLimit: 3, wallSandwich: true },
+    stock: 8, minPar: 3, maxPar: 5, quiet: 0, seed: 11, deadline: Date.now() + 20000, aiMs: 10, nodeLimit: 40000 });
+  if (!pz) { check("generatePuzzle finds a puzzle within 20s", false); return; }
+  const onA = pz.position.pieces.filter((p) => p[0] === "A").length;
+  const onB = pz.position.pieces.length - onA;
+  check("generated puzzle keeps the game position as is (no pieces removed, stock adds up)",
+    pz.removed === 0 && onA + pz.position.stockA === 8 && onB + pz.position.stockB === 8, JSON.stringify(pz.position));
+  const fw = T.fasterWin(T.engineFromPosition(pz.position), pz.position.currentPlayer, pz.par, 0);
+  check(`generated puzzle has no faster win with a quiet move (par ${pz.par}, art ${pz.art}, ${Date.now() - t0}ms)`,
+    fw.faster == null && !fw.unknown);
 })();
 
 // ---- 13. 詰めピンチ: 対局画面と同じ手順(ヒント→最長抵抗の受け)で必ず詰み、悪手には逃れを返す ----

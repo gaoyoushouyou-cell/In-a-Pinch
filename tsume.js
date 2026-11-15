@@ -417,6 +417,86 @@
     return head + "|" + best;
   }
 
+  // ---- 詰め上がりの形と遠回りの判定(作問の品質) ------------------------------
+  // 主手順を指し終えた局面で、動けなくなった駒(受け方の義務駒)の四方を調べる。
+  // sides は上下左右の順に E=攻め方の駒 / O=受け方自身の駒 / W=盤の端 / C=接触制限で行けない空きマス。
+  // pinch は最後に挟んでいる軸の両端が攻め方の駒どうし("piece")か盤の端を使ったか("wall")。
+  // targets = 主手順で攻め方が挟んだ受け方の駒の数(少ないほど一つの狙いに集中している)。
+  function finalNet(position, line) {
+    const e = engineFromPosition(position);
+    const solver = position.currentPlayer;
+    const targets = new Set();
+    for (const label of line) {
+      const mover = e.currentPlayer;
+      const res = AI.applyAction(e, mover, actionFromLabel(e, label));
+      if (mover === solver) for (const pid of res.newlySandwiched) targets.add(pid);
+    }
+    if (e.winner !== solver) return null;
+    const loser = H.otherPlayer(solver);
+    const pieces = Array.from(new Set(e.obligated[loser])).map((id) => {
+      const [r, c] = e.pieces.get(id).position;
+      let sides = "";
+      for (const [dr, dc] of H.DIRECTIONS) {
+        const q = [r + dr, c + dc];
+        if (!e.inBounds(q)) { sides += "W"; continue; }
+        const o = e.pieceAt(q);
+        sides += o ? (o.player === solver ? "E" : "O") : "C";
+      }
+      let pinch = null;
+      for (const [[dr1, dc1], [dr2, dc2]] of H.AXIS_PAIRS) {
+        const f1 = e._flank([r + dr1, c + dc1], solver), f2 = e._flank([r + dr2, c + dc2], solver);
+        if (f1 && f2 && !(f1 === "wall" && f2 === "wall") && pinch !== "piece") {
+          pinch = f1 === "wall" || f2 === "wall" ? "wall" : "piece";
+        }
+      }
+      return { pos: H.posLabel([r, c]), sides, pinch };
+    });
+    return { pieces, targets: targets.size };
+  }
+
+  // 芸術点: 盤の内側で、攻め方の駒が取り囲んで詰ますほど高い。盤の端・隅への追い込みは低い。
+  //   1辺ごとに E(攻め方の駒)+2 / O(受け方自身の駒)+1 / C(接触制限)+1 / W(盤の端)-2、
+  //   攻め方の駒どうしで挟んだ詰みは +2、盤の端に触れない詰め上がり(包囲詰め)は +3、
+  //   動けなくなった駒が2つ以上(二重義務)なら +1。最高 13(四方を攻め方の駒が囲む)、隅は 0 前後。
+  function artScore(net) {
+    if (!net || !net.pieces.length) return -99;
+    let sum = 0, interior = true;
+    for (const p of net.pieces) {
+      let s = 0;
+      for (const ch of p.sides) s += ch === "E" ? 2 : ch === "W" ? -2 : 1;
+      if (p.pinch === "piece") s += 2;
+      if (p.sides.includes("W")) interior = false;
+      sum += s;
+    }
+    const art = sum / net.pieces.length + (interior ? 3 : 0) + (net.pieces.length >= 2 ? 1 : 0);
+    return Math.round(art * 10) / 10;
+  }
+  const ART_SURROUND = 9; // これ以上なら盤の内側で取り囲んだ詰み(包囲詰め)
+
+  // 遠回りの判定: 実戦なら挟まない手も指せる。静かな手を (quiet+1)〜(quiet+2) 回まで許すと
+  // par より短く勝てるなら、「挟む手だけ」の主手順は必要のない手を含む。
+  // 戻り値 { faster: その最短手数 or null, line, unknown: 読み切れなかったか }
+  function fasterWin(engine, solverPlayer, par, quiet, nodeLimit) {
+    quiet = quiet || 0;
+    nodeLimit = nodeLimit || 300000;
+    if (par < 3) return { faster: null, line: null, unknown: false };
+    let unknown = false;
+    for (const q of [quiet + 1, quiet + 2]) {
+      const s = new TsumeSolver(engine, solverPlayer, { quiet: q, nodeLimit });
+      let d;
+      try { d = s.distance(par - 2); } catch (e) {
+        if (!(e instanceof NodeLimit)) throw e;
+        unknown = true;
+        continue;
+      }
+      if (d != null) {
+        const a = analyze(engine, solverPlayer, d, { quiet: q, nodeLimit: nodeLimit * 4 });
+        return { faster: d, line: a ? a.line : null, unknown: false };
+      }
+    }
+    return { faster: null, line: null, unknown };
+  }
+
   // 主手順から問題の「テーマ」を読み取る(問題一覧のタグ・ヒントに使う)
   function themeTags(engine, solverPlayer, line) {
     const e = engine.clone();
@@ -445,6 +525,11 @@
     }
     const loser = H.otherPlayer(solverPlayer);
     if (e.winner === solverPlayer && new Set(e.obligated[loser]).size >= 2) tags.add("二重義務");
+    // 動けなくなった駒がどれも盤の端に触れていない=盤の内側で取り囲んで詰ませた
+    if (e.winner === solverPlayer && e.obligated[loser].every((pid) => {
+      const [r, c] = e.pieces.get(pid).position;
+      return r > 0 && c > 0 && r < e.config.rows - 1 && c < e.config.cols - 1;
+    })) tags.add("包囲詰め");
     return Array.from(tags);
   }
 
@@ -462,6 +547,9 @@
 
   // 局面を問題にできるか調べ、できれば問題データを返す(できなければ null)。
   // want: { minPar, maxPar, quiet, nodeLimit, minimize }
+  // 局面は対局に現れたままを使う(minimize: true のときだけ不要駒を取り除く。取り除くと盤上の駒と
+  // 持ち駒の数が実戦ではありえない組み合わせになるので、既定では行わない)。
+  // 挟まない手を使えばもっと早く勝てる局面(主手順に必要のない手が混じる)は採らない。
   function puzzleFromEngine(engine, want, meta) {
     const solverPlayer = engine.currentPlayer;
     const quiet = want.quiet || 0;
@@ -473,21 +561,28 @@
     if (quiet && analyze(engine, solverPlayer, info.par, { quiet: 0, nodeLimit })) return null;
     if (info.par >= 3 && !info.unique) return null;
     if (info.par === 1 && info.rootChecks < 2) return null; // 挟む手が1つしかない1手詰めは簡単すぎる
+    const fw = fasterWin(engine, solverPlayer, info.par, quiet, nodeLimit * 2);
+    if (fw.faster != null || fw.unknown) return null;
     let e = engine;
-    if (want.minimize !== false) ({ engine: e, info } = minimize(engine, solverPlayer, info, { quiet, nodeLimit }));
+    if (want.minimize === true) ({ engine: e, info } = minimize(engine, solverPlayer, info, { quiet, nodeLimit }));
     const position = positionFromEngine(e);
+    const net = finalNet(position, info.line);
     return Object.assign({
       par: info.par, quiet, position, line: info.line, rootChecks: info.rootChecks, widths: info.widths,
       tags: themeTags(e, solverPlayer, info.line), proofNodes: info.proofNodes,
-      removed: engine.pieces.size - e.pieces.size,
+      removed: engine.pieces.size - e.pieces.size, art: artScore(net),
     }, meta || {});
   }
 
   // 学習型AI同士の速い自己対戦を指しながら、条件に合う詰めピンチが現れるまで探す。
+  // 盤の内側で取り囲む詰み(芸術点 ART_SURROUND 以上)が見つかればすぐ返し、端への追い込みしか
+  // 見つからないときは、少し探し続けてから芸術点のいちばん高いものを返す。
   // opts: { config, stock, minPar, maxPar, quiet, seed, deadline(ms時刻), aiMs, onProgress }
   function generatePuzzle(opts) {
     const rng = mulberry32(opts.seed || 1);
-    const deadline = opts.deadline || (Date.now() + 20000);
+    let deadline = opts.deadline || (Date.now() + 20000);
+    const EXTRA_MS = 12000; // 端の詰みが見つかってから、包囲詰めを探し続ける時間
+    let best = null;
     let games = 0;
     while (Date.now() < deadline) {
       games++;
@@ -510,16 +605,22 @@
         AI.applyAction(e, p, action);
         if (e.isOver() || ply < 6) continue;
         const pz = puzzleFromEngine(e, opts, { source: { kind: "generated", game: games, ply: ply + 1 } });
-        if (pz) return pz;
+        if (!pz) continue;
+        if (pz.art >= ART_SURROUND) return pz;
+        if (!best || pz.art > best.art) {
+          if (!best) deadline = Math.min(deadline, Date.now() + EXTRA_MS);
+          best = pz;
+        }
       }
       if (opts.onProgress) opts.onProgress(games);
     }
-    return null;
+    return best;
   }
 
   const Tsume = {
     TsumeSolver, NodeLimit, engineFromPosition, positionFromEngine, checkMovesOf, actionFromLabel, analyze,
     hintFor, defendFor, isNatural, minimize, canonicalKey, themeTags, puzzleFromEngine, generatePuzzle, mulberry32,
+    finalNet, artScore, ART_SURROUND, fasterWin,
   };
 
   if (typeof module !== "undefined" && module.exports) module.exports = Tsume;

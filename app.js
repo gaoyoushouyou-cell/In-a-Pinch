@@ -96,7 +96,7 @@
   function initWorker() {
     if (!Worker_) { workerOk = false; return; }
     try {
-      worker = new Worker_("ai-worker.js?v=10");
+      worker = new Worker_("ai-worker.js?v=11");
       worker.onmessage = (e) => {
         if (e.data.reqId !== pendingReqId || e.data.progress != null) return; // 破棄済み(リスタート等)の応答
         if (onWorkerResult) onWorkerResult(e.data);
@@ -209,7 +209,7 @@
     if (evalWorker || !evalWorkerOk) return;
     if (!Worker_) { evalWorkerOk = false; return; }
     try {
-      evalWorker = new Worker_("ai-worker.js?v=10");
+      evalWorker = new Worker_("ai-worker.js?v=11");
       evalWorker.onmessage = (e) => {
         if (!evalReq || e.data.reqId !== evalReq.reqId) return;
         const cb = evalReq.callback;
@@ -268,7 +268,7 @@
     const payload = Object.assign({ kind: "study", op, reqId: req.reqId, config: engine.config, state: engineSnapshot(engine) }, extra);
     if (!studyWorker && studyWorkerOk && Worker_) {
       try {
-        studyWorker = new Worker_("ai-worker.js?v=10");
+        studyWorker = new Worker_("ai-worker.js?v=11");
         studyWorker.onmessage = (e) => {
           if (!studyReq || e.data.reqId !== studyReq.reqId) return;
           const cb = studyReq.callback;
@@ -322,7 +322,7 @@
     const payload = Object.assign({ kind: "score", op, reqId: req.reqId, config: engine.config, state: engineSnapshot(engine) }, extra);
     if (!scoreWorker && scoreWorkerOk && Worker_) {
       try {
-        scoreWorker = new Worker_("ai-worker.js?v=10");
+        scoreWorker = new Worker_("ai-worker.js?v=11");
         scoreWorker.onmessage = (e) => {
           if (!scoreReq || e.data.reqId !== scoreReq.reqId) return;
           if (e.data.progress) { if (scoreReq.onProgress) scoreReq.onProgress(e.data.progress); return; }
@@ -1417,8 +1417,11 @@
   }
   function tsumeSourceText(puzzle) {
     const s = puzzle.source || {};
-    if (s.kind === "kifu") return `実戦 ${s.file.replace(/^kifu_|\.csv$/g, "")} ${s.ply + 1}手目の局面`;
-    if (s.kind === "self") return "AI自己対戦から作問";
+    if (s.kind === "kifu") {
+      const who = /AI同士/.test(s.mode || "") ? "AI同士の対局" : "実戦";
+      return `${who} ${s.file.replace(/^kifu_|\.csv$/g, "")} ${s.ply + 1}手目の局面`;
+    }
+    if (s.kind === "self") return `AI同士の対局 ${s.ply + 1}手目の局面`;
     return "自動生成";
   }
   function starText(n) { return "★".repeat(n || 0) + "☆".repeat(3 - (n || 0)); }
@@ -1640,7 +1643,7 @@
     const screen = el("div", { class: "screen" });
     screen.appendChild(pageHead("詰めピンチ", {
       crumbs: [["ホーム", "menu"]],
-      lede: "「正しく指せば必ず勝てる」と証明済みの局面から、相手を詰ませる問題集です。"
+      lede: "実際の対局に現れた局面のうち、「正しく指せば必ず勝てる」と証明済みのものから、相手を詰ませる問題集です。"
         + "詰将棋の王手と同じく、あなたは毎手かならず相手の駒を挟みます(=移動義務を負わせる)。"
         + "相手が義務のある駒をどれも動かせなくなれば詰み。相手は最も長く粘る受けを返してきます。",
     }));
@@ -1705,7 +1708,8 @@
     card.appendChild(el("div", {
       class: "field-hint",
       text: "学習型AI同士の速い対局を裏で指し進め、条件に合う詰み局面が現れたら、"
-        + "唯一解を確かめて不要な駒を取り除き、1問に仕上げます。数秒〜1分ほどかかります。",
+        + "唯一解と、挟まない手を使っても早く勝てない(遠回りしない)ことを確かめて、局面をそのまま1問にします。"
+        + "盤の内側で取り囲んで詰ます形を優先して探します。数秒〜1分ほどかかります。",
     }));
     if (!App.tsumeGen) App.tsumeGen = { board: "t7", length: "5" };
     const g = App.tsumeGen;
@@ -1738,7 +1742,7 @@
     const board = TSUME_GEN_BOARDS.find((b) => b.key === App.tsumeGen.board);
     const len = TSUME_GEN_LENGTHS.find((l) => l.key === App.tsumeGen.length);
     let w;
-    try { w = new Worker_("ai-worker.js?v=10"); } catch (e) { toast("自動作問を開始できませんでした(ローカルサーバー経由で開いてください)"); return; }
+    try { w = new Worker_("ai-worker.js?v=11"); } catch (e) { toast("自動作問を開始できませんでした(ローカルサーバー経由で開いてください)"); return; }
     tsumeGenWorker = w;
     btn.disabled = true;
     status.textContent = "作問中…(AI同士の対局から詰み局面を探しています)";
@@ -4070,7 +4074,7 @@
     return new Promise((resolve) => {
       if (!bgWorker && bgWorkerOk && Worker_) {
         try {
-          bgWorker = new Worker_("ai-worker.js?v=10");
+          bgWorker = new Worker_("ai-worker.js?v=11");
           bgWorker.onmessage = (e) => {
             const cb = bgPending.get(e.data.reqId);
             if (cb) { bgPending.delete(e.data.reqId); cb(e.data.ok ? e.data.result : null); }
